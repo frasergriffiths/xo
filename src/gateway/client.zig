@@ -658,7 +658,7 @@ pub fn postGatewayCompletion(
         defer secret.zeroAndFree(alloc, auth_header);
 
         const extra_headers = [_]std.http.Header{
-            .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" },
+            .{ .name = "HTTP-Referer", .value = "https://github.com/frasergriffiths/xo" },
             .{ .name = "X-Title", .value = "fx" },
             .{ .name = "Accept", .value = "application/json" },
             .{ .name = vercel_gateway_extended_time_header, .value = vercel_gateway_extended_time_value },
@@ -1870,7 +1870,7 @@ fn gatewayExtraHeaders(
 ) []const std.http.Header {
     std.debug.assert(buf.len >= 10);
     var len: usize = 0;
-    buf[len] = .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" };
+    buf[len] = .{ .name = "HTTP-Referer", .value = "https://github.com/frasergriffiths/xo" };
     len += 1;
     buf[len] = .{ .name = "X-Title", .value = "fx" };
     len += 1;

@@ -416,7 +416,7 @@ Do not create version tags manually. Do not change `build.zig.zon` version (it i
 
 ## Repository and License
 
-The canonical repository is `vercel-labs/fx` on GitHub. All URLs, links, and references to the repo must use `vercel-labs/fx` (not `vercel/fx`, `user/fx`, or any other org/owner). Licensed under Apache-2.0.
+The canonical repository is `frasergriffiths/xo` on GitHub. All URLs, links, and references to the repo must use `frasergriffiths/xo` (not `vercel/fx`, `user/fx`, or any other org/owner). Licensed under Apache-2.0.
 
 ## What Not To Do
 

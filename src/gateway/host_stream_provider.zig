@@ -134,7 +134,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     defer headers.deinit(alloc);
     try headers.appendSlice(alloc, &.{
         .{ .name = "content-type", .value = "application/json" },
-        .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" },
+        .{ .name = "HTTP-Referer", .value = "https://github.com/frasergriffiths/xo" },
         .{ .name = "X-Title", .value = "fx" },
         .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" },
         .{ .name = "ai-language-model-specification-version", .value = "4" },
