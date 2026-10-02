@@ -312,5 +312,4 @@ jobs:
           )"
 
           gh workflow run ci.yml --ref "$BRANCH"
-          gh workflow run bench.yml --ref "$BRANCH"
           gh workflow run full-ci.yml --ref "$BRANCH"
