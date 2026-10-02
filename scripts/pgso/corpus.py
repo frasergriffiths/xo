@@ -28,11 +28,18 @@ REQUIRED_DIRECT_COMMANDS = (
 )
 MAX_PROFILE_RUNS = 100
 
-REQUIRED_EXCLUSIONS = (
+# Test files that must never be classified, independent of what exists on
+# disk. Kept as a permanent guard so the classification cannot be widened by
+# adding a file back.
+FORBIDDEN_TEST_FILES = (
     "notifications.test.ts",
     "tui-agent.test.ts",
     "tui-command-permissions.test.ts",
 )
+
+# Exclusions the corpus must declare when the E2E suites are present. Empty
+# once tests/e2e is gone, because every exclusion would otherwise be stale.
+REQUIRED_EXCLUSIONS: tuple[str, ...] = ()
 
 ISOLATED_ENVIRONMENT_KEYS = (
     "AI_GATEWAY_API_KEY",
@@ -241,7 +248,7 @@ def _parse_scenario(
     if test_file is not None:
         if not isinstance(test_file, str) or pathlib.Path(test_file).name != test_file:
             raise PgsoError(f"invalid corpus test file: {test_file!r}")
-        if test_file in REQUIRED_EXCLUSIONS or _is_live_test(test_file):
+        if test_file in REQUIRED_EXCLUSIONS or test_file in FORBIDDEN_TEST_FILES or _is_live_test(test_file):
             raise PgsoError(f"forbidden corpus test: {test_file}")
         expected_argv = (
             "bun",
@@ -345,7 +352,7 @@ def load_corpus(
     discovered_test_files = {
         test_file.name
         for test_file in (root / "tests" / "e2e").glob("*.test.ts")
-    }
+    } if (root / "tests" / "e2e").is_dir() else set()
     classified_test_files = set(test_files) | set(exclusions)
     unclassified = sorted(discovered_test_files - classified_test_files)
     if unclassified:

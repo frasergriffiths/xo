@@ -19,80 +19,13 @@ from scripts.pgso.model import PgsoError
 from scripts.pgso.runner import CommandResult
 
 
-TRAINING_E2E_TESTS = (
-    "cli.test.ts",
-    "ask-presentation.test.ts",
-    "config-persistence.test.ts",
-    "prompt-history.test.ts",
-    "auth-refresh.test.ts",
-    "host-managed-auth.test.ts",
-    "file-tool-paths.test.ts",
-    "file-tool-permissions.test.ts",
-    "gateway-stream-lifecycle.test.ts",
-    "session-title.test.ts",
-    "web-fetch-fake-network.test.ts",
-    "web-search-fake-gateway.test.ts",
-    "vision-route-fake-gateway.test.ts",
-    "acp.test.ts",
-    "mcp-http.test.ts",
-    "mcp-legacy-remote.test.ts",
-    "mcp-stdio.test.ts",
-    "mcp-auth.test.ts",
-    "session-recovery.test.ts",
-    "terminal-host.test.ts",
-    "tui-startup.test.ts",
-    "permission-errors.test.ts",
-    "tui-resize.test.ts",
-    "tui-render-stress.test.ts",
-    "tui-full-transcript-brutal.test.ts",
-    "tui-resume-brutal.test.ts",
-    "tui-permissions.test.ts",
-    "tui-interrupt-recovery.test.ts",
-    "tui-terminal-tool.test.ts",
-    "tui-native-clear-recovery.test.ts",
-    "tui-gateway-stream-lifecycle.test.ts",
-)
+# The E2E suites were removed, so the corpus no longer classifies any
+# test file. It retains only the direct binary scenarios.
+TRAINING_E2E_TESTS: tuple[str, ...] = ()
 
-VERIFICATION_E2E_TESTS = (
-    "slack-install.test.ts",
-    "auto-mode-reliability.test.ts",
-    "review-model-override.test.ts",
-    "configured-providers.test.ts",
-    "oauth-keychain-migration.test.ts",
-    "tui-auth-source-selection.test.ts",
-    "tui-compaction-activity.test.ts",
-    "compaction-policy.test.ts",
-    "tui-composer-edit-contracts.test.ts",
-    "tui-cost.test.ts",
-    "tui-decision-prompts.test.ts",
-    "tui-file-picker.test.ts",
-    "tui-input-line-delete.test.ts",
-    "tui-input-navigation.test.ts",
-    "tui-render-replay.test.ts",
-    "tui-resume.test.ts",
-    "tui-slash-commands.test.ts",
-    "tui-slash-extra.test.ts",
-    "tui-slash-menu.test.ts",
-    "web-fetch-permission-progress.test.ts",
-    "web-search-permission-progress.test.ts",
-    "yolo-permission-mode.test.ts",
-)
+VERIFICATION_E2E_TESTS: tuple[str, ...] = ()
 
-EXCLUDED_E2E_TESTS = (
-    "ci-shards.test.ts",
-    "context-limits-live.test.ts",
-    "notifications.test.ts",
-    "tmux-helpers.test.ts",
-    "tui-agent.test.ts",
-    "tui-command-permissions.test.ts",
-    "tui-direct-write-audit.test.ts",
-    "tui-keybindings.test.ts",
-    "tui-performance.test.ts",
-    "tui-render-lab.test.ts",
-    "tui-render-live-stress.test.ts",
-    "web-fetch-live.test.ts",
-    "web-search-live.test.ts",
-)
+EXCLUDED_E2E_TESTS: tuple[str, ...] = ()
 
 
 class PgsoCorpusTests(unittest.TestCase):
@@ -370,8 +303,9 @@ class PgsoCorpusTests(unittest.TestCase):
             EXCLUDED_E2E_TESTS,
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
-        self.assertEqual(36, len(corpus.scenarios))
-        self.assertEqual(58, len(corpus.candidate_scenarios))
+        self.assertEqual(5, len(corpus.scenarios))
+        self.assertEqual(5, len(corpus.candidate_scenarios))
+        self.assertEqual(0, len(corpus.verification_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,
@@ -386,27 +320,24 @@ class PgsoCorpusTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            ("e2e-cli", "e2e-mcp-auth"),
+            (),
             tuple(
                 scenario.name
                 for scenario in corpus.scenarios
                 if scenario.allow_keychain
             ),
         )
-        self.assertEqual(
-            ("verify-oauth-keychain-migration",),
-            tuple(
-                scenario.name
-                for scenario in corpus.verification_scenarios
-                if scenario.allow_keychain
-            ),
-        )
 
-        discovered = tuple(
-            sorted(
-                path.name
-                for path in (repo_root / "tests" / "e2e").glob("*.test.ts")
+        e2e_directory = repo_root / "tests" / "e2e"
+        discovered = (
+            tuple(
+                sorted(
+                    path.name
+                    for path in e2e_directory.glob("*.test.ts")
+                )
             )
+            if e2e_directory.is_dir()
+            else ()
         )
         self.assertEqual(
             discovered,
