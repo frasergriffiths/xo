@@ -1516,9 +1516,6 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn beginFreshPersistedSession(app: *App) !void {
             closeWritableSession(app);
-            if (comptime runtime_profile.allows(App, .js_host_sessions)) {
-                try beginFreshJsHostSession(app);
-            }
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
             const store = app.session_persistence.store orelse return;
             const preferences = app.session_persistence.workspace_preferences orelse
@@ -1911,11 +1908,6 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             notice: ResumeNotice,
         ) !void {
-            if (comptime runtime_profile.allows(App, .js_host_sessions) and
-                !runtime_profile.allows(App, .durable_sessions))
-            {
-                return resumeRequestedJsHostSessionWithNotice(app, notice);
-            }
             var target = app.requested_resume orelse return;
             app.requested_resume = null;
             defer target.deinit(app.alloc);
@@ -5552,7 +5544,6 @@ pub fn Runtime(comptime App: type) type {
 
         fn commitJsHostSnapshot(app: *App, boundary: []const u8) void {
             if (comptime !@hasField(App, "session_persistence")) return;
-            if (comptime !runtime_profile.allows(App, .js_host_sessions)) return;
             commitJsHostSnapshotEnabled(app, boundary);
         }
 

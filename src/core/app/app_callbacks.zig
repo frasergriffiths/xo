@@ -554,10 +554,7 @@ pub fn Bindings(comptime App: type) type {
                     if (parsed.value == .object) {
                         if (parsed.value.object.get("command")) |command_value| {
                             if (command_value == .string) {
-                                const workspace_root = if (comptime @hasDecl(App, "workspaceHostInfo"))
-                                    if (app.workspaceHostInfo()) |info| info.root() else app.workspace_root
-                                else
-                                    app.workspace_root;
+                                const workspace_root = app.workspace_root;
                                 const display = tool_presentation.formatRunCommandDetailBounded(
                                     alloc,
                                     command_value.string,
@@ -620,10 +617,7 @@ pub fn Bindings(comptime App: type) type {
                             // the live terminal width like any other command.
                             if (app.toolRegistry().lookup(started.tool_name)) |spec| {
                                 if (spec.executor_kind == .terminal) {
-                                    const workspace_root = if (comptime @hasDecl(App, "workspaceHostInfo"))
-                                        if (app.workspaceHostInfo()) |info| info.root() else app.workspace_root
-                                    else
-                                        app.workspace_root;
+                                    const workspace_root = app.workspace_root;
                                     const session_call: ToolCall = .{
                                         .id = started.id.call_id,
                                         .name = started.tool_name,
@@ -986,10 +980,7 @@ pub fn Bindings(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             const tool = app.toolRegistry().lookup(call.name) orelse return error.UnsupportedTool;
             const prepare = tool.prepare_skill_call_fn orelse return error.UnsupportedTool;
-            const workspace_root = if (comptime @hasDecl(App, "workspaceHostInfo"))
-                if (app.workspaceHostInfo()) |info| info.root() else app.workspace_root
-            else
-                app.workspace_root;
+            const workspace_root = app.workspace_root;
             return prepare(.{
                 .allocator = arena,
                 .workspace_root = workspace_root,

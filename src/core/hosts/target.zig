@@ -1,3 +1,11 @@
 const builtin = @import("builtin");
+const std = @import("std");
 
-pub const is_wasm = builtin.os.tag == .wasi;
+/// The WebAssembly surfaces are removed. Every host-gated branch that this
+/// flag used to select is now unreachable, so it is a compile-time false
+/// rather than a target check.
+pub const is_wasm = false;
+
+comptime {
+    std.debug.assert(builtin.os.tag != .wasi);
+}

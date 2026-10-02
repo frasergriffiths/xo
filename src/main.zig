@@ -10,14 +10,11 @@ const provider_runtime = @import("core/app/provider_runtime.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
 const api_key_validator = @import("core/auth/api_key_validator.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
-const js_host_auth = @import("core/auth/js_host_auth.zig");
-const js_host_clipboard = @import("core/hosts/js_host_clipboard.zig");
 const credentials = @import("core/auth/credentials.zig");
 const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
 const usage_dashboard_runtime = @import("core/app/usage_dashboard_runtime.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
-const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
@@ -47,7 +44,6 @@ const collections = @import("core/shared/collections.zig");
 const agent_steps = @import("core/config/agent_steps.zig");
 const config_runtime = @import("core/config/config_runtime.zig");
 const model_provider = @import("core/config/model_provider.zig");
-const js_host_prompt_history = @import("core/session/js_host_prompt_history.zig");
 const model_capabilities = @import("core/config/model_capabilities.zig");
 const prompt_policy = @import("core/config/prompt_policy.zig");
 const builtin_commands = @import("builtins/commands.zig");
@@ -67,8 +63,6 @@ const builtin_modes = @import("builtins/modes.zig");
 const builtin_skills = @import("builtins/skills.zig");
 const host = @import("core/hosts/host.zig");
 const host_runtime_profile = @import("core/hosts/runtime_profile.zig");
-const js_host_url_opener = @import("core/hosts/js_host_url_opener.zig");
-const js_host_workspace = @import("core/hosts/js_host_workspace.zig");
 const host_target = @import("core/hosts/target.zig");
 const native_host = @import("core/hosts/native.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
@@ -113,8 +107,7 @@ const session_codec = @import("core/session/session_codec.zig");
 const session_child_store = @import("core/session/session_child_store.zig");
 const session_log = @import("core/session/session_log.zig");
 const builtin_tools = @import("builtins/tools.zig");
-const browser_workspace_tools = @import("builtins/browser_workspace_tools.zig");
-const browser_capabilities = @import("core/hosts/browser_capabilities.zig");
+const browser_capabilities = struct {};
 const tool_admission = @import("core/tooling/tool_admission.zig");
 const tool_projection = @import("core/tooling/tool_projection.zig");
 const command_output_content = @import("core/tooling/command_output_content.zig");
@@ -127,8 +120,6 @@ const web_search_runtime = @import("core/tooling/web_search_runtime.zig");
 const worker_runtime = @import("core/agent/worker_runtime.zig");
 const question_prompt = @import("core/agent/question_prompt.zig");
 const gateway_client = @import("gateway/client.zig");
-const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
-const js_host_model_catalog = @import("gateway/js_host_model_catalog.zig");
 const url_opener = @import("core/hosts/url_opener.zig");
 const event_loop = @import("ui/event_loop.zig");
 const footer_runtime = @import("ui/footer/runtime.zig");
@@ -361,15 +352,12 @@ test "skill submit snapshot keeps display spans exact while agent bindings dedup
 
 var resize_interlock = shell_runtime.ResizeApprovalInterlock{};
 const default_context_registry = context_contract.Registry{ .default_provider = builtin_context.provider };
-const WorkspaceHostRuntime = if (host_target.is_wasm) js_host_workspace.Runtime else struct {};
 const selected_host_profile = if (host_target.is_wasm) host_runtime_profile.wasm else host_runtime_profile.native;
 const app_api_key_validator = if (host_target.is_wasm)
     api_key_validator.unavailable_provider
 else
     builtin_gateway.api_key_validator;
-const app_oauth_transport = if (selected_host_profile.js_host_auth)
-    js_host_auth.oauth_provider
-else if (selected_host_profile.native_auth)
+const app_oauth_transport = if (selected_host_profile.native_auth)
     builtin_gateway.oauth_transport_provider
 else
     oauth_transport.unavailable_provider;
@@ -397,7 +385,6 @@ const App = struct {
     const Self = @This();
     const AgentAppRuntime = app_agent_runtime.Runtime(Self);
     const AuthAppRuntime = app_auth_runtime.Runtime(Self);
-    const HostConfigAppRuntime = app_host_config_runtime.Runtime(Self);
     const BootstrapAppRuntime = app_bootstrap_runtime.Runtime(Self);
     const InputAppRuntime = app_input_runtime.Runtime(Self);
     const InputFullTranscriptRuntime = input_full_transcript_runtime.Runtime(Self);
@@ -415,16 +402,6 @@ const App = struct {
 
     pub fn contextRegistry(_: *const Self) context_contract.Registry {
         return default_context_registry;
-    }
-
-    pub fn workspaceHostInfo(self: *const Self) ?*const js_host_workspace.Info {
-        if (comptime host_profile.js_host_workspace) return self.workspace_host.info();
-        return null;
-    }
-
-    pub fn workspaceExecutor(self: *const Self) ?js_host_workspace.Executor {
-        if (comptime host_profile.js_host_workspace) return self.workspace_host.executor();
-        return null;
     }
 
     pub fn promptPolicy(_: *const Self) prompt_policy.Policy {
@@ -446,8 +423,6 @@ const App = struct {
     pub fn urlOpener(_: *const Self) host.UrlOpener {
         return if (comptime host_profile.url_opening)
             url_opener.native_opener
-        else if (comptime host_profile.js_host_url_open)
-            js_host_url_opener.opener
         else
             host.unavailable_url_opener;
     }
@@ -500,8 +475,6 @@ const App = struct {
     pub fn clipboard(_: *const Self) host.Clipboard {
         return if (comptime host_profile.clipboard)
             native_host.clipboard
-        else if (comptime host_profile.js_host_clipboard)
-            js_host_clipboard.clipboard
         else
             host.unavailable_clipboard;
     }
@@ -523,7 +496,6 @@ const App = struct {
     usage_dashboard: usage_dashboard_runtime.Runtime = usage_dashboard_runtime.Runtime.init(std.heap.c_allocator),
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
-    workspace_host: WorkspaceHostRuntime = .{},
     workspace: app_workspace_runtime.State = .{},
     permission_engine: PermissionEngine = .{},
     permission_state: app_permission_runtime.State = .{},
@@ -647,22 +619,6 @@ const App = struct {
             else
                 .{},
         );
-        if (comptime host_profile.js_host_workspace) {
-            app.workspace_host = js_host_workspace.Runtime.init(alloc) catch |err| blk: {
-                if (err != error.WorkspaceUnavailable) {
-                    debug_trace.logf("workspace", "js host workspace unavailable err={s}", .{@errorName(err)});
-                }
-                break :blk .{};
-            };
-        }
-        if (comptime host_profile.js_host_prompt_history) {
-            if (js_host_prompt_history.available()) {
-                _ = app.prompt_history.initializeWithProvider(
-                    app.prompt_history.enabled,
-                    js_host_prompt_history.provider,
-                );
-            }
-        }
         app.shell.max_transcript_bytes = max_transcript_bytes;
         if (launch.requested_resume) |target| {
             app.requested_resume = target;
@@ -704,7 +660,7 @@ const App = struct {
             }
         }
         app.context_limits.applyCommandLine(launch.modifiers.context_limit_overrides);
-        if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
+        if (comptime host_profile.durable_sessions) {
             if (app.requested_resume != null) {
                 if (launch.upgrade_relaunch != null) {
                     try SessionAppRuntime.resumeRequestedSessionAfterUpgrade(
@@ -728,18 +684,15 @@ const App = struct {
             app.auto_upgrade_enabled = false;
         }
         if (comptime !host_profile.auto_upgrade) app.auto_upgrade_enabled = false;
-        try HostConfigAppRuntime.restore(&app, builtin_modes.registry);
         SessionAppRuntime.syncTerminalTitle(&app);
         return app;
     }
 
-    pub fn persistAcceptedModel(self: *App, model: []const u8) !void {
-        HostConfigAppRuntime.persistModel(self, model);
-    }
+    /// Native fx persists both through the profile settings store, so the
+    /// host-owned config store the WebAssembly surface used is gone.
+    pub fn persistAcceptedModel(_: *App, _: []const u8) !void {}
 
-    pub fn persistAcceptedPermissionMode(self: *App, mode: PermissionMode) !void {
-        HostConfigAppRuntime.persistPermissionMode(self, mode);
-    }
+    pub fn persistAcceptedPermissionMode(_: *App, _: PermissionMode) !void {}
 
     pub fn configureNotifications(self: *App) !void {
         // Register herdr hooks before NotificationAppRuntime.configure freezes
@@ -1819,14 +1772,8 @@ const App = struct {
         self.mcp.suppressProjectPrompts();
     }
 
-    fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {
-        if (comptime host_profile.tools) {
-            return builtin_tools.advertisement_set;
-        }
-        return browser_workspace_tools.selectToolSet(
-            false,
-            self.workspaceHostInfo() != null,
-        );
+    fn effectiveToolSet(_: *const App) tool_set_contract.ToolSet {
+        return builtin_tools.advertisement_set;
     }
 
     pub fn toolRegistry(self: *const App) tool_dispatch.Registry {
@@ -2074,8 +2021,8 @@ const App = struct {
                 .presentation = provider_catalog.find(.gateway),
                 .auth_strategy = .vercel,
                 .fallback_model_capabilities_fn = vercel_model_policy.capabilitiesForModel,
-                .agent_stream = js_host_stream_provider.provider(),
-                .model_catalog = js_host_model_catalog.provider,
+                .agent_stream = builtin_gateway.stream_provider,
+                .model_catalog = builtin_gateway.models,
                 .permission_reviewer = if (comptime host_profile.tools)
                     builtin_gateway.permission_reviewer.provider
                 else
@@ -2183,10 +2130,7 @@ const App = struct {
     pub fn fetchModelIds(self: *App) !std.ArrayList([]u8) {
         return AgentAppRuntime.fetchModelIds(
             self,
-            if (comptime host_target.is_wasm)
-                js_host_model_catalog.provider
-            else
-                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return error.ModelCatalogUnavailable,
+            self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return error.ModelCatalogUnavailable,
             builtin_gateway.models_path,
         );
     }
@@ -2198,7 +2142,7 @@ const App = struct {
                 return;
             }
             self.model_cache.loadCooperative(
-                js_host_model_catalog.provider,
+                builtin_gateway.models,
                 self.auth.modelCatalogAccess(),
             );
         } else {
@@ -2376,12 +2320,7 @@ const App = struct {
 
     pub fn executeToolCall(self: *App, request: agent_runtime.ToolExecutionRequest) !ToolExecutionResult {
         if (comptime !host_profile.tools) {
-            if (comptime !host_profile.js_host_workspace) {
-                return agent_runtime.unavailableHostToolResult(request.result_allocator);
-            }
-            if (self.workspaceHostInfo() == null) {
-                return agent_runtime.unavailableHostToolResult(request.result_allocator);
-            }
+            return agent_runtime.unavailableHostToolResult(request.result_allocator);
         }
         return AgentAppRuntime.executeToolCall(self, request, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
@@ -3055,7 +2994,7 @@ const App = struct {
         if (try self.mcp.refreshMenuHealth(self.alloc, @intCast(@max(io_mod.milliTimestamp(), 0)))) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
-        if (comptime host_profile.native_auth or host_profile.js_host_auth) {
+        if (comptime host_profile.native_auth) {
             try AuthAppRuntime.collectProviderPreparationFacts(self);
             try AuthAppRuntime.collectSourceInventoryFacts(self);
             try AuthAppRuntime.collectSignInFacts(self);
@@ -3335,41 +3274,6 @@ const App = struct {
 comptime {
     if (!builtin.is_test and !host_target.is_wasm) {
         @export(&main, .{ .name = "main" });
-    }
-}
-
-pub fn runWasmTerminal(init: std.process.Init) !void {
-    if (comptime !host_target.is_wasm or build_options.wasm_surface != .term) {
-        @compileError("runWasmTerminal requires -Dwasm-surface=term");
-    }
-    io_mod.setIo(init.io);
-    io_mod.setEnvironMap(init.environ_map);
-    const alloc = std.heap.c_allocator;
-    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
-    defer args.deinit();
-    _ = args.skip();
-    var cli_args: std.ArrayList([:0]const u8) = .empty;
-    defer cli_args.deinit(alloc);
-    while (args.next()) |arg| try cli_args.append(alloc, arg);
-
-    const parsed = try cli_surface.parseInteractiveLaunch(
-        alloc,
-        cli_args.items,
-        builtin_commands.top_level_registry,
-    );
-    var launch = switch (parsed) {
-        .interactive => |value| value,
-        .noninteractive => |value| {
-            var noninteractive = value;
-            defer noninteractive.deinit(alloc);
-            return error.WasmTerminalInteractiveLaunchRequired;
-        },
-    };
-    defer launch.deinit(alloc);
-    const outcome = try app_entry_runtime.runInteractiveCooperative(App, alloc, &launch, .local);
-    switch (outcome) {
-        .returned => {},
-        .exit => |code| if (code != 0) return error.WasmTerminalExited,
     }
 }
 
@@ -3867,9 +3771,8 @@ test "interactive app keeps notification handlers registered for live preference
     try std.testing.expect(!@hasField(App, "notification_player"));
 }
 
-test "native app preserves the built-in tool set without workspace metadata" {
+test "native app preserves the built-in tool set" {
     var app = App{ .alloc = std.testing.allocator };
-    try std.testing.expect(app.workspaceHostInfo() == null);
 
     const registry = app.toolRegistry();
     try std.testing.expect(registry.tools.ptr == builtin_tools.registry.tools.ptr);
@@ -4746,7 +4649,6 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 }
 
 test {
-    _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
@@ -4917,7 +4819,6 @@ test {
     _ = @import("core/tooling/tool_projection.zig");
     _ = @import("core/tooling/tool_dispatch.zig");
     _ = @import("core/tooling/tool_set.zig");
-    _ = @import("core/hosts/js_host_workspace.zig");
     _ = @import("core/tooling/tool_args.zig");
     _ = @import("core/tooling/tool_result_errors.zig");
     _ = @import("core/tooling/tool_runtime.zig");
@@ -4927,7 +4828,6 @@ test {
     _ = @import("builtins/modes.zig");
     _ = @import("builtins/tools.zig");
     _ = @import("tools/agent/ask_user_question.zig");
-    _ = @import("builtins/browser_workspace_tools.zig");
     _ = @import("core/tooling/model_request_budget.zig");
     _ = @import("core/tooling/web_fetch_runtime.zig");
     _ = @import("core/tooling/web_search_policy.zig");

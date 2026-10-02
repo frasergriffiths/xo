@@ -8,14 +8,6 @@ const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
-const js_host_tools = if (host_target.is_wasm)
-    @import("../core/hosts/js_host_tools.zig")
-else
-    struct {};
-const js_host_steering = if (host_target.is_wasm)
-    @import("../core/hosts/js_host_steering.zig")
-else
-    struct {};
 const io_mod = @import("../core/shared/io.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const jsonrpc = @import("jsonrpc.zig");
@@ -451,7 +443,6 @@ fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
 
 fn hostToolProvider(state: *server.ServerState) ?tool_dispatch.HostToolProvider {
     if (state.host_tools.tools.len == 0) return null;
-    if (comptime host_target.is_wasm) return js_host_tools.provider();
     return .{
         .context = @ptrCast(state),
         .call_fn = callHostTool,
@@ -1491,14 +1482,8 @@ fn takeLibfxSteeringBoundary(
 ) !worker_runtime.SteeringBoundaryResult {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const close_if_empty = kind == .finalizing;
-    const messages = if (comptime host_target.is_wasm)
-        try js_host_steering.takeAll(arena)
-    else
-        try server.takeLibfxSteering(ctx.state, arena, close_if_empty);
+    const messages = try server.takeLibfxSteering(ctx.state, arena, close_if_empty);
     if (messages.len > 0) return .{ .continue_turn = messages };
-    if (comptime host_target.is_wasm) {
-        if (close_if_empty) js_host_steering.close();
-    }
     return if (kind == .cancelled) .interrupt else .none;
 }
 
@@ -2232,11 +2217,9 @@ fn commitContextCompaction(
             const usage = try session.session_rt.usage.snapshot(ctx.alloc);
             if (next.usage) |*old| old.deinit(ctx.alloc);
             next.usage = usage;
-            const revision = try @import("../core/session/js_host_session_store.zig").commit(ctx.alloc, next, session.wasm_revision);
             if (session.wasm_revision) |old| ctx.alloc.free(old);
             base.deinit(ctx.alloc);
             session.wasm_state = next;
-            session.wasm_revision = revision;
             next_owned = false;
             if (active_prefix != null) {
                 if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
