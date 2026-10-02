@@ -328,31 +328,6 @@ zig build test                      # runs every VT and resize test
 
 When a tmux or tape-based scenario exposes a bug, reproduce it as a Zig unit test in `resize_tests.zig` (or a new sibling) before fixing. The test lands the fix as a regression.
 
-## Benchmarks
-
-Startup latency benchmarks live in `benchmarks/` and run in CI via `.github/workflows/bench.yml`.
-
-```bash
-./benchmarks/startup.sh            # full run (100 iterations, builds ReleaseSafe, needs hyperfine)
-./benchmarks/startup.sh --quick    # quick run (20 iterations)
-```
-
-The CI workflow builds a ReleaseSafe binary, measures six CLI paths with hyperfine, and enforces per-command latency budgets. PRs that exceed a budget fail the check. On `main`, results are uploaded to Vercel Blob for historical tracking.
-
-The startup benchmark uses `FX_BENCH=1`, an environment variable that runs through arg parsing and CLI dispatch, then exits before TTY initialization. This lives in `src/core/app/app_entry_runtime.zig`.
-
-Current raw wall-clock contract:
-
-* Linux CI: 2ms for every command
-* Non-Linux local runs: informational raw means
-
-The Linux CI runner is the authoritative product budget. Local macOS process
-and dynamic-loader floors vary enough to exceed 2ms independently of fx, so
-local runs report raw means without assigning a substitute product budget. The
-process baseline is diagnostic only and is never subtracted.
-
-When adding features, consider their impact on startup latency. The `fx help` path is the baseline cold-start benchmark.
-
 ## Binary Size Observability
 
 Every pull request runs `.github/workflows/binary-size.yml` across Linux x86_64,
