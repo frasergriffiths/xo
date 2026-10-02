@@ -507,60 +507,6 @@ status calibration, and a separate native image-flow memory screen. Review the
 retained measurements before changing release signing defaults; successful
 measurement is not performance approval.
 
-## Benchmarks
-
-Startup latency benchmarks run automatically on every PR and push to `main` via `.github/workflows/bench.yml`.
-
-The workflow builds a ReleaseSafe binary, then uses [hyperfine](https://github.com/sharkdp/hyperfine) to measure wall-clock time for six paths:
-
-| Command                | Budget | What it measures                                   |
-| ---------------------- | ------ | -------------------------------------------------- |
-| `fx` (startup)         | 2ms    | Binary launch through CLI dispatch (no TTY needed) |
-| `fx help`              | 2ms    | Minimal startup, pure text output                  |
-| `fx status --json`     | 2ms    | Config read + JSON serialization                   |
-| `fx background --json` | 2ms    | Background record read                             |
-| `fx doctor --json`     | 2ms    | System checks, subprocess spawns                   |
-| `fx sessions --json`   | 2ms    | Session directory read                             |
-
-On PRs the check **fails** if any command exceeds its budget.
-
-The table is the authoritative Linux CI contract. Non-Linux local runs report
-raw means for comparison but do not assign a substitute product budget because
-the host process and dynamic-loader floor can independently exceed 2ms. The
-process baseline is diagnostic only and is never subtracted.
-
-The startup benchmark uses `FX_BENCH=1`, which runs through CLI dispatch and exits before TTY initialization.
-
-To run locally:
-
-```bash
-brew install hyperfine             # macOS (one-time)
-./benchmarks/startup.sh            # full run (100 iterations, builds ReleaseSafe)
-./benchmarks/startup.sh --quick    # quick run (20 iterations)
-```
-
-CI uses `--runs 100` with a reduced warmup and skips the build step because the
-workflow builds ReleaseSafe first. Results are written to
-`benchmarks/results/` (gitignored).
-
-The libfx runtime job measures cold startup, warm prompts, host-tool calls,
-stream throughput, and Agent cleanup. Its direct Pi comparison uses an external
-Zig HTTP server, Pi 0.84.4, and three alternating 100-sample rounds. On Bun,
-native libfx must match or beat Pi p50 and stay within 0.25 ms of Pi p95.
-The Node comparison is report-only because Node's bundled fetch client and
-Pi's dispatcher have different warm-request overhead. Both runtimes still
-require valid measurements, 300 samples, and exactly one inference request per
-prompt. Native/Wasm latency, host-tool, and resource gates remain blocking.
-Live model latency and bulk-stream throughput remain informational.
-
-```sh
-zig build-exe benchmarks/libfx/fake-inference-server.zig -O ReleaseSafe -femit-bin=/tmp/libfx-bench-server
-node benchmarks/libfx/bench-competitive.mjs --server /tmp/libfx-bench-server --pi-root /tmp/libfx-pi --out benchmarks/results/libfx
-```
-
-Build the SDK artifacts and install the pinned Pi package first, as shown in
-`.github/workflows/bench.yml`. Raw per-prompt samples remain in the output directory.
-
 ## Before Marking a PR Ready
 
 Minimum checklist:
