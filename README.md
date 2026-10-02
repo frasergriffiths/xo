@@ -11,7 +11,7 @@
  ⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ```
 
-fx is a coding agent CLI written in Zig: a small native binary that is open source (Apache-2.0), model-agnostic, and embeddable as a harness in larger systems. Its interface stays closer to a Unix shell than an IDE in the terminal.
+fx is a coding agent CLI written in Zig: a single native binary, open source under Apache-2.0, model-agnostic, and drivable from other tools over the Agent Client Protocol. Its interface stays closer to a Unix shell than an IDE in the terminal.
 
 ## Highlights
 
@@ -100,65 +100,81 @@ Slugs are the gateway's provider identifiers (letters, digits, dashes, for examp
 
 fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with the `theme` setting or `FX_THEME=<name>` per launch. Without an explicitly selected theme, diff markers and edit counts stay monochrome; selecting any theme adds its diff marker colors. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.
 
-## Embed fx
+## Connect a client over ACP
 
-fx builds as a native binary and runs over the Agent Client Protocol, so editors
-and other tools can drive a real terminal session.
+fx ships one embedding surface: an Agent Client Protocol server over stdio. Start
+it with `fx acp` and point your editor or tool at it.
 
-| Surface | Use |
-| --- | --- |
-| `fx acp` | Connect the agent to editors and other Agent Client Protocol clients. |
+```bash
+fx acp                          # serve ACP on stdin and stdout
+fx acp --model anthropic/claude-sonnet-5.5
+fx acp --log-file /tmp/fx-acp.log
+```
+
+The server reports `protocolVersion` 1 on `initialize` and advertises session
+loading, prompt images and embedded context, HTTP and SSE MCP transports, and
+session list, resume, and close capabilities. Providers available are the Vercel
+AI Gateway, a Codex subscription, and a Grok subscription.
+
+fx also accepts the `libfx/*` ACP methods (`new`, `steer`, `checkpoint`,
+`restore`, `tool_call`). They are part of the protocol fx speaks and are
+unaffected by the removal of the JavaScript SDK.
+
+There is no JavaScript or WebAssembly package. Build the binary and talk to it
+over ACP, or use `fx ask` from a script.
 
 ## Slack workspace installation
 
 Run `fx slack install` to install the fx bot in the configured Vercel Slack
-workspace. Keep the command running and authorize Slack in a browser on the same
-computer. The HTTPS callback at fx.sh returns the authorization to the CLI;
-PKCE state and the verifier stay in memory. The companion web bridge must be
-deployed and configured first.
+workspace. Leave the command running and authorize Slack in a browser on the same
+computer. The HTTPS callback at fx.sh returns the authorization to the CLI, so the
+PKCE state and verifier never leave memory. The companion web bridge has to be
+deployed and configured before installation will work.
 
-After the CLI saves the installation, the browser returns to an fx.sh confirmation
-page. You can close that tab or refresh it after the command exits.
+Once the CLI saves the installation, the browser lands on an fx.sh confirmation
+page. Close that tab or refresh it after the command exits.
 
-`fx slack status --json` reports local installation metadata without tokens.
-Plain-text output omits Slack IDs and shows expiration as a readable UTC date
-and time. JSON output retains the IDs and Unix timestamps for scripts.
-`fx slack refresh` rotates the local bot credentials when needed. Credentials
-live in the owner-only file `~/.fx/slack/installation.json`; no hosted database
-or background refresh service is created. An expired refresh token requires
-installation again. This workspace operation is separate from each employee's
-MCP user authorization. Employees connect their own account with
-`/mcp auth slack --open` in an fx session (or `fx mcp auth slack` from a terminal).
-For `https://mcp.slack.com/mcp`, the CLI recognizes the fx app by its public
-Client ID and uses the HTTPS callback for personal login. Changing that Client
-ID requires a CLI update. OAuth uses the canonical form of Slack's advertised
-resource, `https://mcp.slack.com/`, while the MCP transport remains at
-`https://mcp.slack.com/mcp`. First login and reauthorization request the full shared
-`user_scopes` list from fx.sh. If local `scopes` are configured, they must include
-every shared scope; extra local scopes are not requested. A narrower or explicitly
-empty list stops authorization before opening the browser, leaving the configuration
-and stored credentials unchanged. Remove the override only if you want to authorize
-the full shared scope set. Per-user read-only subsets are not supported for the fx app. Saved scopes,
-Slack's advertised capabilities, and scope challenges cannot expand this
-request. The shared list contains nine personal scopes configured for fx and
-advertised by Slack MCP; changing it requires a deliberate configuration update
-and any necessary Slack approval. This does not revoke
-permissions on previously issued tokens or change token refresh behavior. It
-opens an ephemeral loopback listener instead of the configured `callback_port`,
-keeps PKCE and personal tokens in the CLI, and shows “Slack connected” after
-saving to the existing MCP credential store. Other MCP providers and different
-Slack app Client IDs retain their direct callback behavior without contacting
-fx.sh. Fx app authorization requires fx.sh to be available; an unavailable
-metadata endpoint returns `SlackBridgeUnavailable`. Deploy the web
-personal-authorization routes and scope metadata before releasing this CLI.
-Missing or invalid shared scopes stop authorization rather than falling back
-to Slack's broader capabilities. Keep the registered
-localhost callback for older clients until they have upgraded. Slack workspace
-approval requirements still apply to personal authorization.
+`fx slack status --json` reports local installation metadata and no tokens. Plain
+text hides the Slack IDs and prints the expiry as a readable UTC date; JSON keeps
+the IDs and Unix timestamps for scripts. `fx slack refresh` rotates the local bot
+credentials when they need it.
 
-Bot installation does not establish whether
-Slack will display a hoverable “Sent using @fx” attribution; that requires a
-live message test.
+Credentials live in the owner-only file `~/.fx/slack/installation.json`. There is
+no hosted database and no background refresh service, so an expired refresh token
+means installing again.
+
+## Slack user authorization
+
+Workspace installation and per-user authorization are separate steps. Each
+employee connects their own account with `/mcp auth slack --open` inside an fx
+session, or `fx mcp auth slack` from a terminal.
+
+For `https://mcp.slack.com/mcp`, fx recognizes its own app by public Client ID
+and uses the HTTPS callback for personal login. Changing that Client ID means a
+CLI update. OAuth targets the canonical form of Slack's advertised resource,
+`https://mcp.slack.com/`, while the MCP transport itself stays at
+`https://mcp.slack.com/mcp`.
+
+First login and reauthorization ask for the full shared `user_scopes` list from
+fx.sh. A local `scopes` override has to be at least that wide, and extra local
+scopes are never requested. Anything narrower stops authorization before the
+browser opens, leaving configuration and stored credentials untouched. Saved
+scopes, Slack's advertised capabilities, and scope challenges cannot widen the
+request. The shared list is nine personal scopes, configured for fx and
+advertised by Slack MCP; changing it is a deliberate configuration change and may
+need Slack approval. It does not revoke permissions on tokens already issued.
+
+Personal authorization opens an ephemeral loopback listener instead of the
+configured `callback_port`, keeps PKCE and personal tokens in the CLI, and shows
+"Slack connected" once the tokens land in the existing MCP credential store. Other
+MCP providers and other Slack app Client IDs keep their direct callback behavior
+and never contact fx.sh. When fx.sh is unavailable the metadata endpoint returns
+`SlackBridgeUnavailable`, and missing or invalid shared scopes stop authorization
+rather than falling back to Slack's broader capabilities. Slack's own workspace
+approval requirements still apply.
+
+Bot installation does not tell you whether Slack will show a hoverable "Sent
+using @fx" attribution. That needs a live message test.
 
 ## Build from source
 

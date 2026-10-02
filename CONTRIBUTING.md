@@ -39,7 +39,7 @@ zig build run
 
 Keep the local development loop focused: run the narrowest test that covers the changed path, build fx, and exercise the change using `./zig-out/bin/fx`. The installed `fx` on `PATH` is not valid development evidence.
 
-Once the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. The **Full CI** workflow runs the complete deterministic suite on native Linux x86_64, Linux aarch64, macOS x86_64, and macOS aarch64 runners. The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting and the public-surface audit run in those ReleaseSafe jobs. Four duration-balanced, isolated ReleaseSafe E2E shards per platform use checked-in weights to assign every Bun test file once; files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after tmux is reset.
+Once the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. The **Full CI** workflow runs the complete deterministic suite on native Linux x86_64, Linux aarch64, macOS x86_64, and macOS aarch64 runners. The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting, the public-surface audit, and the signing and release-routing tests run in those jobs. A `full-suite` job then reads the workflow run back and asserts its own native job succeeded.
 
 Standard PR CI reports ReleaseSafe Build & Test and deterministic E2E results. Do not mark the draft PR ready until all four Full CI jobs and the final ship gate have succeeded for the exact current commit. Each platform aggregate requires its ReleaseSafe native check and all four ReleaseSafe E2E shards. A result from an older commit does not count. Live model evals are separate from this gate because they require credentials and are not deterministic.
 
@@ -106,16 +106,16 @@ If that is unclear, stop and define it first.
 
 ### PGSO corpus ownership
 
-Classify every root `tests/e2e/*.test.ts` file in
-`scripts/pgso/corpus.json`. Put common or performance-sensitive behavior in
-training. Put important correctness, recovery, security, and rare behavior in
-verification-only. Exclude only nondeterministic, live-network, credentialed,
-sound-related, or harness-only coverage, and record the reason.
+Classify every scenario in `scripts/pgso/corpus.json`. Put common or
+performance-sensitive behavior in training. Put important correctness,
+recovery, security, and rare behavior in verification-only. Exclude only
+nondeterministic, live-network, credentialed, sound-related, or harness-only
+coverage, and record the reason.
 
-Tests added to an existing file inherit its classification. Reconsider that
-classification when a feature changes the file's product role, and remove stale
-entries when deleting a feature or E2E owner. Normal PR CI rejects missing,
-duplicate, stale, and unclassified files without running the full PGSO gate.
+Reconsider a scenario's classification when a feature changes what it profiles,
+and remove stale entries when deleting a feature or scenario. Normal PR CI
+rejects missing, duplicate, stale, and unclassified scenarios without running the
+full PGSO gate.
 
 ## Configuration and State
 
@@ -166,19 +166,18 @@ persistence, and explicit refresh. The web bridge contract is fixed to
 `https://fx.sh/api/slack/install/config`, `/api/slack/install`, and
 `/api/slack/oauth/callback`. Employee MCP authentication is separate.
 
-Build with `zig build`, then run `cd tests/e2e && bun test slack-install.test.ts`.
-The fixture exercises the freshly built binary and real loopback sockets without
-live Slack credentials. `FX_E2E_SLACK_ORIGIN` accepts only an HTTP `127.0.0.1`
-origin with a non-privileged port, serving public metadata plus mocked
-`/api/oauth.v2.access` and `/api/auth.test` responses. Production uses pinned
-Slack endpoints. Local records bind to the bridge origin to prevent fixture
+Build with `zig build`, then exercise the binary directly. The TypeScript E2E
+suite was removed along with `tests/`, so Slack installation is verified by hand
+against a loopback origin: `FX_E2E_SLACK_ORIGIN` accepts only an HTTP
+`127.0.0.1` origin with a non-privileged port, serving public metadata plus
+mocked `/api/oauth.v2.access` and `/api/auth.test` responses. Production uses
+pinned Slack endpoints. Local records bind to the bridge origin to prevent fixture
 commands from refreshing production credentials. `FX_NO_OPEN_BROWSER=1` prints
 the start URL for headless operation; authorization still requires a browser on
 the same computer as the listener.
 
-This E2E owner is verification-only in the PGSO corpus because it covers a rare
-workspace setup operation and security boundaries. Live Slack authorization and
-message attribution are not deterministic tests.
+Live Slack authorization and message attribution are not deterministic, so
+Slack never appears in the PGSO corpus.
 
 ## MCP
 
@@ -427,34 +426,34 @@ test "my resize scenario" {
 
 Add it to `src/ui/resize_tests.zig`. See the file header for what each Harness method does.
 
-### tmux end-to-end test (real SIGWINCH, seconds per test)
+### tmux repro (real SIGWINCH, manual)
 
-For bugs that only show up with a real terminal and a real signal (timing, input integration, terminal-emulator quirks), add a scenario to `tests/e2e/tui-resize.test.ts` using the helpers in `tmux-helpers.ts`:
+For bugs that only show up with a real terminal and a real signal, such as
+timing, input integration, or terminal-emulator quirks, drive the built binary
+in a tmux pane by hand:
 
-```typescript
-test("my scenario", async () => {
-    session = await TmuxSession.create({ width: 120, height: 40 });
-    await session.waitForText(">", 10_000);
-    await session.resizeWindow(80, 30);
-    const grid = await session.capturePaneGrid();
-    expect(findFooter(grid)).not.toBeNull();
-}, 30_000);
+```bash
+tmux new-session -d -s fxbug -x 120 -y 40 './zig-out/bin/fx'
+tmux resize-window -t fxbug -x 80 -y 30
+tmux capture-pane -p -t fxbug          # rendered grid
+tmux capture-pane -p -e -t fxbug       # grid with escape sequences
 ```
+
+Prefer the in-process engine above. It costs sub-seconds and needs no fd.
 
 ### Tape-based test (replay a real capture)
 
 For bugs reported by a user, have them run the built binary with an exact
 `FX_RECORD=<path>`, or use `FX_DEBUG_RECORD=1` for an automatic private tape.
 `FX_DEBUG_RECORD_SILENT_BANNER=1` hides the developer-only startup notice from
-the inline transcript without disabling capture; Ctrl+O still shows it. Drop
-the tape in `tests/e2e/tapes/<name>.fxtape` and assert against the built replay
-command:
+the inline transcript without disabling capture; Ctrl+O still shows it. Store
+the tape in a path outside `src/` and assert against the built replay command:
 
 ```bash
-./zig-out/bin/fx replay tests/e2e/tapes/my-bug.fxtape --golden tests/e2e/tapes/my-bug.txt
+./zig-out/bin/fx replay /tmp/my-bug.fxtape --golden /tmp/my-bug.txt
 ```
 
-Check in the golden file and wire a regression test that re-runs `fx replay` in CI and diffs.
+Check in the golden file and write a Zig test that re-runs `fx replay` and diffs.
 
 ## What Not To Do
 
