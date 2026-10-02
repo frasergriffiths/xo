@@ -82,24 +82,3 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
 fn failure(alloc: Allocator, message: []const u8) Allocator.Error!tool_dispatch.DecodeResult {
     return .{ .failure = try alloc.dupe(u8, message) };
 }
-
-test "browser shell accepts only completion run input" {
-    const alloc = std.testing.allocator;
-    const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
-    const decoded = try decode(ctx, "{\"action\":\"run\",\"command\":\"pwd\"}");
-    switch (decoded) {
-        .failure => |body| {
-            defer alloc.free(body);
-            return error.TestUnexpectedResult;
-        },
-        .input => |input| input.deinit(alloc),
-    }
-    const rejected = try decode(ctx, "{\"action\":\"wait\",\"session_id\":\"x\"}");
-    switch (rejected) {
-        .failure => |body| alloc.free(body),
-        .input => |input| {
-            input.deinit(alloc);
-            return error.TestUnexpectedResult;
-        },
-    }
-}

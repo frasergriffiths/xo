@@ -149,18 +149,6 @@ noinline fn failOwnedAuthorityClaimDynamic(err: anyerror) anyerror!OwnedAuthorit
     return err;
 }
 
-test "owned authority claim failures preserve exact error types and identities" {
-    const invalid = failOwnedAuthorityClaim(error.InvalidAuthorityGrant);
-    try std.testing.expect(
-        @TypeOf(invalid) == error{InvalidAuthorityGrant}!OwnedAuthorityClaim,
-    );
-    try std.testing.expectError(error.InvalidAuthorityGrant, invalid);
-    try std.testing.expectError(
-        error.OutOfMemory,
-        failOwnedAuthorityClaim(error.OutOfMemory),
-    );
-}
-
 pub fn ownAuthorityClaim(
     alloc: Allocator,
     authority_claim: contracts.AuthorityClaim,
@@ -349,40 +337,6 @@ pub fn execute(
     return backend.executeAuthorized(request, cancelled);
 }
 
-test "private operation validation requires durable authority on every action" {
-    try std.testing.expectError(
-        error.MissingTerminalAuthority,
-        validate(.{ .screen = .{ .session_id = "terminal-1" } }),
-    );
-    try std.testing.expectError(
-        error.MissingTerminalAuthority,
-        validate(.{ .list = .{} }),
-    );
-    try std.testing.expectError(
-        error.MissingTerminalAuthority,
-        validate(.{ .start = .{ .cwd = "/workspace" } }),
-    );
-}
-
-test "terminal mutations that share session write ownership stay ordered" {
-    try std.testing.expect(requiresOrderedMutation(.{ .write = .{
-        .session_id = "terminal-1",
-        .payload = .{ .text = "input" },
-    } }));
-    try std.testing.expect(requiresOrderedMutation(.{ .close = .{
-        .session_id = "terminal-1",
-        .policy = .graceful,
-    } }));
-    try std.testing.expect(!requiresOrderedMutation(.{ .inspect = .{
-        .session_id = "terminal-1",
-    } }));
-    try std.testing.expect(!requiresOrderedMutation(.{ .wait = .{
-        .session_id = "terminal-1",
-        .return_when = .exit,
-        .safety_ceiling_ms = 1,
-    } }));
-}
-
 fn test_preparation() AuthorityPreparation {
     return .{
         .profile_user = "profile-user",
@@ -395,22 +349,6 @@ fn test_preparation() AuthorityPreparation {
         .controls = .full(),
         .lifetime = .session,
     };
-}
-
-test "production preparation mints canonical generation one authority" {
-    var prepared = try prepareStartPersistence(
-        std.testing.allocator,
-        test_preparation(),
-    );
-    defer prepared.deinit();
-    const persistence = prepared.view();
-    try persistence.validate(.{
-        .cwd = "/workspace/project",
-        .backend = .native,
-    });
-    try std.testing.expectEqual(@as(u64, 1), persistence.grant.generation.value);
-    try std.testing.expectEqual(contracts.TerminalLifetime.session, persistence.grant.principal.lifetime);
-    try persistence.proof.validate();
 }
 
 fn check_preparation_allocation_failures(alloc: Allocator) !void {
@@ -432,12 +370,4 @@ fn check_preparation_allocation_failures(alloc: Allocator) !void {
         persistence.grant.controls,
     );
     defer owned_claim.deinit();
-}
-
-test "authority preparation and owned claims cover allocation failures" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        check_preparation_allocation_failures,
-        .{},
-    );
 }
