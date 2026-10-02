@@ -16,7 +16,7 @@ fx is a coding agent CLI written in Zig: a small native binary that is open sour
 ## Highlights
 
 - **Any model:** Vercel AI Gateway, ChatGPT or Grok subscriptions, or your own OpenAI-compatible endpoint such as Ollama or OpenRouter
-- **Any interface:** interactive shell, one-shot `fx ask` for scripts, or embedded through libfx and ACP
+- **Any interface:** interactive shell, one-shot `fx ask` for scripts, or embedded through ACP
 - **Shell-like output:** inline rendering that preserves your terminal scrollback
 - **Extensible:** skills, MCP servers, and subagents
 
@@ -102,15 +102,12 @@ fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark
 
 ## Embed fx
 
-fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.
+fx builds as a native binary and runs over the Agent Client Protocol, so editors
+and other tools can drive a real terminal session.
 
 | Surface | Use |
 | --- | --- |
-| `fx acp` | Connect the native agent to editors and other Agent Client Protocol clients. |
-| `createFxAgent()` | Embed the agent core in a JavaScript host with `fx-core.wasm`. |
-| `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
-
-The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). See the [WebAssembly SDK](sdk/README.md). The WebAssembly SDK is experimental.
+| `fx acp` | Connect the agent to editors and other Agent Client Protocol clients. |
 
 ## Slack workspace installation
 

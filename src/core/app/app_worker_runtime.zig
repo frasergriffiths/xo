@@ -145,6 +145,7 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
         pacer: assistant_pacer.AssistantPacer = .{},
         total_input_tokens: u64 = 7,
         total_output_tokens: u64 = 11,
+        workspace_root: []const u8 = "",
     };
     const Ownership = struct {
         references: usize = 0,
@@ -172,7 +173,7 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
         defer tmp.cleanup();
         const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
         defer alloc.free(root);
-        var app: ShutdownApp = .{ .alloc = alloc };
+        var app: ShutdownApp = .{ .alloc = alloc, .workspace_root = root };
         defer app.session.deinit(alloc);
         defer app.session_persistence.deinit(alloc);
         defer app.worker.deinit(std.heap.c_allocator);
