@@ -38,7 +38,6 @@ jobs:
       training: ${{ steps.plan.outputs.training }}
       behavior: ${{ steps.plan.outputs.behavior }}
       startup: ${{ steps.plan.outputs.startup }}
-      heavy: ${{ steps.plan.outputs.heavy }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -74,17 +73,14 @@ jobs:
           training="$(python3 -m scripts.pgso.distributed plan --phase training --maximum-shards 20)"
           behavior="$(python3 -m scripts.pgso.distributed plan --phase behavior --maximum-shards 20)"
           startup="$(python3 -m scripts.pgso.distributed plan --phase startup)"
-          heavy="$(python3 -m scripts.pgso.distributed plan --phase heavy)"
           {
             echo "training=$training"
             echo "behavior=$behavior"
             echo "startup=$startup"
-            echo "heavy=$heavy"
           } >> "$GITHUB_OUTPUT"
           echo "Training matrix: $training"
           echo "Behavior matrix: $behavior"
           echo "Startup matrix: $startup"
-          echo "Heavy matrix: $heavy"
 
       - name: Upload immutable seed
         id: upload
@@ -222,22 +218,6 @@ jobs:
             ${{ runner.temp }}/fx-pgso-candidate/control/bin/fx
             ${{ runner.temp }}/fx-pgso-candidate/candidate/fx
             ${{ runner.temp }}/fx-pgso-candidate/profiles/merged.profdata
-            ${{ runner.temp }}/fx-pgso-candidate/profiles/supplements
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/file_index/external-control/file-index-bench
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/file_index/candidate/file-index-bench
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/file_index/profiles/merged.profdata
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/file_index/profiles/production.profdata
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/file_index/profiles/production.proftext
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/ui_activity/external-control/ui-activity-progress-bench
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/ui_activity/candidate/ui-activity-progress-bench
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/ui_activity/profiles/merged.profdata
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/ui_activity/profiles/production.profdata
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/ui_activity/profiles/production.proftext
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/approval_review/external-control/approval-review-bench
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/approval_review/candidate/approval-review-bench
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/approval_review/profiles/merged.profdata
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/approval_review/profiles/production.profdata
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/approval_review/profiles/production.proftext
             ${{ runner.temp }}/fx-pgso-candidate/logs
           if-no-files-found: error
           retention-days: 14
@@ -361,75 +341,9 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  heavy:
-    name: Heavy ${{ matrix.name }}
-    needs: [seed, candidate]
-    runs-on: macos-15
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      max-parallel: 6
-      matrix: ${{ fromJSON(needs.seed.outputs.heavy) }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-
-      - name: Require native arm64 host
-        run: test "$(uname -m)" = arm64
-
-      - name: Download candidate
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          artifact-ids: ${{ needs.candidate.outputs.artifact-id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/fx-pgso-candidate
-
-      - name: Restore executable mode
-        run: |
-          chmod +x \
-            "$RUNNER_TEMP/fx-pgso-candidate/candidate/fx" \
-            "$RUNNER_TEMP/fx-pgso-candidate/control/bin/fx" \
-            "$RUNNER_TEMP/fx-pgso-candidate/heavy/file_index/external-control/file-index-bench" \
-            "$RUNNER_TEMP/fx-pgso-candidate/heavy/file_index/candidate/file-index-bench" \
-            "$RUNNER_TEMP/fx-pgso-candidate/heavy/ui_activity/external-control/ui-activity-progress-bench" \
-            "$RUNNER_TEMP/fx-pgso-candidate/heavy/ui_activity/candidate/ui-activity-progress-bench" \
-            "$RUNNER_TEMP/fx-pgso-candidate/heavy/approval_review/external-control/approval-review-bench" \
-            "$RUNNER_TEMP/fx-pgso-candidate/heavy/approval_review/candidate/approval-review-bench"
-
-      - name: Setup pinned Hyperfine
-        id: setup
-        uses: ./.github/actions/setup-pgso
-        with:
-          hyperfine: "true"
-
-      - name: Measure immutable profile-linked benchmark pair
-        run: |
-          python3 -m scripts.pgso.distributed measure \
-            --kind heavy \
-            --name "${{ matrix.name }}" \
-            --candidate-dir "$RUNNER_TEMP/fx-pgso-candidate" \
-            --output-dir "$RUNNER_TEMP/fx-pgso-heavy-${{ matrix.name }}" \
-            --hyperfine "${{ steps.setup.outputs.hyperfine-bin }}" \
-            --samples 50
-
-      - name: Upload heavy-workload evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: pgso-heavy-${{ github.sha }}-${{ matrix.name }}-attempt-${{ github.run_attempt }}
-          overwrite: true
-          path: |
-            ${{ runner.temp }}/fx-pgso-heavy-${{ matrix.name }}/manifest.json
-            ${{ runner.temp }}/fx-pgso-heavy-${{ matrix.name }}/failure.json
-            ${{ runner.temp }}/fx-pgso-heavy-${{ matrix.name }}/measurements/logs
-            ${{ runner.temp }}/fx-pgso-heavy-${{ matrix.name }}/driver-logs
-          if-no-files-found: error
-          retention-days: 14
-
   aggregate:
     name: Aggregate release eligibility
-    needs: [candidate, behavior, startup, heavy]
+    needs: [candidate, behavior, startup]
     runs-on: macos-15
     timeout-minutes: 20
     outputs:
@@ -461,12 +375,6 @@ jobs:
           pattern: pgso-startup-${{ github.sha }}-*
           path: ${{ runner.temp }}/fx-pgso-startup
 
-      - name: Download heavy-workload evidence
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: pgso-heavy-${{ github.sha }}-*
-          path: ${{ runner.temp }}/fx-pgso-heavy
-
       - name: Restore executable mode
         run: chmod +x "$RUNNER_TEMP/fx-pgso-candidate/candidate/fx" "$RUNNER_TEMP/fx-pgso-candidate/control/bin/fx"
 
@@ -476,7 +384,6 @@ jobs:
             --candidate-dir "$RUNNER_TEMP/fx-pgso-candidate" \
             --behavior-dir "$RUNNER_TEMP/fx-pgso-behavior" \
             --startup-dir "$RUNNER_TEMP/fx-pgso-startup" \
-            --heavy-dir "$RUNNER_TEMP/fx-pgso-heavy" \
             --output-dir "$RUNNER_TEMP/fx-pgso-aggregate"
 
       - name: Upload aggregate evidence

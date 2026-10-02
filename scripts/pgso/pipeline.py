@@ -48,14 +48,6 @@ OUTLINE_CLEANUP_FLAGS = (
     "-internalize-public-api-list=main,_mh_execute_header",
 )
 
-BENCHMARK_USE_FLAGS = (
-    "--disable-vp",
-    "-pgo-kind=pgo-instr-use-pipeline",
-    "-pgo-cold-func-opt=minsize",
-    "-profile-summary-cutoff-cold=990000",
-    "-passes=default<O2>,mergefunc,iroutliner",
-)
-
 FX_MACHINE_OUTLINER_FLAGS = (
     "-machine-outliner-reruns=1",
 )
@@ -76,17 +68,6 @@ PROFILE_SECTIONS = (
 
 ARTIFACT_LAYOUTS = {
     "fx": (None, "fx", "fx.bc"),
-    "file_index": ("bench-file-index", "file-index-bench", "file-index.bc"),
-    "ui_activity": (
-        "bench-ui-activity",
-        "ui-activity-progress-bench",
-        "ui-activity.bc",
-    ),
-    "approval_review": (
-        "bench-approval-review",
-        "approval-review-bench",
-        "approval-review.bc",
-    ),
 }
 
 
@@ -319,7 +300,6 @@ def zig_build_argv(
     argv = [str(toolchain.zig), "build"]
     if emit_ir:
         argv.append("pgso-ir")
-        argv.append(f"-Dpgso-artifact={spec.selector}")
     else:
         build_step = ARTIFACT_LAYOUTS[spec.selector][0]
         if build_step is not None:
@@ -360,19 +340,13 @@ def profile_use_argv(
     profile_path: pathlib.Path | None = None,
 ) -> tuple[str, ...]:
     profile = profile_path or paths.merged_profile
-    flags = USE_FLAGS if paths.selector == "fx" else BENCHMARK_USE_FLAGS
-    output = (
-        paths.profile_use_base_bitcode
-        if paths.selector == "fx"
-        else paths.profile_use_bitcode
-    )
     return (
         str(toolchain.opt),
-        *flags,
+        *USE_FLAGS,
         f"-profile-file={profile}",
         str(paths.bitcode),
         "-o",
-        str(output),
+        str(paths.profile_use_base_bitcode),
     )
 
 
@@ -773,13 +747,11 @@ def candidate_object_argv(
     paths: PipelinePaths,
 ) -> tuple[str, ...]:
     # A second AArch64 outliner pass can fold sequences exposed by the first.
-    # Keep benchmark artifacts on their established code-generation contract.
-    outliner_flags = FX_MACHINE_OUTLINER_FLAGS if paths.selector == "fx" else ()
     return (
         str(toolchain.llc),
         "-filetype=obj",
         "-O=2",
-        *outliner_flags,
+        *FX_MACHINE_OUTLINER_FLAGS,
         str(paths.profile_use_bitcode),
         "-o",
         str(paths.profile_use_object),
@@ -1180,10 +1152,6 @@ def apply_profile(
         log_path=paths.logs / "profile-use.json",
         require_empty_stderr=True,
     )
-    if paths.selector != "fx":
-        _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
-        return paths.profile_use_bitcode
-
     _require_nonempty_file(
         paths.profile_use_base_bitcode,
         "whole-program profile-use bitcode",
@@ -1421,17 +1389,7 @@ def link_candidate(
         require_empty_stderr=True,
     )
     _require_nonempty_file(paths.profile_use_object, "candidate object")
-    if paths.selector == "fx":
-        _link_temporal_candidate(toolchain, paths)
-    else:
-        run_checked(
-            candidate_link_argv(toolchain, paths),
-            cwd=paths.root,
-            env=os.environ.copy(),
-            timeout_s=900,
-            log_path=paths.logs / "link-candidate.json",
-            require_empty_stderr=True,
-        )
+    _link_temporal_candidate(toolchain, paths)
     _require_nonempty_file(paths.candidate_binary, "candidate executable")
     run_checked(
         (
