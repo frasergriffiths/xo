@@ -9,7 +9,6 @@ import unittest
 
 from scripts.pgso.model import PgsoError, sha256_file
 from scripts.pgso.pipeline import (
-    BENCHMARK_USE_FLAGS,
     FX_MACHINE_OUTLINER_FLAGS,
     GENERATION_FLAGS,
     IR_OUTLINER_FLAGS,
@@ -270,16 +269,6 @@ class PgsoPipelineTests(unittest.TestCase):
         self.assertEqual(2, OUTLINE_PARTITIONS)
         self.assertEqual(
             (
-                "--disable-vp",
-                "-pgo-kind=pgo-instr-use-pipeline",
-                "-pgo-cold-func-opt=minsize",
-                "-profile-summary-cutoff-cold=990000",
-                "-passes=default<O2>,mergefunc,iroutliner",
-            ),
-            BENCHMARK_USE_FLAGS,
-        )
-        self.assertEqual(
-            (
                 "-machine-outliner-reruns=1",
             ),
             FX_MACHINE_OUTLINER_FLAGS,
@@ -305,21 +294,6 @@ class PgsoPipelineTests(unittest.TestCase):
                 str(self.paths.profile_use_base_bitcode),
             ),
             profile_use_argv(self.toolchain, self.paths),
-        )
-        benchmark_paths = PipelinePaths.create(
-            self.root / "benchmark-run",
-            selector="ui_activity",
-        )
-        self.assertEqual(
-            (
-                str(self.toolchain.opt),
-                *BENCHMARK_USE_FLAGS,
-                f"-profile-file={benchmark_paths.merged_profile}",
-                str(benchmark_paths.bitcode),
-                "-o",
-                str(benchmark_paths.profile_use_bitcode),
-            ),
-            profile_use_argv(self.toolchain, benchmark_paths),
         )
         mapped_profile = self.paths.profiles / "production.profdata"
         self.assertEqual(
@@ -406,53 +380,10 @@ class PgsoPipelineTests(unittest.TestCase):
         self.assertIn("-Doptimize=ReleaseSafe", control)
         self.assertIn("-Dupdate-channel=stable", control)
         self.assertIn("pgso-ir", ir)
-        self.assertIn("-Dpgso-artifact=fx", ir)
         self.assertNotEqual(
             control[control.index("--cache-dir") + 1],
             ir[ir.index("--cache-dir") + 1],
         )
-
-    def test_benchmark_artifacts_use_their_existing_build_owners_and_names(self) -> None:
-        cases = (
-            ("file_index", "bench-file-index", "file-index-bench", "file-index.bc"),
-            (
-                "ui_activity",
-                "bench-ui-activity",
-                "ui-activity-progress-bench",
-                "ui-activity.bc",
-            ),
-            (
-                "approval_review",
-                "bench-approval-review",
-                "approval-review-bench",
-                "approval-review.bc",
-            ),
-        )
-        for selector, build_step, binary_name, bitcode_name in cases:
-            with self.subTest(selector=selector):
-                spec = ArtifactSpec(repo_root=self.root / "repo", selector=selector)
-                paths = PipelinePaths.create(
-                    self.root / f"run-{selector}",
-                    selector=selector,
-                )
-                control = zig_build_argv(
-                    self.toolchain,
-                    spec,
-                    paths,
-                    emit_ir=False,
-                )
-                ir = zig_build_argv(
-                    self.toolchain,
-                    spec,
-                    paths,
-                    emit_ir=True,
-                )
-
-                self.assertIn(build_step, control)
-                self.assertIn(f"-Dpgso-artifact={selector}", ir)
-                self.assertEqual(binary_name, paths.control_binary.name)
-                self.assertEqual(bitcode_name, paths.bitcode.name)
-                self.assertEqual(binary_name, paths.candidate_binary.name)
 
     def test_link_arguments_preserve_alignment_and_candidate_contract(self) -> None:
         compiler_runtime_object = self.root / "libcompiler_rt_zcu.o"
@@ -464,11 +395,6 @@ class PgsoPipelineTests(unittest.TestCase):
         )
         candidate = candidate_link_argv(self.toolchain, self.paths)
         candidate_object = candidate_object_argv(self.toolchain, self.paths)
-        benchmark_paths = PipelinePaths.create(
-            self.root / "benchmark-run",
-            selector="file_index",
-        )
-        benchmark_object = candidate_object_argv(self.toolchain, benchmark_paths)
 
         for alignment in PROFILE_SECTION_ALIGNMENTS:
             self.assertIn(alignment, instrumented)
@@ -493,7 +419,6 @@ class PgsoPipelineTests(unittest.TestCase):
         )
         for flag in FX_MACHINE_OUTLINER_FLAGS:
             self.assertIn(flag, candidate_object)
-            self.assertNotIn(flag, benchmark_object)
 
     def test_candidate_object_and_signing_contract(self) -> None:
         actions = self.root / "candidate-actions.txt"
@@ -627,25 +552,6 @@ pathlib.Path(sys.argv[sys.argv.index('-map') + 1]).write_bytes({link_map!r}.enco
             sha256_file(runtime),
             (self.paths.logs / "candidate-layout.json").read_text(),
         )
-
-    def test_benchmark_candidate_keeps_the_zig_linker(self) -> None:
-        paths = PipelinePaths.create(self.root / "benchmark-link", selector="ui_activity")
-        artifact = self.write_executable(
-            "benchmark-tool",
-            """import pathlib,sys
-pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')""",
-        )
-        noop = self.write_executable("noop", "pass")
-        toolchain = dataclasses.replace(
-            self.toolchain, zig=artifact, opt=artifact, llc=artifact,
-            strip=noop, codesign=noop,
-        )
-        paths.profile_use_bitcode.write_bytes(b'bitcode')
-        self.assertEqual(paths.candidate_binary, link_candidate(
-            toolchain, paths, require_release_safe_evidence=False,
-        ))
-        self.assertFalse((paths.logs / "candidate-runtime-probe.json").exists())
-        self.assertFalse((paths.logs / "candidate-layout.json").exists())
 
     def test_bitcode_hash_must_match_the_original(self) -> None:
         bitcode = self.root / "fx.bc"
