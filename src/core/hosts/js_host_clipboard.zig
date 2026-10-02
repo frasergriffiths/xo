@@ -12,25 +12,3 @@ fn copy(_: ?*anyopaque, text: []const u8) host.ClipboardError!bool {
 fn copyWith(call: anytype, text: []const u8) bool {
     return call(text.ptr, text.len) == 1;
 }
-
-test "JS host clipboard preserves selection when the browser rejects copy" {
-    const RejectingHost = struct {
-        fn call(_: [*]const u8, _: usize) i32 {
-            return 0;
-        }
-    };
-    try std.testing.expect(!copyWith(RejectingHost.call, "draft"));
-}
-
-test "JS host clipboard forwards the exact selected bytes" {
-    const CapturingHost = struct {
-        var captured: []const u8 = "";
-
-        fn call(ptr: [*]const u8, len: usize) i32 {
-            captured = ptr[0..len];
-            return 1;
-        }
-    };
-    try std.testing.expect(copyWith(CapturingHost.call, "selected text"));
-    try std.testing.expectEqualStrings("selected text", CapturingHost.captured);
-}

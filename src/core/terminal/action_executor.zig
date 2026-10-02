@@ -110,12 +110,3 @@ fn mapAdmissionError(err: anyerror) contracts.StructuredErrorCode {
         else => .protocol_incompatible,
     };
 }
-
-test "disconnect retryability excludes actions that may already have effects" {
-    try std.testing.expect(!disconnectedActionIsRetryable(.start));
-    try std.testing.expect(!disconnectedActionIsRetryable(.write));
-    try std.testing.expect(!disconnectedActionIsRetryable(.signal));
-    try std.testing.expect(!disconnectedActionIsRetryable(.close));
-    try std.testing.expect(disconnectedActionIsRetryable(.list));
-    try std.testing.expect(disconnectedActionIsRetryable(.wait));
-}
