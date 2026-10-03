@@ -110,6 +110,7 @@ jobs:
         run: |
           scripts=(
             scripts/check-public-surface.sh
+            scripts/check-compactor-boundary.sh
           )
           bash -n "${scripts[@]}"
           shellcheck "${scripts[@]}"

@@ -299,7 +299,10 @@ def zig_build_argv(
     cache = paths.ir_cache if emit_ir else paths.control_cache
     argv = [str(toolchain.zig), "build"]
     if emit_ir:
-        argv.append("pgso-ir")
+        # The `pgso-ir` step fails unless it is told which artifact to emit, so
+        # the selector travels with it. Without this the bitcode stage dies with
+        # "pgso-ir requires -Dpgso-artifact" before any optimization work starts.
+        argv.extend(("pgso-ir", f"-Dpgso-artifact={spec.selector}"))
     else:
         build_step = ARTIFACT_LAYOUTS[spec.selector][0]
         if build_step is not None:

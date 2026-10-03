@@ -376,10 +376,15 @@ class PgsoPipelineTests(unittest.TestCase):
 
         self.assertEqual((str(self.toolchain.zig), "build"), control[:2])
         self.assertNotIn("pgso-ir", control)
+        self.assertNotIn("-Dpgso-artifact=fx", control)
         self.assertIn("-Dtarget=aarch64-macos", control)
         self.assertIn("-Doptimize=ReleaseSafe", control)
         self.assertIn("-Dupdate-channel=stable", control)
         self.assertIn("pgso-ir", ir)
+        # The `pgso-ir` step fails without this, so the selector must travel with
+        # it. Omitting it killed the bitcode stage before any optimization ran.
+        self.assertIn("-Dpgso-artifact=fx", ir)
+        self.assertEqual("fx", self.spec.selector)
         self.assertNotEqual(
             control[control.index("--cache-dir") + 1],
             ir[ir.index("--cache-dir") + 1],
