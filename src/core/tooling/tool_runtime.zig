@@ -188,7 +188,6 @@ pub const Context = struct {
     on_web_search_progress: ?tool_dispatch.WebSearchProgressFn = null,
     web_fetch_progress_ctx: ?*anyopaque = null,
     on_web_fetch_progress: ?tool_dispatch.WebFetchProgressFn = null,
-    host_sandbox_default: tool_admission.HostSandboxDefault = .none,
     model_capability_resolver: ?model_capabilities.Resolver = null,
     model_override_resolver: ?subagent_tool_host.ModelOverrideResolver = null,
     /// False when running outside an interactive TUI (e.g. headless runs). Tools
@@ -223,7 +222,6 @@ pub const Context = struct {
             .context_limits = self.context_limits,
             .auto_classifier = self.admissionAutoClassifier(),
             .terminal_review_context = self.terminalReviewContext(),
-            .host_sandbox_default = self.host_sandbox_default,
         };
         if (self.permission_state_override != null) {
             input.session_permission_state_provider = null;
@@ -1897,7 +1895,6 @@ const TestRuntime = struct {
     web_fetch_artifact_error: ?anyerror = null,
     web_fetch_progress_ctx: ?*anyopaque = null,
     on_web_fetch_progress: ?tool_dispatch.WebFetchProgressFn = null,
-    host_sandbox_default: tool_admission.HostSandboxDefault = .none,
 
     fn deinit(self: *TestRuntime, alloc: Allocator) void {
         self.worker.deinit(alloc);
@@ -1962,7 +1959,6 @@ const TestRuntime = struct {
             .on_web_search_progress = self.on_web_search_progress,
             .web_fetch_progress_ctx = self.web_fetch_progress_ctx,
             .on_web_fetch_progress = self.on_web_fetch_progress,
-            .host_sandbox_default = self.host_sandbox_default,
             .interactive = self.interactive,
         };
     }

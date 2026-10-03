@@ -39,9 +39,9 @@ zig build run
 
 Keep the local development loop focused: run the narrowest test that covers the changed path, build fx, and exercise the change using `./zig-out/bin/fx`. The installed `fx` on `PATH` is not valid development evidence.
 
-Once the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. The **Full CI** workflow runs the complete deterministic suite on native Linux x86_64, Linux aarch64, macOS x86_64, and macOS aarch64 runners. The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting and the public-surface audit run in those ReleaseSafe jobs. Four duration-balanced, isolated ReleaseSafe E2E shards per platform use checked-in weights to assign every Bun test file once; files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after tmux is reset.
+Once the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. The **Full CI** workflow runs the complete deterministic suite on native Linux x86_64, Linux aarch64, macOS x86_64, and macOS aarch64 runners. The native matrix formats, audits the public surface, checks the compactor boundary, validates workflow definitions, builds, tests, and smoke-tests ReleaseSafe on every platform.
 
-Standard PR CI reports ReleaseSafe Build & Test and deterministic E2E results. Do not mark the draft PR ready until all four Full CI jobs and the final ship gate have succeeded for the exact current commit. Each platform aggregate requires its ReleaseSafe native check and all four ReleaseSafe E2E shards. A result from an older commit does not count. Live model evals are separate from this gate because they require credentials and are not deterministic.
+Standard PR CI reports the ReleaseSafe Build & Test result. Do not mark the draft PR ready until all four Full CI jobs and the final ship gate have succeeded for the exact current commit. A result from an older commit does not count. Live model evals are separate from this gate because they require credentials and are not deterministic.
 
 Changes to `build.zig` or `scripts/pgso/` also run the native macOS arm64 PGSO candidate workflow. That lane produces retained size, behavior, and performance evidence but does not alter any release artifact or update channel. Its pinned toolchain, local reproduction command, corpus exclusions, and failure rules are documented in [`scripts/pgso/README.md`](scripts/pgso/README.md).
 
@@ -150,27 +150,6 @@ There are two distinct skill categories in `fx`:
 
 The interactive agent can also install skills via the `install_skill` tool when the user asks to install one in conversation, including pasted `npx skills add ...` syntax.
 
-## Slack installation testing
-
-`src/core/slack/install.zig` owns workspace bot installation, local credential
-persistence, and explicit refresh. The web bridge contract is fixed to
-`https://fx.sh/api/slack/install/config`, `/api/slack/install`, and
-`/api/slack/oauth/callback`.
-
-Build with `zig build`, then run the Zig tests for that module.
-The fixture exercises the freshly built binary and real loopback sockets without
-live Slack credentials. `FX_E2E_SLACK_ORIGIN` accepts only an HTTP `127.0.0.1`
-origin with a non-privileged port, serving public metadata plus mocked
-`/api/oauth.v2.access` and `/api/auth.test` responses. Production uses pinned
-Slack endpoints. Local records bind to the bridge origin to prevent fixture
-commands from refreshing production credentials. `FX_NO_OPEN_BROWSER=1` prints
-the start URL for headless operation; authorization still requires a browser on
-the same computer as the listener.
-
-This E2E owner is verification-only in the PGSO corpus because it covers a rare
-workspace setup operation and security boundaries. Live Slack authorization and
-message attribution are not deterministic tests.
-
 ## Permissions and Auto Mode
 
 Security is permission-first.
@@ -205,29 +184,13 @@ Do not add new sensitive tool behavior without integrating it into `src/core/per
 
 Render bugs that appear during window resize are hard to reason about because the footer is inline (hugs the transcript) rather than pinned to the terminal bottom, and the 100 ms debounce can mask ordering mistakes. The testing rig covers three layers. Pick the lowest layer that can catch the bug.
 
-### Zig unit test (fastest, runs in `zig build test`)
+### Zig unit test (runs in `zig build test` only if the file is reachable)
 
-Drive `TranscriptRuntime` against the built-in VT emulator. Assertions are on the cell grid after a sequence of writes and resize calls.
+`zig build test` has two roots: `src/main.zig` and `tests.zig`. A `test` block runs only if its file is reachable from one of them through `@import`. Put the test beside the code it exercises, or add the file to `tests.zig`. Verify it actually ran by checking the test count in `zig build test --summary all`, or run it by name with `-Dtest-filter`.
 
-```zig
-test "my resize scenario" {
-    var h = try Harness.init(std.testing.allocator, 80, 24, 4);
-    defer h.deinit();
+Drive `TranscriptRuntime` against the built-in VT emulator, asserting on the cell grid after a sequence of writes and resize calls. `src/ui/` currently has no executed test blocks, so a new render test is the first thing covering that path.
 
-    try h.shell.initViewport(&h.metrics, 4);
-    try h.shell.writeTranscript(h.alloc, &h.metrics, 1024, "hello\n", true);
-    try h.flush();
-
-    try h.driveResize(60, 20, 4, true);
-
-    var row: std.ArrayList(u8) = .empty;
-    defer row.deinit(h.alloc);
-    try h.vt.rowText(1, &row);
-    try std.testing.expectEqualStrings("hello               ", row.items);
-}
-```
-
-Add it to `src/ui/resize_tests.zig`. See the file header for what each Harness method does.
+Check in the golden file and add a Zig test that runs `fx replay --golden` and diffs. No golden regression test is checked in today.
 
 ### Tape-based test (replay a real capture)
 

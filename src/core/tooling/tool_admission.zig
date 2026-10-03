@@ -42,12 +42,6 @@ const PermissionMode = types.PermissionMode;
 const ToolPermissionDecision = types.ToolPermissionDecision;
 const WorkerRuntime = worker_runtime.WorkerRuntime;
 
-pub const HostSandboxDefault = enum {
-    none,
-    allow_sandboxed,
-    prompt,
-};
-
 pub const SessionPermissionStateProvider = struct {
     context: *anyopaque,
     snapshot_fn: *const fn (
@@ -82,7 +76,6 @@ pub const Input = struct {
     context_limits: context_limits.Values = .{},
     auto_classifier: permission_auto_classifier.Classifier = .disabled(),
     terminal_review_context: ?terminal_managed_observer.Context = null,
-    host_sandbox_default: HostSandboxDefault = .none,
 };
 
 fn registeredTool(input: Input, name: []const u8) ?*const tool_dispatch.Tool {
@@ -1352,15 +1345,6 @@ fn requestPermissionOutcomeResolved(
         return bindVisionPathExecutionAuthority(
             try permissionOutcomeForDecision(input, arena, call, .once, .session_grant),
             vision_path_authority,
-        );
-    }
-    if (input.host_sandbox_default == .allow_sandboxed and
-        try isRunCommandCall(input, arena, call))
-    {
-        return shellPermissionOutcome(
-            try runCommandContext(input, arena, call),
-            .once,
-            .js_host,
         );
     }
     const resolution = try resolveOrdinaryPermissionOutcome(
