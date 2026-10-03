@@ -19,7 +19,6 @@ const mem_utils = @import("../../shared/mem_utils.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const io_mod = @import("../../shared/io.zig");
-const host_target = @import("../../hosts/target.zig");
 const secret = @import("../../auth/secret.zig");
 const auth_transition = @import("../../auth/auth_transition.zig");
 const credentials = @import("../../auth/credentials.zig");
@@ -3307,17 +3306,15 @@ fn refreshGatewayCredentialForJob(
         return false;
     } orelse return false;
     const previous_api_key = active_api_key.*;
-    if (comptime !host_target.is_wasm) {
-        if (deps.usage) |usage| {
-            if (source == .stored_key or source == .stored_key) {
-                usage.clearReconciliationCredential();
-            } else {
-                usage.refreshReconciliationCredential(
-                    deps.usage_allocator,
-                    previous_api_key,
-                    refreshed,
-                );
-            }
+    if (deps.usage) |usage| {
+        if (source == .stored_key or source == .stored_key) {
+            usage.clearReconciliationCredential();
+        } else {
+            usage.refreshReconciliationCredential(
+                deps.usage_allocator,
+                previous_api_key,
+                refreshed,
+            );
         }
     }
     if (owned_api_key.*) |old| secret.zeroAndFree(alloc, old);
@@ -8483,25 +8480,14 @@ fn processQueuedPromptLoop(
                         .{ .ctx = &completion_publisher, .notify = ParallelSubagentCompletionPublisher.notify }
                     else
                         null;
-                    if (comptime host_target.is_wasm) {
-                        parallel_run = try runtime_parallel_execution.runSequentialCalls(arena, executable_calls.items, .{
-                            .exec_ctx = &parallel_exec_ctx,
-                            .execute = runtime_parallel_execution.parallelHookExecute,
-                            .format_ctx = &parallel_exec_ctx,
-                            .format_error = runtime_parallel_execution.parallelHookFormatError,
-                            .cancel_flag = config.cancel_flag,
-                            .attempt_observer = attempt_observer,
-                        });
-                    } else {
-                        parallel_run = try runtime_parallel_execution.runParallelCalls(arena, executable_calls.items, .{
-                            .exec_ctx = &parallel_exec_ctx,
-                            .execute = runtime_parallel_execution.parallelHookExecute,
-                            .format_ctx = &parallel_exec_ctx,
-                            .format_error = runtime_parallel_execution.parallelHookFormatError,
-                            .cancel_flag = config.cancel_flag,
-                            .attempt_observer = attempt_observer,
-                        });
-                    }
+                    parallel_run = try runtime_parallel_execution.runParallelCalls(arena, executable_calls.items, .{
+                        .exec_ctx = &parallel_exec_ctx,
+                        .execute = runtime_parallel_execution.parallelHookExecute,
+                        .format_ctx = &parallel_exec_ctx,
+                        .format_error = runtime_parallel_execution.parallelHookFormatError,
+                        .cancel_flag = config.cancel_flag,
+                        .attempt_observer = attempt_observer,
+                    });
                 }
                 defer if (parallel_run) |*run| run.deinit(arena);
 

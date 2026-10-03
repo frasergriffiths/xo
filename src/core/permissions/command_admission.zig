@@ -129,7 +129,7 @@ pub fn defaultForRunCommand(
         switch (command_ctx.environment) {
             .user => true,
             .clean => permission_mode != .yolo,
-            .legacy, .workspace_clean => false,
+            .legacy => false,
         };
     if (requires_shell_authority) {
         return .{ .approval_required = .dynamic_shell };

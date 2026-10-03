@@ -62,51 +62,6 @@ jobs:
             fx-${{ matrix.name }}.tar.gz
             fx-${{ matrix.name }}.tar.gz.sha256
 
-  web:
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
-    name: Build web artifacts
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: "0.16.0"
-
-      - name: Build terminal WASM
-        run: zig build -Doptimize=ReleaseSafe -Dwasm-surface=term
-
-      - name: Package web artifacts
-        run: |
-          cp sdk/fx-sdk.js fx-sdk.js
-          cp sdk/core-output.js core-output.js
-          cp sdk/wasm-module.js wasm-module.js
-          cp zig-out/bin/fx-term.wasm fx-term.wasm
-          sha256sum fx-sdk.js > fx-sdk.js.sha256
-          sha256sum core-output.js > core-output.js.sha256
-          sha256sum wasm-module.js > wasm-module.js.sha256
-          sha256sum fx-term.wasm > fx-term.wasm.sha256
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: fx-web
-          path: |
-            fx-sdk.js
-            fx-sdk.js.sha256
-            core-output.js
-            core-output.js.sha256
-            wasm-module.js
-            wasm-module.js.sha256
-            fx-term.wasm
-            fx-term.wasm.sha256
-
   publish:
     needs: [build, web]
     runs-on: ubuntu-latest

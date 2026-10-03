@@ -6,16 +6,7 @@ const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
-const host_target = @import("../core/hosts/target.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
-const js_host_tools = if (host_target.is_wasm)
-    @import("../core/hosts/js_host_tools.zig")
-else
-    struct {};
-const js_host_steering = if (host_target.is_wasm)
-    @import("../core/hosts/js_host_steering.zig")
-else
-    struct {};
 const io_mod = @import("../core/shared/io.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const jsonrpc = @import("jsonrpc.zig");
@@ -266,7 +257,7 @@ const AcpContext = struct {
         if (publication.* != .pending) return;
         const status = providerTerminalStatus(outcome.kind) orelse return;
 
-        const detail = if (self.state.cfg.minimal_kernel) result else null;
+        const detail: ?[]const u8 = result;
         switch (status) {
             .completed => try self.sendToolCallCompletedWithCommandResult(tool_call_id, detail orelse "Web search completed", null),
             .failed => try self.sendToolCallErrorWithCommandResult(tool_call_id, detail orelse "Web search failed", null),
@@ -363,7 +354,6 @@ const AcpContext = struct {
             .permission_grants = session.session_grants,
             .permission_rules = session.permission_rules,
             .tool_registry = self.toolRegistry(),
-            .host_tool_provider = hostToolProvider(self.state),
             .permission_reviewer_provider = self.state.cfg.provider_set.select(session.provider).permission_reviewer,
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
@@ -412,7 +402,6 @@ const AcpContext = struct {
                 .session_id = session.session_id,
             },
         };
-        if (comptime !host_target.is_wasm) {}
         return tc;
     }
 
@@ -430,97 +419,6 @@ fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
     return tool_call_presentation.activeToolSet(state);
 }
 
-fn hostToolProvider(state: *server.ServerState) ?tool_dispatch.HostToolProvider {
-    if (state.host_tools.tools.len == 0) return null;
-    if (comptime host_target.is_wasm) return js_host_tools.provider();
-    return .{
-        .context = @ptrCast(state),
-        .call_fn = callHostTool,
-    };
-}
-
-fn callHostTool(
-    raw_state: *anyopaque,
-    alloc: Allocator,
-    name: []const u8,
-    arguments_json: []const u8,
-    max_result_bytes: usize,
-    cancel_flag: ?*std.atomic.Value(bool),
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const state: *server.ServerState = @ptrCast(@alignCast(raw_state));
-    if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
-    const outbound_id = (server.beginOutboundRequest(state, .host_tool) catch
-        return .{ .failure = try alloc.dupe(u8, "Host tool request failed") }) orelse
-        return .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
-    var awaiting = true;
-    errdefer if (awaiting) {
-        server.cancelOutboundRequest(state, outbound_id);
-        if (server.awaitOutboundResponse(state, outbound_id, .host_tool)) |owned| {
-            var abandoned = owned;
-            abandoned.deinit(state.alloc);
-        }
-    };
-
-    var params: std.Io.Writer.Allocating = .init(alloc);
-    defer params.deinit();
-    params.writer.writeAll("{\"sessionId\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(
-        if (state.active_session) |*session| session.session_id else "",
-        .{},
-        &params.writer,
-    ) catch return error.OutOfMemory;
-    params.writer.writeAll(",\"name\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(name, .{}, &params.writer) catch return error.OutOfMemory;
-    params.writer.writeAll(",\"input\":") catch return error.OutOfMemory;
-    params.writer.writeAll(arguments_json) catch return error.OutOfMemory;
-    params.writer.writeByte('}') catch return error.OutOfMemory;
-    state.writer.writeRequest(
-        alloc,
-        .{ .integer = @intCast(outbound_id) },
-        "libfx/tool_call",
-        params.written(),
-    ) catch return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
-
-    var response = server.awaitOutboundResponse(state, outbound_id, .host_tool) orelse
-        return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
-    awaiting = false;
-    defer response.deinit(state.alloc);
-    if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
-    if (response.cancelled) {
-        if (cancel_flag) |flag| flag.store(true, .seq_cst);
-        return error.Cancelled;
-    }
-    if (response.error_json != null) {
-        return .{ .failure = try alloc.dupe(u8, "Host tool failed") };
-    }
-    const raw = response.result_json orelse
-        return .{ .failure = try alloc.dupe(u8, "Host tool returned no result") };
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
-        return .{ .failure = try alloc.dupe(u8, "Host tool returned an invalid result") };
-    defer parsed.deinit();
-    if (parsed.value != .object) {
-        return .{ .failure = try alloc.dupe(u8, "Host tool returned an invalid result") };
-    }
-    const content = parsed.value.object.get("content") orelse
-        return .{ .failure = try alloc.dupe(u8, "Host tool returned an invalid result") };
-    if (content == .string) {
-        if (parsed.value.object.get("contentType")) |kind| {
-            if (kind == .string and std.mem.eql(u8, kind.string, "rich")) {
-                const failed = if (parsed.value.object.get("isError")) |value| value == .bool and value.bool else false;
-                return @import("../core/tooling/tool_content.zig").parseRichResult(alloc, content.string, @min(state.max_tool_result_bytes, max_result_bytes), failed);
-            }
-        }
-    }
-    if (content != .string or content.string.len > @min(state.max_tool_result_bytes, max_result_bytes)) {
-        return .{ .failure = try alloc.dupe(u8, "Host tool result exceeded the configured limit") };
-    }
-    const owned = try alloc.dupe(u8, content.string);
-    const is_error = if (parsed.value.object.get("isError")) |value|
-        value == .bool and value.bool
-    else
-        false;
-    return if (is_error) .{ .failure = owned } else .{ .success = owned };
-}
 const Osc8Link = struct { uri: []const u8, end: usize };
 
 fn parseOsc8Link(text: []const u8, index: usize) ?Osc8Link {
@@ -630,13 +528,7 @@ pub fn handlePrompt(
         return promptInputFailure(err);
     defer prompt_input.deinit(alloc);
     if (prompt_input.pending_images.len > 0) {
-        if (session.store == null and session.wasm_state == null) {
-            // libfx kernel session: images stay in memory and ride the kernel
-            // checkpoint, so no filesystem snapshot backend is needed.
-            prompt_input.captureImagesInline(alloc) catch |err|
-                return promptInputFailure(err);
-        } else {
-            if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
+        {
             var temporary_snapshot_dir: ?[]u8 = null;
             defer if (temporary_snapshot_dir) |path| alloc.free(path);
             const snapshot_dir = try session_store.imageSnapshotStorageDir(
@@ -729,8 +621,6 @@ pub fn handlePrompt(
 
     var skill_catalog = state.skills.acquireCatalog();
     defer skill_catalog.deinit();
-    const host_instructions = try alloc.dupe(u8, state.host_instructions);
-    defer alloc.free(host_instructions);
     for (state.context_snapshot.notices) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
 
     session.session_rt.setConversationLanguageFromUserMessage(owned_prompt);
@@ -809,7 +699,6 @@ pub fn handlePrompt(
         false;
     var agent_config = buildAgentConfig(state, session, .{
         .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
-        .host_instructions = host_instructions,
         .advertised_tool_names = tool_projection.advertised_names,
         .advertised_functions = tool_projection.advertised_functions,
         .custom_tool_guidance = tool_projection.custom_guidance,
@@ -860,7 +749,6 @@ fn maybeStartAcpTitleTask(
     // Unit tests share the real provider bundles; never spawn network side
     // calls from a test process. Wiring is covered by e2e mock servers.
     if (comptime @import("builtin").is_test) return;
-    if (comptime host_target.is_wasm) return;
     if (!state.session_titles or recovery) return;
     if (session.title_task != null) return;
     if (session.session_rt.agent.history.items.len != 0) return;
@@ -993,7 +881,6 @@ fn refreshProjectContext(
 }
 
 const AgentConfigSections = struct {
-    host_instructions: []const u8 = "",
     skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
@@ -1008,14 +895,12 @@ fn buildAgentConfig(
 ) agent_runtime.Config {
     return .{
         .system_prompt = state.cfg.prompt_policy.system_prompt,
-        .host_instructions = sections.host_instructions,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(session.model),
         .skill_catalog = sections.skill_catalog,
         .gateway_retry_count = state.cfg.gateway_retry_count,
         .gateway_chat_url = state.cfg.gateway_chat_url,
         .advertised_tool_names = sections.advertised_tool_names,
         .advertised_functions = sections.advertised_functions,
-        .initial_dynamic_tools = state.host_tools.dynamic_tools,
         .provider_capabilities = state.cfg.provider_set.select(session.provider).capabilities,
         .custom_tool_guidance = sections.custom_tool_guidance,
         .agent_step_limit = session.agent_step_limit,
@@ -1043,7 +928,7 @@ fn buildAgentConfig(
                 current_prompt_is_external
         else
             false,
-        .enforce_response_language = !state.cfg.minimal_kernel,
+        .enforce_response_language = true,
         .context_limits = state.context_limits,
     };
 }
@@ -1087,31 +972,6 @@ const ParsedPromptInput = struct {
                 pending.media_type,
                 pending.bytes,
                 snapshot_dir,
-            );
-            captured += 1;
-        }
-        self.images = images;
-    }
-
-    /// libfx kernel sessions have no filesystem snapshot backend on either
-    /// host (native or wasm), so their prompt images keep validated bytes on
-    /// the attachment itself and serialize through the kernel checkpoint.
-    fn captureImagesInline(self: *ParsedPromptInput, alloc: Allocator) !void {
-        if (self.pending_images.len == 0) return;
-        const images = try alloc.alloc(types.ImageAttachment, self.pending_images.len);
-        var captured: usize = 0;
-        errdefer {
-            for (images[0..captured]) |attachment| {
-                types.freeImageAttachment(alloc, attachment);
-            }
-            alloc.free(images);
-        }
-        for (self.pending_images, 0..) |pending, index| {
-            images[index] = try image_attachments.captureInlineImageBytesInMemory(
-                alloc,
-                pending.id,
-                pending.media_type,
-                pending.bytes,
             );
             captured += 1;
         }
@@ -1359,13 +1219,12 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = @ptrCast(ctx),
         .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.state.active_session.?.provider),
-        .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
+        .flush_assistant_stream_per_content_chunk = false,
         .render_assistant_text = false,
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.state.cfg.context_registry,
         .context_enabled = ctx.state.context_enabled,
         .finalize_turn = finalizeTurn,
-        .take_steering_boundary = if (ctx.state.cfg.minimal_kernel) takeLibfxSteeringBoundary else null,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
@@ -1413,25 +1272,6 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .usage = &session.session_rt.usage,
         .usage_allocator = ctx.state.alloc,
     };
-}
-
-fn takeLibfxSteeringBoundary(
-    raw_ctx: *anyopaque,
-    arena: Allocator,
-    _: u64,
-    kind: worker_runtime.SteeringBoundaryKind,
-) !worker_runtime.SteeringBoundaryResult {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const close_if_empty = kind == .finalizing;
-    const messages = if (comptime host_target.is_wasm)
-        try js_host_steering.takeAll(arena)
-    else
-        try server.takeLibfxSteering(ctx.state, arena, close_if_empty);
-    if (messages.len > 0) return .{ .continue_turn = messages };
-    if (comptime host_target.is_wasm) {
-        if (close_if_empty) js_host_steering.close();
-    }
-    return if (kind == .cancelled) .interrupt else .none;
 }
 
 fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {
@@ -1845,10 +1685,7 @@ fn executeToolCall(
     tool_ctx.session_grants = request.session_grants;
     tool_ctx.advertised_dynamic_tool_names = request.advertised_dynamic_tool_names;
     tool_ctx.max_tool_result_bytes = request.max_tool_result_bytes;
-    const result = (if (comptime host_target.is_wasm)
-        tool_runtime.executeHostToolCallAuthorized(tool_ctx, request)
-    else
-        tool_runtime.executeToolCallAuthorized(tool_ctx, request)) catch |err| {
+    const result = tool_runtime.executeToolCallAuthorized(tool_ctx, request) catch |err| {
         const err_text = try formatToolExecutionError(
             raw_ctx,
             request.result_allocator,
@@ -2039,13 +1876,6 @@ fn persistAcpHistoryTurn(
     var prepared = try session.session_rt.prepareHistoryEntry(alloc, turn);
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurn(alloc, prepared);
-    if (comptime host_target.is_wasm) {
-        session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
-        prepared_owned = false;
-        if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
-        if (session.wasm_state != null) try sessions.commitWasmSessionLocked(alloc, session);
-        return;
-    }
     const writable = if (session.writable) |*value| value else {
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
         prepared_owned = false;
@@ -2095,40 +1925,6 @@ fn commitContextCompaction(
         };
         if (active_prefix != null) {
             if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
-        }
-    }
-    if (comptime host_target.is_wasm) {
-        if (session.wasm_state) |*base| {
-            var next = try base.dupe(ctx.alloc);
-            var next_owned = true;
-            defer if (next_owned) next.deinit(ctx.alloc);
-            const history = try session_runtime.snapshotOwnedContextHistory(ctx.alloc, prepared, 0, 0);
-            types.freeHistoryTurnSlice(ctx.alloc, next.history);
-            next.history = history;
-            const permission_state = try session.session_rt.snapshotPermissionState(ctx.alloc);
-            next.permission_state.deinit(ctx.alloc);
-            next.permission_state = permission_state;
-            next.context_history_start = 0;
-            next.conversation_language = session.session_rt.languageSnapshot();
-            next.updated_at_ms = io_mod.milliTimestamp();
-            const model = try ctx.alloc.dupe(u8, session.model);
-            ctx.alloc.free(next.preferences.model);
-            next.preferences.model = model;
-            next.preferences.provider = session.provider;
-            next.preferences.effort = session.effort;
-            next.preferences.fast_mode = session.fast_mode;
-            const usage = try session.session_rt.usage.snapshot(ctx.alloc);
-            if (next.usage) |*old| old.deinit(ctx.alloc);
-            next.usage = usage;
-            const revision = try @import("../core/session/js_host_session_store.zig").commit(ctx.alloc, next, session.wasm_revision);
-            if (session.wasm_revision) |old| ctx.alloc.free(old);
-            base.deinit(ctx.alloc);
-            session.wasm_state = next;
-            session.wasm_revision = revision;
-            next_owned = false;
-            if (active_prefix != null) {
-                if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
-            }
         }
     }
     session.session_rt.commitCompactedHistory(ctx.alloc, prepared);

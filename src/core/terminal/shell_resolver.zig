@@ -190,7 +190,7 @@ pub fn capturedInvocation(
     command: []const u8,
 ) (ResolveError || Allocator.Error)!Invocation {
     switch (environment_value) {
-        .legacy, .workspace_clean => return error.UnsupportedShell,
+        .legacy => return error.UnsupportedShell,
         .clean => |path| {
             var invocation = try resolve(null, .{ .executable = .{
                 .path = path,

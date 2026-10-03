@@ -1231,9 +1231,9 @@ pub const ImageAttachment = struct {
     snapshot_path: ?[]u8 = null,
     snapshot_sha256: ?[]u8 = null,
     /// Owned decoded image bytes for sessions without a filesystem snapshot
-    /// backend (libfx kernel sessions on native and wasm). When set, the
-    /// attachment loads from memory instead of `snapshot_path`, and durable
-    /// serializers embed the bytes so checkpoint/restore round-trips them.
+    /// backend. The native terminal always writes `snapshot_path`, so this is
+    /// only populated by sessions restored from older profile data. Durable
+    /// serializers still round-trip it so those sessions keep loading.
     inline_data: ?[]u8 = null,
 };
 

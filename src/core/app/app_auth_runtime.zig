@@ -3,7 +3,6 @@ const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
-const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
 const api_key_validator = @import("../auth/api_key_validator.zig");
@@ -143,7 +142,7 @@ pub fn Runtime(comptime App: type) type {
         fn selectProviderCredential(app: *App, provider: model_provider.ProviderId) !auth_runtime.ProviderCredentialSelection {
             if (hostManagesAuth(app) or (provider != .configured and model_provider.authorizesCredential(provider, app.auth.credentialSource()))) return .unchanged;
             var preferred: ?credentials.Source = null;
-            if (provider == .openrouter and !host_target.is_wasm) {
+            if (provider == .openrouter) {
                 var settings = try config_runtime.loadMergedSettings(app.alloc, app.workspace_root);
                 defer settings.deinit(app.alloc);
                 preferred = settings.credential_source;
@@ -158,7 +157,6 @@ pub fn Runtime(comptime App: type) type {
             if (provider_changed) {
                 app.model_cache.resetForProviderChange();
             }
-            if (comptime host_target.is_wasm) return;
             if (hostManagesAuth(app)) return;
             const selection = selectProviderCredential(app, provider) catch |err| {
                 if (err == error.OutOfMemory) return err;
@@ -753,8 +751,6 @@ pub fn Runtime(comptime App: type) type {
         /// leaves the source active for this run rather than refusing a working
         /// credential the user already selected.
         fn rememberCredentialSource(app: *App, source: credentials.Source) void {
-            // ChatGPT is selected by model route, not as a global Gateway
-            // credential preference. Its saved session coexists independently.
             if (source == .stored_key or source == .groq_stored_key) return;
             if (comptime @hasDecl(App, "persistCredentialSourcePreference")) {
                 app.persistCredentialSourcePreference(source);
@@ -792,7 +788,7 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             if (comptime !provider_runtime.supported(App) or
                 !@hasDecl(App, "providerCatalog") or
-                !@hasDecl(@TypeOf(app.auth), "beginProviderPreparation") or host_target.is_wasm)
+                !@hasDecl(@TypeOf(app.auth), "beginProviderPreparation"))
             {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
@@ -913,7 +909,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn collectProviderPreparationFacts(app: *App) !void {
-            if (comptime !@hasDecl(@TypeOf(app.auth), "takeProviderPreparation") or host_target.is_wasm) return;
+            if (comptime !@hasDecl(@TypeOf(app.auth), "takeProviderPreparation")) return;
             if (pendingPromptNeedsAdoption(app)) return;
             const task = app.auth.takeProviderPreparation() orelse return;
             defer task.deinit();
@@ -1168,9 +1164,6 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(@TypeOf(app.auth), "providerPreparationPending")) {
                 if (app.auth.providerPreparationPending()) return .pending;
             }
-            if (comptime host_target.is_wasm) {
-                return if (try admitPromptCredential(app)) .current else .rejected;
-            }
             if (!try ensurePromptCredential(app)) return .rejected;
             const source = app.auth.credentialSource() orelse return .rejected;
             // An OpenRouter key is a static secret with no refresh lifecycle, so
@@ -1184,9 +1177,6 @@ pub fn Runtime(comptime App: type) type {
         ) !PendingPromptCredentialReadiness {
             if (comptime @hasDecl(@TypeOf(app.auth), "providerPreparationPending")) {
                 if (app.auth.providerPreparationPending()) return .pending;
-            }
-            if (comptime host_target.is_wasm) {
-                return if (try admitPromptCredential(app)) .current else .rejected;
             }
             if (!try ensurePromptCredential(app)) return .rejected;
             if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
@@ -1405,16 +1395,6 @@ const TestModelCache = struct {
 const BusySignInAuth = struct {
     start_count: usize = 0,
 
-    fn openChatGptSignInPickerFromRoot(self: *BusySignInAuth, _: std.mem.Allocator) !bool {
-        self.start_count += 1;
-        return true;
-    }
-
-    fn openGrokSignInPickerFromRoot(self: *BusySignInAuth, _: std.mem.Allocator) !bool {
-        self.start_count += 1;
-        return true;
-    }
-
     fn signInBrowserUrlAlloc(_: *BusySignInAuth, _: std.mem.Allocator) !?[]u8 {
         return null;
     }
@@ -1591,14 +1571,6 @@ const TestAuth = struct {
     }
 
     fn openSignInPickerFromRoot(self: *TestAuth, alloc: std.mem.Allocator) !bool {
-        return self.openSignInPicker(alloc);
-    }
-
-    fn openChatGptSignInPickerFromRoot(self: *TestAuth, alloc: std.mem.Allocator) !bool {
-        return self.openSignInPicker(alloc);
-    }
-
-    fn openGrokSignInPickerFromRoot(self: *TestAuth, alloc: std.mem.Allocator) !bool {
         return self.openSignInPicker(alloc);
     }
 

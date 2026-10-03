@@ -17,6 +17,7 @@ class PgsoBuildStepTests(unittest.TestCase):
                     "zig",
                     "build",
                     "pgso-ir",
+                    "-Dpgso-artifact=fx",
                     "-Doptimize=ReleaseSafe",
                     "-Dtarget=aarch64-macos",
                     "--prefix",

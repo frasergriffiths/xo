@@ -156,9 +156,8 @@ const FetchOperation = struct {
     }
 };
 
-/// Parses an OpenRouter `/models` payload into owned catalog entries. Shared by
-/// the native, host-transport, and JS-host fetches so all three agree on which
-/// models are offered and what capabilities they declare.
+/// Parses an OpenRouter `/models` payload into owned catalog entries so every
+/// caller agrees on which models are offered and what capabilities they declare.
 pub fn parseCatalog(
     alloc: Allocator,
     json_text: []const u8,

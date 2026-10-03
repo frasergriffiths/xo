@@ -31,41 +31,6 @@ pub fn Runtime(comptime App: type) type {
             app.worker_thread = try std.Thread.spawn(.{}, workerThreadMain, .{app});
         }
 
-        /// Starts one queued prompt on a single-threaded host. Prompt admission
-        /// is presented before agent work can suspend on host transport.
-        pub fn processNextCooperativePrompt(
-            app: *App,
-            event_handlers: app_worker_runtime.WorkerEventHandlers,
-            flush_frame: *const fn (*App) anyerror!void,
-        ) !void {
-            const work = (try app.worker.tryTakeNextWork(std.heap.c_allocator)) orelse return;
-            defer worker_runtime.freeWorkItem(std.heap.c_allocator, work);
-            defer app.worker.finishProcessing();
-            errdefer |err| settleCompactionWorkFailure(&app.worker, work, err);
-
-            try app_worker_runtime.Runtime(App).tick(
-                app,
-                event_handlers,
-            );
-            try flush_frame(app);
-
-            var failure_provenance: ?compaction_activity.ErrorProvenance = null;
-            app.processQueuedWork(work, &failure_provenance) catch |err| {
-                settleCompactionWorkFailure(&app.worker, work, err);
-                if (compactionErrorHandled(work, failure_provenance, err)) {
-                    diagnostics.traceCompactionLog(true, "interactive error retained err={s}", .{@errorName(err)});
-                } else if (err != error.RouteRecoveryStopped) {
-                    const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
-                    defer std.heap.c_allocator.free(body);
-                    try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
-                        .topic = "system",
-                        .tone = .@"error",
-                        .body = body,
-                    } });
-                }
-            };
-        }
-
         pub fn formatToolExecutionError(alloc: std.mem.Allocator, tool_name: []const u8, err: anyerror) ![]u8 {
             const error_detail = detailedErrorSummary(err);
             const details: []const tool_result_errors.Detail = if (error_detail) |detail|

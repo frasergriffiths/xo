@@ -13,12 +13,11 @@ pub const Environment = union(enum) {
     legacy,
     clean: []const u8,
     user: []const u8,
-    workspace_clean,
 
     pub fn eql(self: Environment, other: Environment) bool {
         if (std.meta.activeTag(self) != std.meta.activeTag(other)) return false;
         return switch (self) {
-            .legacy, .workspace_clean => true,
+            .legacy => true,
             .clean => |path| std.mem.eql(u8, path, other.clean),
             .user => |path| std.mem.eql(u8, path, other.user),
         };
@@ -27,7 +26,7 @@ pub const Environment = union(enum) {
     pub fn requiresShellRoute(self: Environment) bool {
         return switch (self) {
             .clean, .user => true,
-            .legacy, .workspace_clean => false,
+            .legacy => false,
         };
     }
 };
@@ -48,7 +47,7 @@ pub fn permissionCommandIdentity(
     command: []const u8,
 ) ![]u8 {
     return switch (environment) {
-        .legacy, .workspace_clean => alloc.dupe(u8, command),
+        .legacy => alloc.dupe(u8, command),
         .clean => |path| formatPermissionCommandIdentity(alloc, "clean", path, command),
         .user => |path| formatPermissionCommandIdentity(alloc, "user", path, command),
     };
@@ -113,11 +112,6 @@ pub fn formatApprovalCommand(
             "# shell.run profile=omitted (legacy)\n{s}",
             .{command},
         ),
-        .workspace_clean => std.fmt.allocPrint(
-            alloc,
-            "# shell.run profile=clean workspace=root-fixed\n{s}",
-            .{command},
-        ),
         .clean => |path| std.fmt.allocPrint(
             alloc,
             "# shell.run profile=clean shell={s}\n{s}",
@@ -133,5 +127,4 @@ pub fn formatApprovalCommand(
 
 pub const Host = enum {
     native,
-    workspace_clean,
 };

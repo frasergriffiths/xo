@@ -16,7 +16,7 @@ fx is a coding agent CLI written in Zig: a small native binary that is open sour
 ## Highlights
 
 - **OpenRouter:** every model fx can reach through one OpenRouter API key, plus your own OpenAI-compatible endpoints such as Ollama
-- **Any interface:** interactive shell, one-shot `fx ask` for scripts, or embedded through libfx and ACP
+- **Any interface:** interactive shell, one-shot `fx ask` for scripts, or `fx acp` for editors that speak the Agent Client Protocol
 - **Shell-like output:** inline rendering that preserves your terminal scrollback
 - **Extensible:** skills and subagents
 
@@ -122,17 +122,11 @@ compatibility; any other value is ignored and full access still applies.
 
 fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with the `theme` setting or `FX_THEME=<name>` per launch. Without an explicitly selected theme, diff markers and edit counts stay monochrome; selecting any theme adds its diff marker colors. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.
 
-## Embed fx
+## Editors
 
-fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.
-
-| Surface | Use |
-| --- | --- |
-| `fx acp` | Connect the native agent to editors and other Agent Client Protocol clients. |
-| `createFxAgent()` | Embed the agent core in a JavaScript host with `fx-core.wasm`. |
-| `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
-
-The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). See the [WebAssembly SDK](sdk/README.md). The WebAssembly SDK is experimental.
+fx builds as a single native binary and runs in your terminal. `fx acp` starts
+the native Agent Client Protocol server over stdio, so editors that speak ACP,
+such as Zed, can drive the agent directly.
 
 ## Build from source
 

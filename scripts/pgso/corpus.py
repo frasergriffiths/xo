@@ -28,15 +28,9 @@ REQUIRED_DIRECT_COMMANDS = (
 )
 MAX_PROFILE_RUNS = 100
 
-REQUIRED_EXCLUSIONS = (
-    "notifications.test.ts",
-    "tui-agent.test.ts",
-    "tui-command-permissions.test.ts",
-)
-
 ISOLATED_ENVIRONMENT_KEYS = (
-    "AI_GATEWAY_API_KEY",
-    "VERCEL_OIDC_TOKEN",
+    "OPENROUTER_API_KEY",
+    "GROQ_API_KEY",
     "LLVM_PROFILE_FILE",
     "TMUX",
     "TMUX_PANE",
@@ -239,22 +233,7 @@ def _parse_scenario(
 
     test_file = values.get("test_file")
     if test_file is not None:
-        if not isinstance(test_file, str) or pathlib.Path(test_file).name != test_file:
-            raise PgsoError(f"invalid corpus test file: {test_file!r}")
-        if test_file in REQUIRED_EXCLUSIONS or _is_live_test(test_file):
-            raise PgsoError(f"forbidden corpus test: {test_file}")
-        expected_argv = (
-            "bun",
-            "test",
-            "--max-concurrency",
-            "1",
-            f"./{test_file}",
-        )
-        if argv != expected_argv:
-            raise PgsoError(f"scenario {name} test command mismatch")
-        expected_test = repo_root / "tests" / "e2e" / test_file
-        if not expected_test.is_file():
-            raise PgsoError(f"test file does not exist: {test_file}")
+        raise PgsoError(f"scenario {name} may not declare a Bun test_file")
     if profile_runs != 1 and (
         argv[0] != "{binary}"
         or test_file is not None
@@ -304,10 +283,6 @@ def load_corpus(
         document.get("intentional_exclusions"),
         "intentional_exclusions",
     )
-    for required in REQUIRED_EXCLUSIONS:
-        if required not in exclusions:
-            raise PgsoError(f"missing required corpus exclusion: {required}")
-
     defaults = _mapping(document.get("defaults", {}), "corpus defaults")
     raw_scenarios = document.get("scenarios")
     if not isinstance(raw_scenarios, list) or not raw_scenarios:

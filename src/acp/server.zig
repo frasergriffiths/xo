@@ -3,7 +3,6 @@ const managed_execution = @import("../core/execution/managed_execution.zig");
 const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const io_mod = @import("../core/shared/io.zig");
-const host_target = @import("../core/hosts/target.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
@@ -41,18 +40,12 @@ const web_fetch_runtime = @import("../core/tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("../core/tooling/web_search_runtime.zig");
 
 const permissions = @import("../core/permissions/permissions.zig");
-const host_tool_runtime = @import("../core/tooling/host_tool_runtime.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
-const libfx_steering = @import("libfx_steering.zig");
 
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
 const writeJsonStr = jsonrpc.writeJsonStr;
-const libfx_provider_tools = [_]tool_dispatch.Tool{
-    host_tool_runtime.providerProjection(builtin_tools.web_search),
-};
-const libfx_provider_tool_registry = tool_dispatch.Registry{ .tools = &libfx_provider_tools };
 
 const AcpMethod = enum {
     request_cancel,
@@ -67,10 +60,6 @@ const AcpMethod = enum {
     session_prompt,
     session_set_config_option,
     session_set_mode,
-    libfx_checkpoint,
-    libfx_restore,
-    libfx_new,
-    libfx_steer,
     unknown,
 
     fn parse(method: []const u8) AcpMethod {
@@ -86,10 +75,6 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "session/prompt")) return .session_prompt;
         if (std.mem.eql(u8, method, "session/set_config_option")) return .session_set_config_option;
         if (std.mem.eql(u8, method, "session/set_mode")) return .session_set_mode;
-        if (std.mem.eql(u8, method, "libfx/checkpoint")) return .libfx_checkpoint;
-        if (std.mem.eql(u8, method, "libfx/restore")) return .libfx_restore;
-        if (std.mem.eql(u8, method, "libfx/new")) return .libfx_new;
-        if (std.mem.eql(u8, method, "libfx/steer")) return .libfx_steer;
         return .unknown;
     }
 
@@ -103,24 +88,13 @@ const AcpMethod = enum {
             .session_load,
             .session_resume,
             .session_close,
-            .libfx_new,
-            .libfx_steer,
             => false,
             .session_list,
             .session_remove,
             .session_prompt,
             .session_set_config_option,
-            .libfx_checkpoint,
-            .libfx_restore,
             .unknown,
             => true,
-        };
-    }
-
-    fn isLibfx(self: AcpMethod) bool {
-        return switch (self) {
-            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer => true,
-            else => false,
         };
     }
 };
@@ -169,8 +143,6 @@ pub const ActiveSessionState = struct {
     session_id: []u8,
     store: ?session_store.Store = null,
     writable: ?session_store.LoadedWritableSession = null,
-    wasm_state: ?session_codec.DurableSessionState = null,
-    wasm_revision: ?[]u8 = null,
     session_write_mutex: std.Io.Mutex = .init,
     model: []u8,
     provider: model_provider.ProviderId = .openrouter,
@@ -195,7 +167,6 @@ pub const ActiveSessionState = struct {
 
     cancel_flag: std.atomic.Value(bool),
     pending_prompt_id: ?jsonrpc.RequestId,
-    steering: libfx_steering.Runtime = .{},
 
     pub fn retainGrant(self: *ActiveSessionState, alloc: Allocator, tool_name: []const u8, target_path: []const u8) !void {
         for (self.session_grants) |grant| {
@@ -226,7 +197,7 @@ const ActivePrompt = struct {
     /// Mid-turn mode changes apply to the next prompt, never the running one.
     mode: []const u8,
     permission_mode: types.PermissionMode,
-    thread: if (host_target.is_wasm) void else std.Thread = if (host_target.is_wasm) {} else undefined,
+    thread: std.Thread = undefined,
     reapable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
@@ -277,8 +248,6 @@ pub const ServerState = struct {
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{}),
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
-    host_tools: host_tool_runtime.Runtime = .{},
-    host_instructions: []u8 = &.{},
     outbound_mutex: std.Io.Mutex = .init,
     outbound_cond: std.Io.Condition = .init,
     next_outbound_request_id: u64 = 1,
@@ -309,8 +278,6 @@ pub const ServerState = struct {
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.lifecycle_runtime.deinit();
-        self.host_tools.deinit();
-        if (self.host_instructions.len > 0) self.alloc.free(self.host_instructions);
         self.capability_resolver.deinit(self.alloc);
         var pending = self.pending_outbound.valueIterator();
         while (pending.next()) |entry| {
@@ -369,7 +336,6 @@ pub fn adoptServerCredential(state: *ServerState, credential: *credentials.Crede
         active.credential_source = state.credential_source;
         active.credential_refresh_after_ms = state.credential_refresh_after_ms;
         active.account_id = state.account_id;
-        if (comptime !host_target.is_wasm) {}
     }
 }
 
@@ -496,19 +462,19 @@ fn publishRefreshedCredential(
     if (expected_account_id) |expected| {
         const refreshed_account = null orelse {
             debug_trace.logf("auth", "ACP credential publication rejected stage=refreshed_account_missing", .{});
-            return error.ChatGptAccountChanged;
+            return error.CredentialAccountChanged;
         };
         const state_account = state.account_id orelse {
             debug_trace.logf("auth", "ACP credential publication rejected stage=state_account_missing", .{});
-            return error.ChatGptAccountChanged;
+            return error.CredentialAccountChanged;
         };
         if (!std.mem.eql(u8, expected, refreshed_account)) {
             debug_trace.logf("auth", "ACP credential publication rejected stage=refreshed_account_changed", .{});
-            return error.ChatGptAccountChanged;
+            return error.CredentialAccountChanged;
         }
         if (!std.mem.eql(u8, expected, state_account)) {
             debug_trace.logf("auth", "ACP credential publication rejected stage=state_account_changed", .{});
-            return error.ChatGptAccountChanged;
+            return error.CredentialAccountChanged;
         }
     }
     if (expected_team) |expected| {
@@ -522,11 +488,11 @@ fn publishRefreshedCredential(
         if (expected_account_id) |expected| {
             const active_account = active.account_id orelse {
                 debug_trace.logf("auth", "ACP credential publication rejected stage=active_account_missing", .{});
-                return error.ChatGptAccountChanged;
+                return error.CredentialAccountChanged;
             };
             if (!std.mem.eql(u8, expected, active_account)) {
                 debug_trace.logf("auth", "ACP credential publication rejected stage=active_account_changed", .{});
-                return error.ChatGptAccountChanged;
+                return error.CredentialAccountChanged;
             }
         }
     }
@@ -536,44 +502,40 @@ fn publishRefreshedCredential(
 pub fn releaseActiveSession(state: *ServerState) !void {
     const active = if (state.active_session) |*session| session else return;
     disableSubagentHost(state);
-    if (comptime !host_target.is_wasm) {
-        active.session_rt.usage.cancelReconciliation();
-        active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
-        flushActiveSessionUsage(state) catch |err| {
-            if (state.cfg.provider_set.select(active.provider).deferred_usage == null) {
-                active.session_rt.usage.clearReconciliationCredential();
-            } else if (active.credential_source) |source| {
-                active.session_rt.usage.replaceProviderReconciliationCredential(
-                    state.alloc,
-                    active.provider,
-                    source,
-                    active.account_id,
-                    state.api_key,
-                );
-            } else {
-                active.session_rt.usage.clearReconciliationCredential();
-            }
-            return err;
-        };
-        active.session_rt.usage.configurePublicationSink(null);
-        active.session_rt.usage.configureCheckpointSink(null);
-    }
+    active.session_rt.usage.cancelReconciliation();
+    active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
+    flushActiveSessionUsage(state) catch |err| {
+        if (state.cfg.provider_set.select(active.provider).deferred_usage == null) {
+            active.session_rt.usage.clearReconciliationCredential();
+        } else if (active.credential_source) |source| {
+            active.session_rt.usage.replaceProviderReconciliationCredential(
+                state.alloc,
+                active.provider,
+                source,
+                active.account_id,
+                state.api_key,
+            );
+        } else {
+            active.session_rt.usage.clearReconciliationCredential();
+        }
+        return err;
+    };
+    active.session_rt.usage.configurePublicationSink(null);
+    active.session_rt.usage.configureCheckpointSink(null);
     destroyActiveSession(state);
 }
 
 fn closeActiveSession(state: *ServerState) !void {
     const active = if (state.active_session) |*session| session else return;
     disableSubagentHost(state);
-    if (comptime !host_target.is_wasm) {
-        active.session_rt.usage.cancelReconciliation();
-        active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
-        flushActiveSessionUsage(state) catch |err| {
-            destroyActiveSession(state);
-            return err;
-        };
-        active.session_rt.usage.configurePublicationSink(null);
-        active.session_rt.usage.configureCheckpointSink(null);
-    }
+    active.session_rt.usage.cancelReconciliation();
+    active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
+    flushActiveSessionUsage(state) catch |err| {
+        destroyActiveSession(state);
+        return err;
+    };
+    active.session_rt.usage.configurePublicationSink(null);
+    active.session_rt.usage.configureCheckpointSink(null);
     destroyActiveSession(state);
 }
 
@@ -585,14 +547,10 @@ fn destroyActiveSession(state: *ServerState) void {
     }
     state.alloc.free(active.session_id);
     state.alloc.free(active.model);
-    active.steering.deinit(state.alloc);
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
-    if (comptime !host_target.is_wasm) {}
     active.session_rt.deinit(state.alloc);
     if (active.writable) |*writable| writable.deinit(state.alloc);
     if (active.store) |*store| store.deinit(state.alloc);
-    if (active.wasm_state) |*wasm_state| wasm_state.deinit(state.alloc);
-    if (active.wasm_revision) |revision| state.alloc.free(revision);
     state.active_session = null;
 }
 
@@ -972,38 +930,11 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         return state.writer.writeResponse(alloc, msg.id, "null");
     }
 
-    if (method.isLibfx() and !state.cfg.minimal_kernel) {
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.method_not_found,
-            .message = "Method not found",
-        });
-    }
-
     if (method.waitsForActivePrompt() and state.active_prompt != null) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = "Prompt already in progress",
         });
-    }
-
-    if (comptime host_target.is_wasm) {
-        return switch (method) {
-            .session_new => sessions.handleNewWasmSession(state, alloc, msg),
-            .session_load => sessions.handleLoadWasmSession(state, alloc, msg),
-            .session_list => sessions.handleListWasmSessions(state, alloc, msg),
-            .session_remove => sessions.handleRemoveWasmSession(state, alloc, msg),
-            .session_prompt => startPrompt(state, alloc, msg),
-            .session_set_config_option => handleSetConfigOption(state, alloc, msg),
-            .session_set_mode => handleSetMode(state, alloc, msg),
-            .libfx_checkpoint => handleKernelCheckpoint(state, alloc, msg),
-            .libfx_restore => handleKernelRestore(state, alloc, msg),
-            .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
-            .libfx_steer => handleKernelSteer(state, alloc, msg),
-            else => state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.method_not_found,
-                .message = "Method not available in the web core yet",
-            }),
-        };
     }
 
     return switch (method) {
@@ -1015,10 +946,6 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .session_prompt => startPrompt(state, alloc, msg),
         .session_set_config_option => handleSetConfigOption(state, alloc, msg),
         .session_set_mode => handleSetMode(state, alloc, msg),
-        .libfx_checkpoint => handleKernelCheckpoint(state, alloc, msg),
-        .libfx_restore => handleKernelRestore(state, alloc, msg),
-        .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
-        .libfx_steer => handleKernelSteer(state, alloc, msg),
         .initialize,
         .request_cancel,
         .session_cancel,
@@ -1071,169 +998,6 @@ fn handleRequestCancellation(
     handleCancel(state, true);
 }
 
-fn libfxSessionId(alloc: Allocator, msg: *const jsonrpc.Message) !std.json.Parsed(std.json.Value) {
-    const raw = msg.params_raw orelse return error.InvalidLibfxParams;
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
-        return error.InvalidLibfxParams;
-    if (parsed.value != .object) {
-        parsed.deinit();
-        return error.InvalidLibfxParams;
-    }
-    return parsed;
-}
-
-fn activeLibfxSession(
-    state: *ServerState,
-    params: std.json.Value,
-) ?*ActiveSessionState {
-    const session_id = params.object.get("sessionId") orelse return null;
-    if (session_id != .string) return null;
-    const active = if (state.active_session) |*session| session else return null;
-    if (!std.mem.eql(u8, active.session_id, session_id.string)) return null;
-    return active;
-}
-
-pub fn takeLibfxSteering(
-    state: *ServerState,
-    result_alloc: Allocator,
-    close_if_empty: bool,
-) Allocator.Error![][]u8 {
-    const active = if (state.active_session) |*session| session else return &.{};
-    return active.steering.takeAll(state.alloc, result_alloc, close_if_empty);
-}
-
-fn handleKernelCheckpoint(
-    state: *ServerState,
-    alloc: Allocator,
-    msg: *const jsonrpc.Message,
-) !void {
-    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
-        .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx checkpoint params",
-    });
-    defer parsed.deinit();
-    const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
-    const bytes = active.session_rt.agent.checkpoint(alloc) catch
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_request,
-            .message = "libfx checkpoint is unavailable",
-        });
-    defer alloc.free(bytes);
-    const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
-    defer alloc.free(encoded);
-    _ = std.base64.standard.Encoder.encode(encoded, bytes);
-    var response: std.Io.Writer.Allocating = .init(alloc);
-    defer response.deinit();
-    try response.writer.writeAll("{\"checkpoint\":");
-    try std.json.Stringify.value(encoded, .{}, &response.writer);
-    try response.writer.writeByte('}');
-    try state.writer.writeResponse(alloc, msg.id, response.written());
-}
-
-fn handleKernelRestore(
-    state: *ServerState,
-    alloc: Allocator,
-    msg: *const jsonrpc.Message,
-) !void {
-    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
-        .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx restore params",
-    });
-    defer parsed.deinit();
-    const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
-    const checkpoint = parsed.value.object.get("checkpoint") orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Missing libfx checkpoint",
-        });
-    if (checkpoint != .string) return state.writer.writeError(alloc, msg.id, .{
-        .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx checkpoint",
-    });
-    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(checkpoint.string) catch
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Invalid libfx checkpoint",
-        });
-    if (decoded_len > agent_checkpoint.max_checkpoint_bytes) {
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "libfx checkpoint is too large",
-        });
-    }
-    const bytes = try alloc.alloc(u8, decoded_len);
-    defer alloc.free(bytes);
-    std.base64.standard.Decoder.decode(bytes, checkpoint.string) catch
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Invalid libfx checkpoint",
-        });
-    active.session_rt.agent.restoreCheckpoint(alloc, bytes) catch
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Invalid or non-fresh libfx checkpoint",
-        });
-    try state.writer.writeResponse(alloc, msg.id, "null");
-}
-
-fn handleKernelSteer(
-    state: *ServerState,
-    alloc: Allocator,
-    msg: *const jsonrpc.Message,
-) !void {
-    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
-        .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx steer params",
-    });
-    defer parsed.deinit();
-    const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
-    const text = parsed.value.object.get("text") orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Missing steering text",
-        });
-    if (text != .string) return state.writer.writeError(alloc, msg.id, .{
-        .code = ErrorCode.invalid_params,
-        .message = "Invalid steering text",
-    });
-    active.steering.enqueue(state.alloc, text.string) catch |err| {
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = switch (err) {
-                error.SteeringQueueFull, error.SteeringNotActive => ErrorCode.invalid_request,
-                else => ErrorCode.invalid_params,
-            },
-            .message = switch (err) {
-                error.EmptySteeringMessage => "Steering text cannot be empty",
-                error.SteeringMessageTooLarge => "Steering text exceeds the 64 KiB libfx limit",
-                error.SteeringQueueFull => "Steering queue is full",
-                error.SteeringNotActive => "No prompt is running",
-                error.OutOfMemory => "Failed to queue steering text",
-            },
-        });
-    };
-    var update: std.Io.Writer.Allocating = .init(alloc);
-    defer update.deinit();
-    try update.writer.writeAll("{\"sessionId\":");
-    try writeJsonStr(active.session_id, &update.writer);
-    try update.writer.writeAll(",\"update\":");
-    try acp_types.writeUserMessageChunk(&update.writer, "libfx-steering", text.string);
-    try update.writer.writeByte('}');
-    try state.writer.writeNotification(alloc, "session/update", update.written());
-    try state.writer.writeResponse(alloc, msg.id, "null");
-}
-
 fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) !void {
     if (!try requireActiveSessionTarget(state, alloc, msg)) return;
     const session = if (state.active_session) |*active| active else unreachable;
@@ -1249,15 +1013,6 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
     errdefer jsonrpc.freeMessage(alloc, &active.msg);
 
     session.cancel_flag.store(false, .seq_cst);
-    if (state.cfg.minimal_kernel) session.steering.open(state.alloc);
-    if (comptime host_target.is_wasm) {
-        promptWorkerMain(active);
-        jsonrpc.freeMessage(active.alloc, &active.msg);
-        active.alloc.destroy(active);
-    } else {
-        active.thread = try std.Thread.spawn(.{}, promptWorkerMain, .{active});
-        state.active_prompt = active;
-    }
 }
 
 fn parsedSessionTargetDecision(state: *const ServerState, root: std.json.Value) SessionTargetDecision {
@@ -1348,9 +1103,6 @@ fn promptWorkerMain(active: *ActivePrompt) void {
             .message = @errorName(err),
         },
     };
-    if (active.state.active_session) |*session| {
-        if (active.state.cfg.minimal_kernel) session.steering.close(active.state.alloc, "turn_finished");
-    }
     active.reapable.store(true, .seq_cst);
     publishPromptOutcome(active, outcome) catch {};
     prompt_test_controls.pauseAfterTerminalWrite();
@@ -1379,15 +1131,13 @@ fn publishPromptOutcome(active: *ActivePrompt, outcome: prompt_handler.TerminalO
 }
 
 fn reapActivePrompt(state: *ServerState, wait: bool) void {
-    if (!host_target.is_wasm) {
-        const active = state.active_prompt orelse return;
-        if (!wait and !active.reapable.load(.seq_cst)) return;
-        prompt_test_controls.noteReapBeforeJoin();
-        active.thread.join();
-        jsonrpc.freeMessage(active.alloc, &active.msg);
-        active.alloc.destroy(active);
-        state.active_prompt = null;
-    }
+    const active = state.active_prompt orelse return;
+    if (!wait and !active.reapable.load(.seq_cst)) return;
+    prompt_test_controls.noteReapBeforeJoin();
+    active.thread.join();
+    jsonrpc.freeMessage(active.alloc, &active.msg);
+    active.alloc.destroy(active);
+    state.active_prompt = null;
 }
 
 fn cloneMessage(alloc: Allocator, msg: *const jsonrpc.Message) !jsonrpc.Message {
@@ -1410,12 +1160,9 @@ const InitializeRequest = struct {
     client_fs_read: bool = false,
     client_fs_write: bool = false,
     client_terminal: bool = false,
-    host_tools: host_tool_runtime.Runtime = .{},
-    host_instructions: []u8 = &.{},
 
     fn deinit(self: *InitializeRequest, alloc: Allocator) void {
-        self.host_tools.deinit();
-        if (self.host_instructions.len > 0) alloc.free(self.host_instructions);
+        _ = alloc;
         self.* = .{};
     }
 };
@@ -1423,7 +1170,6 @@ const InitializeRequest = struct {
 fn parseInitializeRequest(
     alloc: Allocator,
     params: ?[]const u8,
-    allow_libfx: bool,
 ) !InitializeRequest {
     const raw = params orelse return error.InvalidInitializeParams;
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
@@ -1454,35 +1200,10 @@ fn parseInitializeRequest(
     if (capabilities.object.get("terminal")) |value| {
         request.client_terminal = value == .bool and value.bool;
     }
-    if (allow_libfx) {
-        if (capabilities.object.get("libfx")) |libfx| {
-            if (libfx != .object) return error.InvalidInitializeParams;
-            request.host_tools = try host_tool_runtime.Runtime.initWithProviderRegistry(
-                alloc,
-                libfx.object.get("tools"),
-                libfx_provider_tool_registry,
-            );
-            errdefer request.host_tools.deinit();
-            if (libfx.object.get("instructions")) |instructions| {
-                if (instructions != .string or instructions.string.len > 64 * 1024) {
-                    return error.InvalidInitializeParams;
-                }
-                request.host_instructions = try alloc.dupe(u8, instructions.string);
-            }
-        }
-    }
     return request;
 }
 
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
-    if (state.cfg.minimal_kernel) {
-        return app_lifecycle.loadLibfxStartupState(
-            alloc,
-            state.cfg.workspace_root_override orelse "/",
-            state.cfg.model_override orelse state.cfg.default_model,
-            state.cfg.default_agent_step_limit,
-        );
-    }
     if (state.cfg.home_override) |home_dir| {
         if (state.cfg.workspace_root_override) |workspace_root| {
             var startup = try app_lifecycle.loadEmbeddedStartupState(
@@ -1518,7 +1239,6 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     var request = parseInitializeRequest(
         alloc,
         msg.params_raw,
-        state.cfg.minimal_kernel,
     ) catch {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
@@ -1542,14 +1262,12 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             if (auth_runtime.preparationError(auth_runtime.classifyCredentialFailure(failure.source, failure.err))) |err| return err;
         }
     }
-    if (!state.cfg.minimal_kernel) {
-        try app_lifecycle.applyWorkspaceLaunch(
-            &startup,
-            alloc,
-            state.cfg.additional_directories,
-            state.cfg.saved_directories_suppressed,
-        );
-    }
+    try app_lifecycle.applyWorkspaceLaunch(
+        &startup,
+        alloc,
+        state.cfg.additional_directories,
+        state.cfg.saved_directories_suppressed,
+    );
     for (startup.config_diagnostics) |diagnostic| {
         if (diagnostic.recovery_path != null) {
             debug_trace.logf("config", "acp startup diagnostic layer={s} cause={s} recovery_available=true", .{
@@ -1649,43 +1367,37 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.context_enabled = startup.context_enabled;
     state.session_titles = startup.session_title_generation;
 
-    if (comptime !host_target.is_wasm) {
-        if (!state.cfg.minimal_kernel) {
-            var loaded_skills = try app_runtime_setup.loadSkills(alloc, state.workspace_root, builtin_skills.root_policy);
-            errdefer loaded_skills.deinit(alloc);
-            skill_runtime.traceDiagnostics("acp_startup", loaded_skills.diagnostics);
-            try state.skills.replaceLoaded(alloc, loaded_skills.dir, loaded_skills.skills, loaded_skills.diagnostics);
-            loaded_skills = .{};
-        }
-    }
+    var loaded_skills = try app_runtime_setup.loadSkills(alloc, state.workspace_root, builtin_skills.root_policy);
+    errdefer loaded_skills.deinit(alloc);
+    skill_runtime.traceDiagnostics("acp_startup", loaded_skills.diagnostics);
+    try state.skills.replaceLoaded(alloc, loaded_skills.dir, loaded_skills.skills, loaded_skills.diagnostics);
+    loaded_skills = .{};
 
-    if (!state.cfg.minimal_kernel) {
-        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
-        const startup_catalog = catalogProviderFor(state, state.provider) orelse
-            return state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.invalid_request,
-                .message = "Selected provider is unavailable in this host",
-            });
-        _ = try state.capability_resolver.resolve(
-            state.alloc,
-            startup_catalog,
-            .{
-                .access = if (state.cfg.auth_mode == .host_managed)
-                    .host_managed
-                else
-                    credentials.catalogAccessForCredentialAndAccount(
-                        state.credential_source,
-                        state.api_key,
-                        null,
-                        state.account_id,
-                    ),
-                .endpoint = state.cfg.gateway_models_path,
-                .cancel_flag = &catalog_cancel_flag,
-            },
-            state.selected_model,
-            state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
-        );
-    }
+    var catalog_cancel_flag = std.atomic.Value(bool).init(false);
+    const startup_catalog = catalogProviderFor(state, state.provider) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "Selected provider is unavailable in this host",
+        });
+    _ = try state.capability_resolver.resolve(
+        state.alloc,
+        startup_catalog,
+        .{
+            .access = if (state.cfg.auth_mode == .host_managed)
+                .host_managed
+            else
+                credentials.catalogAccessForCredentialAndAccount(
+                    state.credential_source,
+                    state.api_key,
+                    null,
+                    state.account_id,
+                ),
+            .endpoint = state.cfg.gateway_models_path,
+            .cancel_flag = &catalog_cancel_flag,
+        },
+        state.selected_model,
+        state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
+    );
 
     if (state.cfg.effort_override) |raw| {
         const effort = types.ReasoningEffort.parse(raw) orelse
@@ -1703,21 +1415,11 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.client_fs_read = request.client_fs_read;
     state.client_fs_write = request.client_fs_write;
     state.client_terminal = request.client_terminal;
-    state.host_tools.deinit();
-    state.host_tools = request.host_tools;
-    request.host_tools = .{};
-    if (state.host_instructions.len > 0) alloc.free(state.host_instructions);
-    state.host_instructions = request.host_instructions;
-    request.host_instructions = &.{};
-    debug_trace.logf("acp", "libfx host capabilities tools={d} instructions_bytes={d}", .{
-        state.host_tools.tools.len,
-        state.host_instructions.len,
-    });
     state.initialized = true;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try acp_types.writeInitializeResponse(&out.writer, !host_target.is_wasm);
+    try acp_types.writeInitializeResponse(&out.writer);
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
@@ -1733,27 +1435,7 @@ fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mess
     const bundle = state.cfg.provider_set.select(state.provider);
     const fallback = bundle.fallbackModelCapabilities(state.selected_model);
     var capabilities: model_capabilities.Capabilities = undefined;
-    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
-        // libfx cores skip the startup catalog resolve; explicit effort and
-        // fast overrides are the creation-time consumers that need it.
-        const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
-        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
-        capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
-            .access = if (state.cfg.auth_mode == .host_managed)
-                .host_managed
-            else
-                credentials.catalogAccessForCredentialAndAccount(
-                    state.credential_source,
-                    state.api_key,
-                    null,
-                    state.account_id,
-                ),
-            .endpoint = state.cfg.gateway_models_path,
-            .cancel_flag = &catalog_cancel_flag,
-        }, state.selected_model, fallback);
-    } else {
-        capabilities = state.capability_resolver.available(state.selected_model, fallback);
-    }
+    capabilities = state.capability_resolver.available(state.selected_model, fallback);
     // A failed catalog lookup cannot name the supported set; the turn-time
     // capability check remains the backstop.
     if (state.capability_resolver.state == .failed) return true;
@@ -1771,7 +1453,7 @@ fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mess
             .code = ErrorCode.invalid_params,
             .message = message,
             .data = .{
-                .code = "LIBFX_MODEL_UNSUPPORTED_EFFORT",
+                .code = "MODEL_UNSUPPORTED_EFFORT",
                 .model = state.selected_model,
                 .capability = "effort",
             },
@@ -1819,27 +1501,7 @@ fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
     const bundle = state.cfg.provider_set.select(state.provider);
     const fallback = bundle.fallbackModelCapabilities(state.selected_model);
     var capabilities: model_capabilities.Capabilities = undefined;
-    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
-        // Shares the effort override's one-shot catalog resolve: creation is
-        // the only point that can reject before any turn runs.
-        const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
-        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
-        capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
-            .access = if (state.cfg.auth_mode == .host_managed)
-                .host_managed
-            else
-                credentials.catalogAccessForCredentialAndAccount(
-                    state.credential_source,
-                    state.api_key,
-                    null,
-                    state.account_id,
-                ),
-            .endpoint = state.cfg.gateway_models_path,
-            .cancel_flag = &catalog_cancel_flag,
-        }, state.selected_model, fallback);
-    } else {
-        capabilities = state.capability_resolver.available(state.selected_model, fallback);
-    }
+    capabilities = state.capability_resolver.available(state.selected_model, fallback);
     // A failed catalog lookup cannot confirm a fast path; the turn-time
     // capability gate remains the backstop.
     if (state.capability_resolver.state == .failed) return true;
@@ -1857,7 +1519,7 @@ fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
             .code = ErrorCode.invalid_params,
             .message = message,
             .data = .{
-                .code = "LIBFX_MODEL_UNSUPPORTED_FAST",
+                .code = "MODEL_UNSUPPORTED_FAST",
                 .model = state.selected_model,
                 .capability = "fast",
             },
@@ -1884,7 +1546,6 @@ fn handleCancel(state: *ServerState, notify_client: bool) void {
     if (state.active_session) |*session| {
         debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=acp active_tool_known=false", .{});
         session.cancel_flag.store(true, .seq_cst);
-        if (state.cfg.minimal_kernel) session.steering.close(state.alloc, "cancelled");
     }
     cancelPendingOutbound(state, notify_client);
 }
@@ -1981,55 +1642,36 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .code = ErrorCode.invalid_params,
                 .message = "Invalid session model",
             });
-        if (comptime !host_target.is_wasm) {
-            if (session.provider != .openrouter) {
-                if (session.provider != .configured) {
-                    try refreshModelCatalogForOptions(state);
-                    var model_available = false;
-                    if (state.capability_resolver.catalogEntries()) |entries| {
-                        for (entries) |entry| {
-                            if (std.mem.eql(u8, entry.id, value)) {
-                                model_available = true;
-                                break;
-                            }
+        if (session.provider != .openrouter) {
+            if (session.provider != .configured) {
+                try refreshModelCatalogForOptions(state);
+                var model_available = false;
+                if (state.capability_resolver.catalogEntries()) |entries| {
+                    for (entries) |entry| {
+                        if (std.mem.eql(u8, entry.id, value)) {
+                            model_available = true;
+                            break;
                         }
                     }
-                    if (!model_available) {
-                        return state.writer.writeError(alloc, msg.id, .{
-                            .code = ErrorCode.invalid_params,
-                            .message = "Model is not available for the active provider",
-                        });
-                    }
                 }
-                if (!try selectCredentialForProvider(state, session.provider)) {
+                if (!model_available) {
                     return state.writer.writeError(alloc, msg.id, .{
-                        .code = ErrorCode.invalid_request,
-                        .message = if (credentialOverrideSource(session.provider) != null)
-                            credentials.missing_credential_message
-                        else
-                            "Configured provider authentication is unavailable",
+                        .code = ErrorCode.invalid_params,
+                        .message = "Model is not available for the active provider",
                     });
                 }
             }
+            if (!try selectCredentialForProvider(state, session.provider)) {
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = if (credentialOverrideSource(session.provider) != null)
+                        credentials.missing_credential_message
+                    else
+                        "Configured provider authentication is unavailable",
+                });
+            }
         }
-        if (host_target.is_wasm and session.writable == null) {
-            const next_model = alloc.dupe(u8, value) catch
-                return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.internal_error,
-                    .message = "Failed to update session model",
-                });
-            const previous_model = session.model;
-            session.model = next_model;
-            sessions.commitWasmSession(alloc, session) catch {
-                session.model = previous_model;
-                alloc.free(next_model);
-                return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.internal_error,
-                    .message = "Failed to persist session model",
-                });
-            };
-            alloc.free(previous_model);
-        } else commitActiveSessionModel(
+        commitActiveSessionModel(
             alloc,
             session,
             value,
@@ -2058,12 +1700,6 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             .message = "No active session",
         });
         if (!target.eql(session.provider)) {
-            if (host_target.is_wasm) {
-                return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.invalid_request,
-                    .message = "Subscription provider switching is unavailable in this WASM runtime",
-                });
-            }
             var staged_credential: ?credentials.Credential = blk: {
                 if (state.cfg.auth_mode == .host_managed) break :blk null;
                 if (credentialOverrideSource(target)) |override_source| {
@@ -2211,14 +1847,12 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"configOptions\":[");
-    if (comptime !host_target.is_wasm) {
-        try sessions.writeProviderConfigOption(
-            &out.writer,
-            if (state.active_session) |session| session.provider else state.provider,
-            state.configured_providers.definitions,
-        );
-        try out.writer.writeAll(",");
-    }
+    try sessions.writeProviderConfigOption(
+        &out.writer,
+        if (state.active_session) |session| session.provider else state.provider,
+        state.configured_providers.definitions,
+    );
+    try out.writer.writeAll(",");
     try sessions.writeModelConfigOption(
         &out.writer,
         current_model,
@@ -2235,8 +1869,6 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
 }
 
 pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
-    if (comptime host_target.is_wasm) return;
-    if (state.cfg.minimal_kernel) return;
     const active = if (state.active_session) |*session| session else return;
     const provider = catalogProviderFor(state, active.provider) orelse return;
     std.debug.assert(state.active_prompt == null);
@@ -2325,15 +1957,6 @@ fn commitActiveSessionEffort(
     session: *ActiveSessionState,
     effort: types.ReasoningEffort,
 ) !void {
-    if (host_target.is_wasm and session.writable == null) {
-        const previous = session.effort;
-        session.effort = effort;
-        sessions.commitWasmSession(alloc, session) catch |err| {
-            session.effort = previous;
-            return err;
-        };
-        return;
-    }
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (session.writable) |*active|

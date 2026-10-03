@@ -9,13 +9,11 @@ const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
 const api_key_validator = @import("core/auth/api_key_validator.zig");
-const js_host_clipboard = @import("core/hosts/js_host_clipboard.zig");
 const credentials = @import("core/auth/credentials.zig");
 const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
 const usage_dashboard_runtime = @import("core/app/usage_dashboard_runtime.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
-const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
@@ -45,7 +43,6 @@ const collections = @import("core/shared/collections.zig");
 const agent_steps = @import("core/config/agent_steps.zig");
 const config_runtime = @import("core/config/config_runtime.zig");
 const model_provider = @import("core/config/model_provider.zig");
-const js_host_prompt_history = @import("core/session/js_host_prompt_history.zig");
 const model_capabilities = @import("core/config/model_capabilities.zig");
 const prompt_policy = @import("core/config/prompt_policy.zig");
 const builtin_commands = @import("builtins/commands.zig");
@@ -64,9 +61,6 @@ const builtin_modes = @import("builtins/modes.zig");
 const builtin_skills = @import("builtins/skills.zig");
 const host = @import("core/hosts/host.zig");
 const host_runtime_profile = @import("core/hosts/runtime_profile.zig");
-const js_host_url_opener = @import("core/hosts/js_host_url_opener.zig");
-const js_host_workspace = @import("core/hosts/js_host_workspace.zig");
-const host_target = @import("core/hosts/target.zig");
 const native_host = @import("core/hosts/native.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
 const display_width = @import("core/shared/display_width.zig");
@@ -104,8 +98,6 @@ const session_codec = @import("core/session/session_codec.zig");
 const session_child_store = @import("core/session/session_child_store.zig");
 const session_log = @import("core/session/session_log.zig");
 const builtin_tools = @import("builtins/tools.zig");
-const browser_workspace_tools = @import("builtins/browser_workspace_tools.zig");
-const browser_capabilities = @import("core/hosts/browser_capabilities.zig");
 const tool_admission = @import("core/tooling/tool_admission.zig");
 const tool_projection = @import("core/tooling/tool_projection.zig");
 const command_output_content = @import("core/tooling/command_output_content.zig");
@@ -118,8 +110,6 @@ const web_search_runtime = @import("core/tooling/web_search_runtime.zig");
 const worker_runtime = @import("core/agent/worker_runtime.zig");
 const question_prompt = @import("core/agent/question_prompt.zig");
 const gateway_client = @import("gateway/client.zig");
-const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
-const js_host_model_catalog = @import("gateway/js_host_model_catalog.zig");
 const url_opener = @import("core/hosts/url_opener.zig");
 const event_loop = @import("ui/event_loop.zig");
 const footer_runtime = @import("ui/footer/runtime.zig");
@@ -167,7 +157,6 @@ const RawEnviron = io_mod.RawEnviron;
 const footer_rows: u16 = 4;
 const active_poll_timeout_ms: i32 = 8;
 const focused_ui_worker_poll_timeout_ms: i32 = 1;
-const idle_wasm_poll_timeout_ms: i32 = 16;
 const resize_debounce_ms: i64 = 100;
 const max_transcript_bytes: usize = 256 * 1024;
 const default_max_agent_steps: usize = agent_steps.default_max_agent_steps;
@@ -331,19 +320,9 @@ fn promptCardSkillTokensFromDisplaySpans(
 
 var resize_interlock = shell_runtime.ResizeApprovalInterlock{};
 const default_context_registry = context_contract.Registry{ .default_provider = builtin_context.provider };
-const WorkspaceHostRuntime = if (host_target.is_wasm) js_host_workspace.Runtime else struct {};
-const selected_host_profile = if (host_target.is_wasm) host_runtime_profile.wasm else host_runtime_profile.native;
-const app_api_key_validator = if (host_target.is_wasm)
-    api_key_validator.unavailable_provider
-else
-    openrouter.api_key_validator;
-const app_secret_store = if (host_target.is_wasm)
-    host.unavailable_secret_store
-else
-    native_host.secret_store;
-const wasm_skill_root_policy: @import("core/skills/skill_contract.zig").RootPolicy = .{
-    .managed_root_source = null,
-};
+const selected_host_profile = host_runtime_profile.native;
+const app_api_key_validator = openrouter.api_key_validator;
+const app_secret_store = native_host.secret_store;
 fn currentBuild() update_target.CurrentBuild {
     return .{
         .channel = compiled_update_channel,
@@ -361,7 +340,6 @@ const App = struct {
     const Self = @This();
     const AgentAppRuntime = app_agent_runtime.Runtime(Self);
     const AuthAppRuntime = app_auth_runtime.Runtime(Self);
-    const HostConfigAppRuntime = app_host_config_runtime.Runtime(Self);
     const BootstrapAppRuntime = app_bootstrap_runtime.Runtime(Self);
     const InputAppRuntime = app_input_runtime.Runtime(Self);
     const InputFullTranscriptRuntime = input_full_transcript_runtime.Runtime(Self);
@@ -381,16 +359,6 @@ const App = struct {
         return default_context_registry;
     }
 
-    pub fn workspaceHostInfo(self: *const Self) ?*const js_host_workspace.Info {
-        if (comptime host_profile.js_host_workspace) return self.workspace_host.info();
-        return null;
-    }
-
-    pub fn workspaceExecutor(self: *const Self) ?js_host_workspace.Executor {
-        if (comptime host_profile.js_host_workspace) return self.workspace_host.executor();
-        return null;
-    }
-
     pub fn promptPolicy(_: *const Self) prompt_policy.Policy {
         return builtin_context.prompt_policy;
     }
@@ -404,12 +372,7 @@ const App = struct {
     }
 
     pub fn urlOpener(_: *const Self) host.UrlOpener {
-        return if (comptime host_profile.url_opening)
-            url_opener.native_opener
-        else if (comptime host_profile.js_host_url_open)
-            js_host_url_opener.opener
-        else
-            host.unavailable_url_opener;
+        return url_opener.native_opener;
     }
 
     pub fn agentStreamProvider(self: *const Self) agent_stream_provider.Provider {
@@ -431,7 +394,6 @@ const App = struct {
     }
 
     pub fn cooperativeTransportPulse(self: *Self) !void {
-        if (comptime !host_target.is_wasm) return;
         if (try event_loop.pump_ready_input(
             self.terminal,
             &self.should_exit,
@@ -452,12 +414,7 @@ const App = struct {
     }
 
     pub fn clipboard(_: *const Self) host.Clipboard {
-        return if (comptime host_profile.clipboard)
-            native_host.clipboard
-        else if (comptime host_profile.js_host_clipboard)
-            js_host_clipboard.clipboard
-        else
-            host.unavailable_clipboard;
+        return native_host.clipboard;
     }
 
     pub fn terminalTitle(self: *const Self) host.TerminalTitle {
@@ -476,7 +433,6 @@ const App = struct {
     usage_dashboard: usage_dashboard_runtime.Runtime = usage_dashboard_runtime.Runtime.init(std.heap.c_allocator),
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
-    workspace_host: WorkspaceHostRuntime = .{},
     workspace: app_workspace_runtime.State = .{},
     permission_engine: PermissionEngine = .{},
     permission_state: app_permission_runtime.State = .{},
@@ -566,23 +522,14 @@ const App = struct {
             .session = undefined,
             .shell = TranscriptRuntime.init(),
             .lifecycle_runtime = hooks.Runtime.init(alloc),
-            .terminal_client = terminal_client_runtime.Runtime.init(if (comptime host_target.is_wasm)
-                process_provider.unavailable_provider
-            else
-                shell_process_provider.provider),
-            .legacy_process_provider = if (comptime host_target.is_wasm)
-                process_provider.unavailable_provider
-            else
-                shell_process_provider.provider,
+            .terminal_client = terminal_client_runtime.Runtime.init(shell_process_provider.provider),
+            .legacy_process_provider = shell_process_provider.provider,
         };
         // Resolve the key validator from the same provider bundle the agent
         // will use, so a retargeted `providers.openrouter` entry validates
         // against its own address rather than the compiled default.
-        const resolved_validator = if (comptime host_target.is_wasm)
-            api_key_validator.unavailable_provider
-        else
-            app.providerSet().select(.openrouter).api_key_validator orelse
-                api_key_validator.unavailable_provider;
+        const resolved_validator = app.providerSet().select(.openrouter).api_key_validator orelse
+            api_key_validator.unavailable_provider;
         auth_runtime.Runtime.initIntoWithMode(
             &app.auth,
             resolved_validator,
@@ -600,22 +547,6 @@ const App = struct {
             else
                 .{},
         );
-        if (comptime host_profile.js_host_workspace) {
-            app.workspace_host = js_host_workspace.Runtime.init(alloc) catch |err| blk: {
-                if (err != error.WorkspaceUnavailable) {
-                    debug_trace.logf("workspace", "js host workspace unavailable err={s}", .{@errorName(err)});
-                }
-                break :blk .{};
-            };
-        }
-        if (comptime host_profile.js_host_prompt_history) {
-            if (js_host_prompt_history.available()) {
-                _ = app.prompt_history.initializeWithProvider(
-                    app.prompt_history.enabled,
-                    js_host_prompt_history.provider,
-                );
-            }
-        }
         app.shell.max_transcript_bytes = max_transcript_bytes;
         if (launch.requested_resume) |target| {
             app.requested_resume = target;
@@ -629,7 +560,7 @@ const App = struct {
             default_max_agent_steps,
             handle_sigwinch,
             .{
-                .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
+                .skill_root_policy = builtin_skills.root_policy,
                 .terminal_title = app.terminalTitle(),
             },
             .{
@@ -647,16 +578,14 @@ const App = struct {
             launch.modifiers.additional_directories,
             launch.modifiers.saved_directories_suppressed,
         );
-        if (comptime !host_target.is_wasm) {
-            app.provider_selection.ensureGatewayHttpPool();
-            if (app.provider_selection.selection().provider == .openrouter) {
-                if (app.provider_selection.gateway_http_pool) |pool| {
-                    pool.warmAsync(gateway_client.resolveChatUrlForWarmup(openrouter.chat_url));
-                }
+        app.provider_selection.ensureGatewayHttpPool();
+        if (app.provider_selection.selection().provider == .openrouter) {
+            if (app.provider_selection.gateway_http_pool) |pool| {
+                pool.warmAsync(gateway_client.resolveChatUrlForWarmup(openrouter.chat_url));
             }
         }
         app.context_limits.applyCommandLine(launch.modifiers.context_limit_overrides);
-        if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
+        if (comptime host_profile.durable_sessions) {
             if (app.requested_resume != null) {
                 if (launch.upgrade_relaunch != null) {
                     try SessionAppRuntime.resumeRequestedSessionAfterUpgrade(
@@ -680,17 +609,8 @@ const App = struct {
             app.auto_upgrade_enabled = false;
         }
         if (comptime !host_profile.auto_upgrade) app.auto_upgrade_enabled = false;
-        try HostConfigAppRuntime.restore(&app, builtin_modes.registry);
         SessionAppRuntime.syncTerminalTitle(&app);
         return app;
-    }
-
-    pub fn persistAcceptedModel(self: *App, model: []const u8) !void {
-        HostConfigAppRuntime.persistModel(self, model);
-    }
-
-    pub fn persistAcceptedPermissionMode(self: *App, mode: PermissionMode) !void {
-        HostConfigAppRuntime.persistPermissionMode(self, mode);
     }
 
     /// Persists the user-supplied base URL for the OpenAI-compatible provider.
@@ -1016,9 +936,7 @@ const App = struct {
     }
 
     pub fn startPromptCredentialPrewarm(self: *App) void {
-        if (comptime !host_target.is_wasm) {
-            AuthAppRuntime.startPromptCredentialPrewarm(self);
-        }
+        AuthAppRuntime.startPromptCredentialPrewarm(self);
     }
 
     pub fn collectPendingPromptCredential(
@@ -1075,30 +993,16 @@ const App = struct {
 
     pub fn loopPollTimeoutMs(ctx: *anyopaque, default_timeout_ms: i32) i32 {
         const self: *App = @ptrCast(@alignCast(ctx));
-        if (comptime !host_target.is_wasm) {
-            return nativeLoopPollTimeoutMs(
-                default_timeout_ms,
-                self.auth.sourceInventoryRefreshActive(),
-                self.skills.refreshActive(),
-                self.fullTranscriptFocusedWorkActive(),
-            );
-        }
-        return if (self.pacer.hasPending()) default_timeout_ms else idle_wasm_poll_timeout_ms;
+        return nativeLoopPollTimeoutMs(
+            default_timeout_ms,
+            self.auth.sourceInventoryRefreshActive(),
+            self.skills.refreshActive(),
+            self.fullTranscriptFocusedWorkActive(),
+        );
     }
 
     fn fullTranscriptFocusedWorkActive(self: *App) bool {
         return self.shell.fullTranscriptFocusedWorkActive();
-    }
-
-    fn processNextCooperativePrompt(self: *App) !void {
-        if (comptime !host_target.is_wasm) return;
-        defer SessionAppRuntime.finishDeferredSessionInputReplay(self);
-        try app_process_runtime.Runtime(App).processNextCooperativePrompt(
-            self,
-            app_callbacks.Bindings(App).workerEventHandlers(self),
-            flushRequestedFrame,
-        );
-        try SessionAppRuntime.settlePendingLiveSessionTransition(self);
     }
 
     fn flushRequestedFrame(self: *App) !void {
@@ -1558,14 +1462,8 @@ const App = struct {
         return self.session.hasContextToCompact();
     }
 
-    fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {
-        if (comptime host_profile.tools) {
-            return builtin_tools.advertisement_set;
-        }
-        return browser_workspace_tools.selectToolSet(
-            false,
-            self.workspaceHostInfo() != null,
-        );
+    fn effectiveToolSet(_: *const App) tool_set_contract.ToolSet {
+        return builtin_tools.advertisement_set;
     }
 
     pub fn toolRegistry(self: *const App) tool_dispatch.Registry {
@@ -1648,7 +1546,6 @@ const App = struct {
         self: *App,
         pending: *input_submit_runtime.PendingSubmission,
     ) !input_submit_runtime.PendingSkillRefresh {
-        if (comptime host_target.is_wasm) return .current;
         const generation = pending.skill_refresh_generation orelse blk: {
             const requested = try self.requestSkillsRefresh();
             pending.skill_refresh_generation = requested;
@@ -1690,22 +1587,6 @@ const App = struct {
 
     pub fn providerSet(self: *const App) provider_set.Set {
         if (self.provider_selection.model_requests_blocked) return .{ .openrouter = .{} };
-        if (comptime host_target.is_wasm) {
-            return provider_set.openrouter_only(.{
-                .capabilities = .{
-                    .vision_fallback = host_profile.tools,
-                },
-                .presentation = provider_catalog.find(.openrouter),
-                .auth_strategy = .api_key,
-                .fallback_model_capabilities_fn = openrouter.fallbackModelCapabilities,
-                .agent_stream = js_host_stream_provider.provider(),
-                .model_catalog = js_host_model_catalog.provider,
-                .permission_reviewer = if (comptime host_profile.tools)
-                    openrouter.provider_bundle.permission_reviewer.?
-                else
-                    null,
-            });
-        }
         var providers = builtin_providers.native;
         providers.definitions = self.provider_selection.definitions.definitions;
         providers.openai_compatible_definition = if (self.provider_selection.openai_compatible_definition) |*definition| definition else null;
@@ -1719,7 +1600,6 @@ const App = struct {
     /// entered, so a Groq key is checked against Groq instead of the compiled
     /// OpenRouter default.
     pub fn apiKeyValidator(self: *const App, provider: model_provider.ProviderId) api_key_validator.Provider {
-        if (comptime host_target.is_wasm) return api_key_validator.unavailable_provider;
         return self.providerSet().select(provider).api_key_validator orelse
             api_key_validator.unavailable_provider;
     }
@@ -1806,30 +1686,16 @@ const App = struct {
     pub fn fetchModelIds(self: *App) !std.ArrayList([]u8) {
         return AgentAppRuntime.fetchModelIds(
             self,
-            if (comptime host_target.is_wasm)
-                js_host_model_catalog.provider
-            else
-                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return error.ModelCatalogUnavailable,
+            self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return error.ModelCatalogUnavailable,
             openrouter.models_path,
         );
     }
 
     pub fn startModelCacheWarmup(self: *App) void {
-        if (comptime host_profile.cooperative_agent) {
-            if (self.auth.credentialNeedsRefresh()) {
-                debug_trace.logf("auth", "model_cache_warmup_deferred reason=credential_refresh_required", .{});
-                return;
-            }
-            self.model_cache.loadCooperative(
-                js_host_model_catalog.provider,
-                self.auth.modelCatalogAccess(),
-            );
-        } else {
-            self.model_cache.startWarmup(
-                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return,
-                self.auth.modelCatalogAccess(),
-            );
-        }
+        self.model_cache.startWarmup(
+            self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return,
+            self.auth.modelCatalogAccess(),
+        );
     }
 
     pub fn ensureModelCache(self: *App) void {
@@ -1969,10 +1835,6 @@ const App = struct {
         try self.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{
             .text = @constCast(text),
         } });
-        if (comptime host_profile.cooperative_agent) {
-            try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
-            try self.flushRequestedFrame();
-        }
     }
 
     pub fn processQueuedWork(self: *App, work: WorkItem, failure_provenance: *?@import("core/output/compaction_activity.zig").ErrorProvenance) !void {
@@ -1998,14 +1860,6 @@ const App = struct {
     }
 
     pub fn executeToolCall(self: *App, request: agent_runtime.ToolExecutionRequest) !ToolExecutionResult {
-        if (comptime !host_profile.tools) {
-            if (comptime !host_profile.js_host_workspace) {
-                return agent_runtime.unavailableHostToolResult(request.result_allocator);
-            }
-            if (self.workspaceHostInfo() == null) {
-                return agent_runtime.unavailableHostToolResult(request.result_allocator);
-            }
-        }
         return AgentAppRuntime.executeToolCall(self, request, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, openrouter.retry_count, openrouter.chat_url);
     }
 
@@ -2039,12 +1893,6 @@ const App = struct {
 
     pub fn appendStaticContextMessage(self: *App, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
         try AgentAppRuntime.appendStaticContextMessage(self, arena, project_context, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, openrouter.retry_count, openrouter.chat_url);
-        if (comptime host_target.is_wasm) {
-            try messages.append(arena, .{
-                .role = .system,
-                .content = browser_capabilities.model_context,
-            });
-        }
     }
 
     pub fn writeTranscript(self: *App, text: []const u8, record: bool) !void {
@@ -2638,24 +2486,20 @@ const App = struct {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
 
-        if (comptime !host_target.is_wasm) {
-            if (self.file_index.joinThreadIfDone(std.heap.c_allocator)) {
-                self.shell.render_requests.request(.footer);
-            }
-            switch (try self.pollSkillsRefresh()) {
-                .none, .unchanged => {},
-                .adopted, .failed => self.shell.render_requests.request(.footer),
-            }
-            try app_commands.Handlers(App).collectSkillsRefreshFacts(self);
+        if (self.file_index.joinThreadIfDone(std.heap.c_allocator)) {
+            self.shell.render_requests.request(.footer);
         }
+        switch (try self.pollSkillsRefresh()) {
+            .none, .unchanged => {},
+            .adopted, .failed => self.shell.render_requests.request(.footer),
+        }
+        try app_commands.Handlers(App).collectSkillsRefreshFacts(self);
         InputSubmitRuntime.collectPendingSubmissionFacts(self);
         InputAppRuntime.collectFilePickerFacts(self);
 
         try self.collectThemeFacts();
 
-        if (comptime !host_target.is_wasm) {
-            UpgradeAppRuntime.collectUpgradeFacts(self);
-        }
+        UpgradeAppRuntime.collectUpgradeFacts(self);
         app_permission_runtime.Runtime(App).tick(
             self,
             app_permission_runtime.monotonicMillis(),
@@ -2668,15 +2512,13 @@ const App = struct {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
 
-        if (comptime host_profile.native_auth or host_profile.js_host_auth) {
+        if (comptime host_profile.native_auth) {
             try AuthAppRuntime.collectProviderPreparationFacts(self);
             try AuthAppRuntime.collectSourceInventoryFacts(self);
         }
         if (comptime host_profile.native_auth) {
             try AuthAppRuntime.collectApiKeySaveFacts(self);
         }
-        try self.processNextCooperativePrompt();
-
         const cols_before_resize = self.shell.layout.cols;
         if (self.terminal_input_runtime.native_clear_probe.active() or
             self.terminal_input_runtime.native_clear_probe.awaitingLateResponse())
@@ -2707,11 +2549,9 @@ const App = struct {
             self.input_runtime.vertical_navigation.reset();
         }
 
-        if (comptime !host_target.is_wasm) {
-            try SessionAppRuntime.pollSessionPicker(self);
-            if (try SessionAppRuntime.pollSessionTitleGeneration(self)) {
-                RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
-            }
+        try SessionAppRuntime.pollSessionPicker(self);
+        if (try SessionAppRuntime.pollSessionTitleGeneration(self)) {
+            RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
         try self.shell.prewarmFullTranscriptPage(
             self.fullTranscriptSidecarCapability(),
@@ -2777,19 +2617,15 @@ const App = struct {
         if (self.terminal_input_runtime.native_clear_probe.active()) return;
         _ = self.admitPendingResizeSignal("post_input");
         InputAppRuntime.prepareFilePicker(self);
-        if (comptime !host_target.is_wasm) {
-            if (self.shell.sessionScrollbackHandoffPending()) {
-                try SessionAppRuntime.settlePendingLiveSessionTransition(self);
-                if (self.shell.sessionScrollbackHandoffPending()) return;
-            }
+        if (self.shell.sessionScrollbackHandoffPending()) {
+            try SessionAppRuntime.settlePendingLiveSessionTransition(self);
+            if (self.shell.sessionScrollbackHandoffPending()) return;
         }
         _ = try InputAppRuntime.flushDeferredSessionInput(self, input_limits, max_prompt_history);
         if (self.should_exit) return;
         try self.flushRequestedFrame();
-        if (comptime !host_target.is_wasm) {
-            try SessionAppRuntime.settlePendingLiveSessionTransition(self);
-            if (try InputAppRuntime.flushDeferredSessionInput(self, input_limits, max_prompt_history)) try self.flushRequestedFrame();
-        }
+        try SessionAppRuntime.settlePendingLiveSessionTransition(self);
+        if (try InputAppRuntime.flushDeferredSessionInput(self, input_limits, max_prompt_history)) try self.flushRequestedFrame();
     }
 
     pub fn admitPendingApprovalResize(self: *App) bool {
@@ -2945,43 +2781,8 @@ const App = struct {
 };
 
 comptime {
-    if (!builtin.is_test and !host_target.is_wasm) {
+    if (!builtin.is_test) {
         @export(&main, .{ .name = "main" });
-    }
-}
-
-pub fn runWasmTerminal(init: std.process.Init) !void {
-    if (comptime !host_target.is_wasm or build_options.wasm_surface != .term) {
-        @compileError("runWasmTerminal requires -Dwasm-surface=term");
-    }
-    io_mod.setIo(init.io);
-    io_mod.setEnvironMap(init.environ_map);
-    const alloc = std.heap.c_allocator;
-    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
-    defer args.deinit();
-    _ = args.skip();
-    var cli_args: std.ArrayList([:0]const u8) = .empty;
-    defer cli_args.deinit(alloc);
-    while (args.next()) |arg| try cli_args.append(alloc, arg);
-
-    const parsed = try cli_surface.parseInteractiveLaunch(
-        alloc,
-        cli_args.items,
-        builtin_commands.top_level_registry,
-    );
-    var launch = switch (parsed) {
-        .interactive => |value| value,
-        .noninteractive => |value| {
-            var noninteractive = value;
-            defer noninteractive.deinit(alloc);
-            return error.WasmTerminalInteractiveLaunchRequired;
-        },
-    };
-    defer launch.deinit(alloc);
-    const outcome = try app_entry_runtime.runInteractiveCooperative(App, alloc, &launch, .local);
-    switch (outcome) {
-        .returned => {},
-        .exit => |code| if (code != 0) return error.WasmTerminalExited,
     }
 }
 
@@ -3493,11 +3294,4 @@ fn handleSigWinchNative(_: std.posix.SIG) callconv(.c) void {
     resize_interlock.noteResizeSignal();
 }
 
-fn handleSigWinchWeb() callconv(.c) void {
-    resize_interlock.noteResizeSignal();
-}
-
-const handle_sigwinch: app_lifecycle.ResizeHandler = if (host_target.is_wasm)
-    handleSigWinchWeb
-else
-    handleSigWinchNative;
+const handle_sigwinch: app_lifecycle.ResizeHandler = handleSigWinchNative;

@@ -1986,21 +1986,12 @@ pub fn runCommandContext(
     const command = try tool_args.requiredStringArg(args, "command");
     const execution_mode: command_admission.CommandExecutionMode =
         if (tool_args.optionalBoolArg(args, "tty") orelse false) .tty else .captured;
-    const tool = registeredTool(input, call.name) orelse return error.NotRunCommand;
-    const cwd = switch (tool.captured_command_host) {
-        .workspace_clean => try arena.dupe(u8, input.workspace_root),
-        .native => blk: {
-            const cwd_arg = tool_args.nullablePlaceholderStringArg(args, "cwd") orelse ".";
-            break :blk if (std.mem.eql(u8, cwd_arg, "."))
-                try arena.dupe(u8, input.workspace_root)
-            else
-                try pathing.resolveWorkspaceOrExternalPath(arena, input.workspace_root, cwd_arg);
-        },
-    };
-    const environment_value: command_environment.Environment = switch (tool.captured_command_host) {
-        .workspace_clean => .workspace_clean,
-        .native => try nativeCommandEnvironment(arena, args, execution_mode),
-    };
+    const cwd_arg = tool_args.nullablePlaceholderStringArg(args, "cwd") orelse ".";
+    const cwd = if (std.mem.eql(u8, cwd_arg, "."))
+        try arena.dupe(u8, input.workspace_root)
+    else
+        try pathing.resolveWorkspaceOrExternalPath(arena, input.workspace_root, cwd_arg);
+    const environment_value: command_environment.Environment = try nativeCommandEnvironment(arena, args, execution_mode);
     return .{
         .command = command,
         .resolved_cwd = cwd,

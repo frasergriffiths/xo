@@ -1510,7 +1510,6 @@ fn dupeEnvironment(
 ) !command_environment.Environment {
     return switch (environment) {
         .legacy => .legacy,
-        .workspace_clean => .workspace_clean,
         .clean => |path| .{ .clean = try alloc.dupe(u8, path) },
         .user => |path| .{ .user = try alloc.dupe(u8, path) },
     };

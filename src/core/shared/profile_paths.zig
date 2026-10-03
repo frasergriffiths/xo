@@ -4,8 +4,6 @@ const Allocator = std.mem.Allocator;
 
 pub const root_dir_name = ".fx";
 pub const auth_file_name = "auth.json";
-pub const chatgpt_auth_file_name = "chatgpt-auth.json";
-pub const grok_auth_file_name = "grok-auth.json";
 pub const api_key_file_name = "api-key";
 pub const groq_api_key_file_name = "api-key-groq";
 pub const openai_compatible_api_key_file_name = "api-key-openai-compatible";
@@ -35,10 +33,6 @@ pub fn managedSkillsDir(alloc: Allocator, home: []const u8) ![]u8 {
 
 pub fn authPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, auth_file_name });
-}
-
-pub fn chatgptAuthPath(alloc: Allocator, home: []const u8) ![]u8 {
-    return std.fs.path.join(alloc, &.{ home, root_dir_name, chatgpt_auth_file_name });
 }
 
 pub fn apiKeyPath(alloc: Allocator, home: []const u8) ![]u8 {

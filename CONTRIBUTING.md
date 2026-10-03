@@ -100,22 +100,8 @@ Before adding a new feature, answer these first:
 3. Does it need persistence?
 4. Does it need both text and JSON output?
 5. What docs and tests land with it?
-6. How is its deterministic E2E owner classified for macOS arm64 PGSO?
 
 If that is unclear, stop and define it first.
-
-### PGSO corpus ownership
-
-Classify every root `tests/e2e/*.test.ts` file in
-`scripts/pgso/corpus.json`. Put common or performance-sensitive behavior in
-training. Put important correctness, recovery, security, and rare behavior in
-verification-only. Exclude only nondeterministic, live-network, credentialed,
-sound-related, or harness-only coverage, and record the reason.
-
-Tests added to an existing file inherit its classification. Reconsider that
-classification when a feature changes the file's product role, and remove stale
-entries when deleting a feature or E2E owner. Normal PR CI rejects missing,
-duplicate, stale, and unclassified files without running the full PGSO gate.
 
 ## Configuration and State
 
@@ -166,7 +152,7 @@ persistence, and explicit refresh. The web bridge contract is fixed to
 `https://fx.sh/api/slack/install/config`, `/api/slack/install`, and
 `/api/slack/oauth/callback`.
 
-Build with `zig build`, then run `cd tests/e2e && bun test slack-install.test.ts`.
+Build with `zig build`, then run the Zig tests for that module.
 The fixture exercises the freshly built binary and real loopback sockets without
 live Slack credentials. `FX_E2E_SLACK_ORIGIN` accepts only an HTTP `127.0.0.1`
 origin with a non-privileged port, serving public metadata plus mocked
@@ -238,34 +224,20 @@ test "my resize scenario" {
 
 Add it to `src/ui/resize_tests.zig`. See the file header for what each Harness method does.
 
-### tmux end-to-end test (real SIGWINCH, seconds per test)
-
-For bugs that only show up with a real terminal and a real signal (timing, input integration, terminal-emulator quirks), add a scenario to `tests/e2e/tui-resize.test.ts` using the helpers in `tmux-helpers.ts`:
-
-```typescript
-test("my scenario", async () => {
-    session = await TmuxSession.create({ width: 120, height: 40 });
-    await session.waitForText(">", 10_000);
-    await session.resizeWindow(80, 30);
-    const grid = await session.capturePaneGrid();
-    expect(findFooter(grid)).not.toBeNull();
-}, 30_000);
-```
-
 ### Tape-based test (replay a real capture)
 
 For bugs reported by a user, have them run the built binary with an exact
 `FX_RECORD=<path>`, or use `FX_DEBUG_RECORD=1` for an automatic private tape.
 `FX_DEBUG_RECORD_SILENT_BANNER=1` hides the developer-only startup notice from
 the inline transcript without disabling capture; Ctrl+O still shows it. Drop
-the tape in `tests/e2e/tapes/<name>.fxtape` and assert against the built replay
+the tape somewhere stable and assert against the built replay
 command:
 
 ```bash
-./zig-out/bin/fx replay tests/e2e/tapes/my-bug.fxtape --golden tests/e2e/tapes/my-bug.txt
+./zig-out/bin/fx replay my-bug.fxtape --golden my-bug.txt
 ```
 
-Check in the golden file and wire a regression test that re-runs `fx replay` in CI and diffs.
+Check in the golden file and add a Zig test that re-runs `fx replay` and diffs.
 
 ## What Not To Do
 

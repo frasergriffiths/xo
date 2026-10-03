@@ -19,91 +19,12 @@ from scripts.pgso.model import PgsoError
 from scripts.pgso.runner import CommandResult
 
 
-TRAINING_E2E_TESTS = (
-    "cli.test.ts",
-    "ask-presentation.test.ts",
-    "config-persistence.test.ts",
-    "prompt-history.test.ts",
-    "auth-refresh.test.ts",
-    "host-managed-auth.test.ts",
-    "file-tool-paths.test.ts",
-    "file-tool-permissions.test.ts",
-    "gateway-stream-lifecycle.test.ts",
-    "session-title.test.ts",
-    "web-fetch-fake-network.test.ts",
-    "web-search-fake-gateway.test.ts",
-    "vision-route-fake-gateway.test.ts",
-    "acp.test.ts",
-    "session-recovery.test.ts",
-    "terminal-host.test.ts",
-    "tui-startup.test.ts",
-    "permission-errors.test.ts",
-    "tui-resize.test.ts",
-    "tui-render-stress.test.ts",
-    "tui-full-transcript-brutal.test.ts",
-    "tui-resume-brutal.test.ts",
-    "tui-permissions.test.ts",
-    "tui-interrupt-recovery.test.ts",
-    "tui-terminal-tool.test.ts",
-    "tui-native-clear-recovery.test.ts",
-    "tui-gateway-stream-lifecycle.test.ts",
-)
-
-VERIFICATION_E2E_TESTS = (
-    "slack-install.test.ts",
-    "auto-mode-reliability.test.ts",
-    "review-model-override.test.ts",
-    "configured-providers.test.ts",
-    "oauth-keychain-migration.test.ts",
-    "tui-auth-source-selection.test.ts",
-    "tui-compaction-activity.test.ts",
-    "compaction-policy.test.ts",
-    "tui-composer-edit-contracts.test.ts",
-    "tui-cost.test.ts",
-    "tui-decision-prompts.test.ts",
-    "tui-file-picker.test.ts",
-    "tui-input-line-delete.test.ts",
-    "tui-input-navigation.test.ts",
-    "tui-render-replay.test.ts",
-    "tui-resume.test.ts",
-    "tui-slash-commands.test.ts",
-    "tui-slash-extra.test.ts",
-    "tui-slash-menu.test.ts",
-    "web-fetch-permission-progress.test.ts",
-    "web-search-permission-progress.test.ts",
-    "yolo-permission-mode.test.ts",
-)
-
-EXCLUDED_E2E_TESTS = (
-    "ci-shards.test.ts",
-    "context-limits-live.test.ts",
-    "notifications.test.ts",
-    "tmux-helpers.test.ts",
-    "tui-agent.test.ts",
-    "tui-command-permissions.test.ts",
-    "tui-direct-write-audit.test.ts",
-    "tui-keybindings.test.ts",
-    "tui-performance.test.ts",
-    "tui-render-lab.test.ts",
-    "tui-render-live-stress.test.ts",
-    "web-fetch-live.test.ts",
-    "web-search-live.test.ts",
-)
-
-
 class PgsoCorpusTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory(
             prefix="fx-pgso-corpus-"
         )
         self.root = pathlib.Path(self.temporary_directory.name)
-        (self.root / "tests" / "e2e").mkdir(parents=True)
-        for test_file in (
-            "notifications.test.ts",
-            "tui-agent.test.ts",
-            "tui-command-permissions.test.ts",
-        ):
-            (self.root / "tests" / "e2e" / test_file).write_text("test")
         self.manifest_path = self.root / "corpus.json"
 
     def tearDown(self) -> None:
@@ -133,11 +54,7 @@ class PgsoCorpusTests(unittest.TestCase):
     def manifest(self) -> dict[str, object]:
         return {
             "version": 1,
-            "intentional_exclusions": {
-                "notifications.test.ts": "sound-related",
-                "tui-agent.test.ts": "requires a real model credential",
-                "tui-command-permissions.test.ts": "contains a sound scenario",
-            },
+            "intentional_exclusions": {},
             "scenarios": self.direct_scenarios(),
             "verification_scenarios": [],
         }
@@ -145,18 +62,6 @@ class PgsoCorpusTests(unittest.TestCase):
     def write_manifest(self, payload: dict[str, object]) -> pathlib.Path:
         self.manifest_path.write_text(json.dumps(payload))
         return self.manifest_path
-
-    def e2e_scenario(self, test_file: str) -> dict[str, object]:
-        return {
-            "name": f"e2e-{test_file.removesuffix('.test.ts')}",
-            "argv": ["bun", "test", "--max-concurrency", "1", f"./{test_file}"],
-            "cwd": "tests/e2e",
-            "env_set": {"FX_SOUND": "0"},
-            "env_unset": ["AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN"],
-            "timeout_seconds": 60,
-            "requires_tmux": True,
-            "test_file": test_file,
-        }
 
     def test_load_rejects_duplicate_names(self) -> None:
         payload = self.manifest()
@@ -167,75 +72,6 @@ class PgsoCorpusTests(unittest.TestCase):
         with self.assertRaisesRegex(PgsoError, "duplicate scenario name"):
             load_corpus(self.write_manifest(payload), repo_root=self.root)
 
-    def test_load_separates_training_and_verification_scenarios(self) -> None:
-        test_file = "new-feature.test.ts"
-        (self.root / "tests" / "e2e" / test_file).write_text("test")
-        payload = self.manifest()
-        verification = payload["verification_scenarios"]
-        assert isinstance(verification, list)
-        verification.append(self.e2e_scenario(test_file))
-
-        corpus = load_corpus(self.write_manifest(payload), repo_root=self.root)
-
-        self.assertEqual(5, len(corpus.scenarios))
-        self.assertEqual(
-            ("e2e-new-feature",),
-            tuple(scenario.name for scenario in corpus.verification_scenarios),
-        )
-        self.assertEqual(6, len(corpus.candidate_scenarios))
-
-    def test_load_rejects_duplicate_test_files_across_phases(self) -> None:
-        test_file = "shared.test.ts"
-        (self.root / "tests" / "e2e" / test_file).write_text("test")
-        payload = self.manifest()
-        scenarios = payload["scenarios"]
-        verification = payload["verification_scenarios"]
-        assert isinstance(scenarios, list)
-        assert isinstance(verification, list)
-        scenarios.append(self.e2e_scenario(test_file))
-        duplicate = self.e2e_scenario(test_file)
-        duplicate["name"] = "e2e-shared-verification"
-        verification.append(duplicate)
-
-        with self.assertRaisesRegex(PgsoError, "duplicate corpus test file"):
-            load_corpus(self.write_manifest(payload), repo_root=self.root)
-
-    def test_load_rejects_unclassified_e2e_files(self) -> None:
-        test_file = "forgotten-feature.test.ts"
-        (self.root / "tests" / "e2e" / test_file).write_text("test")
-
-        with self.assertRaisesRegex(
-            PgsoError,
-            "unclassified E2E test file: forgotten-feature.test.ts",
-        ):
-            load_corpus(self.write_manifest(self.manifest()), repo_root=self.root)
-
-    def test_load_rejects_stale_exclusions(self) -> None:
-        payload = self.manifest()
-        exclusions = payload["intentional_exclusions"]
-        assert isinstance(exclusions, dict)
-        exclusions["removed.test.ts"] = "removed from the suite"
-
-        with self.assertRaisesRegex(
-            PgsoError,
-            "excluded E2E test file does not exist: removed.test.ts",
-        ):
-            load_corpus(self.write_manifest(payload), repo_root=self.root)
-
-    def test_load_rejects_multiple_classifications(self) -> None:
-        test_file = "classified-twice.test.ts"
-        (self.root / "tests" / "e2e" / test_file).write_text("test")
-        payload = self.manifest()
-        scenarios = payload["scenarios"]
-        exclusions = payload["intentional_exclusions"]
-        assert isinstance(scenarios, list)
-        assert isinstance(exclusions, dict)
-        scenarios.append(self.e2e_scenario(test_file))
-        exclusions[test_file] = "also excluded"
-
-        with self.assertRaisesRegex(PgsoError, "multiple corpus classifications"):
-            load_corpus(self.write_manifest(payload), repo_root=self.root)
-
     def test_load_rejects_path_traversal(self) -> None:
         payload = self.manifest()
         scenarios = payload["scenarios"]
@@ -243,28 +79,6 @@ class PgsoCorpusTests(unittest.TestCase):
         scenarios[0]["cwd"] = "../outside"
 
         with self.assertRaisesRegex(PgsoError, "cwd escapes repository"):
-            load_corpus(self.write_manifest(payload), repo_root=self.root)
-
-    def test_load_rejects_a_missing_test_file(self) -> None:
-        payload = self.manifest()
-        scenarios = payload["scenarios"]
-        assert isinstance(scenarios, list)
-        scenarios.append(self.e2e_scenario("missing.test.ts"))
-
-        with self.assertRaisesRegex(PgsoError, "test file does not exist"):
-            load_corpus(self.write_manifest(payload), repo_root=self.root)
-
-    def test_load_binds_each_test_file_to_its_exact_bun_command(self) -> None:
-        test_file = "cli.test.ts"
-        (self.root / "tests" / "e2e" / test_file).write_text("test")
-        payload = self.manifest()
-        scenarios = payload["scenarios"]
-        assert isinstance(scenarios, list)
-        scenario = self.e2e_scenario(test_file)
-        scenario["argv"] = ["bun", "test", "./different.test.ts"]
-        scenarios.append(scenario)
-
-        with self.assertRaisesRegex(PgsoError, "test command mismatch"):
             load_corpus(self.write_manifest(payload), repo_root=self.root)
 
     def test_load_rejects_an_empty_command_or_nonpositive_timeout(self) -> None:
@@ -288,35 +102,6 @@ class PgsoCorpusTests(unittest.TestCase):
                 with self.assertRaisesRegex(PgsoError, "profile_runs"):
                     load_corpus(self.write_manifest(payload), repo_root=self.root)
 
-    def test_load_rejects_profile_runs_for_e2e_scenarios(self) -> None:
-        test_file = "profile-repeat.test.ts"
-        (self.root / "tests" / "e2e" / test_file).write_text("test")
-        payload = self.manifest()
-        scenarios = payload["scenarios"]
-        assert isinstance(scenarios, list)
-        scenario = self.e2e_scenario(test_file)
-        scenario["profile_runs"] = 2
-        scenarios.append(scenario)
-
-        with self.assertRaisesRegex(PgsoError, "profile_runs"):
-            load_corpus(self.write_manifest(payload), repo_root=self.root)
-
-    def test_load_rejects_sound_and_nondeterministic_test_files(self) -> None:
-        for test_file in (
-            "notifications.test.ts",
-            "tui-agent.test.ts",
-            "tui-command-permissions.test.ts",
-            "web-search-live.test.ts",
-        ):
-            with self.subTest(test_file=test_file):
-                (self.root / "tests" / "e2e" / test_file).write_text("test")
-                payload = self.manifest()
-                scenarios = payload["scenarios"]
-                assert isinstance(scenarios, list)
-                scenarios.append(self.e2e_scenario(test_file))
-                with self.assertRaisesRegex(PgsoError, "forbidden corpus test"):
-                    load_corpus(self.write_manifest(payload), repo_root=self.root)
-
     def test_load_requires_every_direct_command(self) -> None:
         payload = self.manifest()
         scenarios = payload["scenarios"]
@@ -332,7 +117,7 @@ class PgsoCorpusTests(unittest.TestCase):
             "LLVM_PROFILE_FILE",
             "TMUX",
             "TMUX_TMPDIR",
-            "AI_GATEWAY_API_KEY",
+            "OPENROUTER_API_KEY",
             "FX_TRACE_LOG",
             "FX_TRACE_SCOPES",
         ):
@@ -353,62 +138,6 @@ class PgsoCorpusTests(unittest.TestCase):
         with self.assertRaisesRegex(PgsoError, "cannot be skipped"):
             load_corpus(self.write_manifest(payload), repo_root=self.root)
 
-    def test_production_manifest_classifies_every_e2e_file(self) -> None:
-        repo_root = pathlib.Path(__file__).resolve().parents[3]
-        corpus = load_corpus(
-            repo_root / "scripts" / "pgso" / "corpus.json",
-            repo_root=repo_root,
-        )
-
-        self.assertEqual(TRAINING_E2E_TESTS, corpus.training_test_files)
-        self.assertEqual(VERIFICATION_E2E_TESTS, corpus.verification_test_files)
-        self.assertEqual(
-            EXCLUDED_E2E_TESTS,
-            tuple(test_file for test_file, _ in corpus.intentional_exclusions),
-        )
-        self.assertEqual(32, len(corpus.scenarios))
-        self.assertEqual(54, len(corpus.candidate_scenarios))
-        self.assertEqual(
-            {
-                "direct-help": 100,
-                "direct-status": 100,
-                "direct-sessions": 100,
-            },
-            {
-                scenario.name: scenario.profile_runs
-                for scenario in corpus.scenarios
-                if scenario.name
-                in ("direct-help", "direct-status", "direct-sessions")
-            },
-        )
-        self.assertEqual(
-            ("e2e-cli",),
-            tuple(
-                scenario.name
-                for scenario in corpus.scenarios
-                if scenario.allow_keychain
-            ),
-        )
-        self.assertEqual(
-            ("verify-oauth-keychain-migration",),
-            tuple(
-                scenario.name
-                for scenario in corpus.verification_scenarios
-                if scenario.allow_keychain
-            ),
-        )
-
-        discovered = tuple(
-            sorted(
-                path.name
-                for path in (repo_root / "tests" / "e2e").glob("*.test.ts")
-            )
-        )
-        self.assertEqual(
-            discovered,
-            tuple(sorted((*corpus.test_files, *EXCLUDED_E2E_TESTS))),
-        )
-
     def test_behavior_corpus_adds_verification_only_scenarios(self) -> None:
         training = self.make_scenario("training")
         verification = self.make_scenario("verification")
@@ -418,11 +147,7 @@ class PgsoCorpusTests(unittest.TestCase):
             manifest_sha256="a" * 64,
             scenarios=(training,),
             verification_scenarios=(verification,),
-            intentional_exclusions=(
-                ("notifications.test.ts", "sound-related"),
-                ("tui-agent.test.ts", "requires a real model credential"),
-                ("tui-command-permissions.test.ts", "contains sound"),
-            ),
+            intentional_exclusions=(),
         )
         binary = self.root / "candidate-fx"
         binary.write_bytes(b"candidate")
@@ -457,11 +182,7 @@ class PgsoCorpusTests(unittest.TestCase):
             manifest_sha256="a" * 64,
             scenarios=(training,),
             verification_scenarios=(verification,),
-            intentional_exclusions=(
-                ("notifications.test.ts", "sound-related"),
-                ("tui-agent.test.ts", "requires a real model credential"),
-                ("tui-command-permissions.test.ts", "contains sound"),
-            ),
+            intentional_exclusions=(),
         )
 
         result, calls, _, _, _ = self.run_fixture(corpus)
@@ -493,11 +214,7 @@ class PgsoCorpusTests(unittest.TestCase):
             manifest_path=self.manifest_path,
             manifest_sha256="a" * 64,
             scenarios=tuple(scenarios),
-            intentional_exclusions=(
-                ("notifications.test.ts", "sound-related"),
-                ("tui-agent.test.ts", "requires a real model credential"),
-                ("tui-command-permissions.test.ts", "contains sound"),
-            ),
+            intentional_exclusions=(),
         )
 
     def run_fixture(

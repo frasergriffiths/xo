@@ -60,7 +60,6 @@ const web_search_runtime = @import("../tooling/web_search_runtime.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
-const js_host_workspace = @import("../hosts/js_host_workspace.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -80,13 +79,6 @@ pub fn Runtime(comptime App: type) type {
         fn appAccessScope(app: *const App) ?workspace_access.AccessScope {
             if (comptime @hasDecl(App, "workspaceAccessScope")) {
                 return app.workspaceAccessScope();
-            }
-            return null;
-        }
-
-        fn appHostWorkspaceInfo(app: *const App) ?*const js_host_workspace.Info {
-            if (comptime @hasDecl(App, "workspaceHostInfo")) {
-                return app.workspaceHostInfo();
             }
             return null;
         }
@@ -172,11 +164,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
             authority: ?ToolAuthorityView,
         ) tool_runtime.Context {
-            const host_workspace = appHostWorkspaceInfo(app);
-            const workspace_root = if (host_workspace) |info|
-                info.root()
-            else
-                app.workspace_root;
+            const workspace_root = app.workspace_root;
             const agent_settings = app.worker.effectiveAgentTurnSettings();
             const permission_snapshot = if (authority) |snapshot|
                 worker_runtime.PermissionSnapshot{
@@ -206,10 +194,7 @@ pub fn Runtime(comptime App: type) type {
                 provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
                 .workspace_root = workspace_root,
-                .access_scope = if (host_workspace != null)
-                    workspace_access.AccessScope.primaryOnly(workspace_root)
-                else
-                    appAccessScope(app),
+                .access_scope = appAccessScope(app),
                 .ignored_list_entries = ignored_list_entries,
                 .max_list_entries = max_list_entries,
                 .max_read_file_bytes = max_read_file_bytes,
@@ -277,11 +262,7 @@ pub fn Runtime(comptime App: type) type {
                 .context_registry = app.contextRegistry(),
                 .output_chunk_ctx = @ptrCast(app),
                 .on_output_chunk = app_callbacks.Bindings(App).onCommandOutputChunk,
-                .workspace_executor = if (comptime @hasDecl(App, "workspaceExecutor")) app.workspaceExecutor() else null,
-                .host_sandbox_default = if (host_workspace) |info| switch (info.permission) {
-                    .allow_sandboxed => .allow_sandboxed,
-                    .prompt => .prompt,
-                } else .none,
+                .host_sandbox_default = .none,
                 .permission_reviewer_provider = if (comptime @hasDecl(App, "permissionReviewerProvider")) app.permissionReviewerProvider() else null,
                 .tracker = &app.change_tracker,
 
@@ -705,22 +686,11 @@ pub fn Runtime(comptime App: type) type {
             _ = gateway_retry_count;
             _ = gateway_chat_url;
             const permission_snapshot = app_permission_runtime.Runtime(App).livePermissionSnapshot(app);
-            const host_workspace = appHostWorkspaceInfo(app);
-            const workspace_root = if (host_workspace) |info|
-                info.root()
-            else
-                app.workspace_root;
+            const workspace_root = app.workspace_root;
             try app.contextRegistry().appendDefaultTransient(.{
                 .workspace_root = workspace_root,
-                .host_workspace = if (host_workspace) |info| .{
-                    .root = info.root(),
-                    .cwd = info.cwd(),
-                    .home = info.home(),
-                } else null,
-                .access_scope = if (host_workspace != null)
-                    workspace_access.AccessScope.primaryOnly(workspace_root)
-                else
-                    appAccessScope(app),
+                .host_workspace = null,
+                .access_scope = appAccessScope(app),
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
                 .stale_shell_handles = app.session.has_stale_shell_handles,

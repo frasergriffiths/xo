@@ -597,11 +597,10 @@ pub fn captureInlineImageBytes(
     return attachment;
 }
 
-/// Captures caller-supplied image bytes for sessions without a filesystem
-/// snapshot backend (libfx kernel sessions on native and wasm). Applies the
-/// same size, media-type, and digest validation as the filesystem capture,
-/// but retains the decoded bytes on the attachment itself so request building
-/// and checkpoint serialization never touch a filesystem.
+/// Captures caller-supplied image bytes without touching the filesystem.
+/// Applies the same size, media-type, and digest validation as the filesystem
+/// capture, but retains the decoded bytes on the attachment itself so request
+/// building and checkpoint serialization never read from disk.
 /// The caller owns the returned attachment and must release it with
 /// `types.freeImageAttachment` or `discardImageAttachment`.
 pub fn captureInlineImageBytesInMemory(

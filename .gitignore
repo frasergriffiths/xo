@@ -1,16 +1,10 @@
 .DS_Store
 
-# Dependencies
-node_modules/
-bun.lock
-.next/
-
 # Zig build output and fetched packages
 .zig-cache/
 zig-cache/
 zig-out/
 zig-pkg/
-sdk/dist/
 
 # Workspace-local runtime state
 /skills/
@@ -51,3 +45,7 @@ sdk/dist/
 .vibe/
 .windsurf/
 .zencoder/
+
+# Python bytecode caches
+__pycache__/
+*.pyc

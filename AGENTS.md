@@ -30,7 +30,7 @@ When running fx for verification, **always use the freshly-built binary at** **`
 
 ## Language and Toolchain
 
-This project is written in **Zig 0.16+**. There is no Node.js runtime, no `package.json` at the root, and no JavaScript build step for the main binary.
+This project is written in **Zig 0.16+**. fx builds as a single native terminal binary. There is no Node.js runtime, no `package.json`, no WebAssembly target, and no JavaScript or TypeScript in the tree.
 
 Build and test commands:
 
@@ -41,7 +41,6 @@ zig build run      # build and run
 zig fmt src/       # format all source files
 ```
 
-The test suites under `tests/` use Bun but are separate from the Zig codebase. See **Testing** below.
 
 ## Code Style
 
@@ -84,28 +83,11 @@ Before implementing, answer in order:
 3. Does it need persistence?
 4. Does it need both text and JSON output?
 5. What docs and tests land with it?
-6. How is its deterministic E2E owner classified in the macOS arm64 PGSO corpus?
-
 If unclear, define the contract first.
 
-Every root `tests/e2e/*.test.ts` file must have exactly one classification in
-`scripts/pgso/corpus.json`:
-
-* **Training:** common or performance-sensitive product behavior that should
-  influence LLVM's hot and cold decisions
-
-* **Verification-only:** important correctness, recovery, security, or rare
-  behavior that the final candidate must pass without making it hot
-
-* **Intentional exclusion:** nondeterministic, live-network, credentialed,
-  sound-related, or harness-only coverage, with a concrete reason
-
-New tests inside an already classified file inherit that file's classification,
-but feature work must reconsider whether the existing classification still
-matches the file's product role. When removing a feature or E2E owner, remove
-its stale corpus entry. Normal PR CI loads the corpus and rejects missing,
-duplicate, stale, or unclassified files without running the expensive PGSO
-qualification.
+Deterministic coverage belongs beside the source it exercises, as a Zig unit
+test. Terminal rendering and resize behavior belong in `src/ui/resize_tests.zig`,
+which drives `TranscriptRuntime` in process against the shared terminal engine.
 
 ### Adding a Command
 
@@ -208,31 +190,18 @@ Do not bypass the permission system for new tools.
 
 * Use `io_mod.dirRealpathAlloc(alloc, dir, sub_path)` to resolve paths within `std.testing.tmpDir()`.
 
-## Testing (TypeScript)
+## Testing
 
-Two test suites live under `tests/`, both using Bun:
-
-### `tests/evals/` — LLM Evals
-
-Eval scenarios that exercise the agent through `fx ask --json`. Require `AI_GATEWAY_API_KEY`.
+The complete test suite is Zig and lives beside the source it covers. Run the
+narrowest relevant test while developing:
 
 ```bash
-cd tests/evals && bun install && bun test           # run all evals
-cd tests/evals && bun run eval:matrix               # cross-model matrix run
+zig build test                        # every unit test
+zig build test -Dtest-filter=resume   # only tests whose name contains "resume"
 ```
 
-### `tests/e2e/` — End-to-End Tests
-
-Deterministic runtime tests (CLI commands, ACP protocol, TUI via tmux). No API key needed for most.
-
-```bash
-cd tests/e2e && bun install && bun test              # run all e2e tests
-cd tests/e2e && bun test cli.test.ts                 # just CLI tests
-cd tests/e2e && bun test acp.test.ts                 # just ACP tests
-cd tests/e2e && bun test tui-*.test.ts               # just TUI tests (requires tmux)
-```
-
-TUI tests use tmux to drive the interactive terminal. They require `tmux` to be installed.
+Terminal rendering and resize behavior are also covered in process by
+`src/ui/resize_tests.zig`, which needs no fd, no tmux, and no timing luck.
 
 ## Pull Request Classification
 
@@ -267,21 +236,13 @@ After the focused checks pass, create a clean checkpoint commit, push the non-`m
 * `macos-15-intel` (x86_64)
 * `macos-15` (aarch64)
 
-The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting and the public-surface audit run in those ReleaseSafe jobs. The E2E matrix runs four duration-balanced, isolated ReleaseSafe shards per platform with Bun and tmux. Checked-in weights assign every test file to exactly one shard on each platform, and files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after its tmux server is reset. Live model evals remain separate because they require credentials and are not deterministic.
+The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform. Formatting, the public-surface audit, and the full Zig test suite run in those ReleaseSafe jobs.
 
-A Full CI result is valid only when it belongs to the exact current commit and all four `Full suite (...)` jobs succeed. Each platform aggregate requires its ReleaseSafe native check plus all four ReleaseSafe E2E shards. Do not mark the draft PR ready or request review from a stale, partial, queued, cancelled, skipped, or failed run. If Full CI fails, make the smallest repair, rerun the focused local proof, push the new commit to the same draft PR, and wait for Full CI on the new exact commit. After CI passes, run the final ship gate and mark the PR ready only when it reports `SHIP` for that exact commit.
+A Full CI result is valid only when it belongs to the exact current commit and every `Native checks (...)` job succeeds. Do not mark the draft PR ready or request review from a stale, partial, queued, cancelled, skipped, or failed run. If Full CI fails, make the smallest repair, rerun the focused local proof, push the new commit to the same draft PR, and wait for Full CI on the new exact commit. After CI passes, run the final ship gate and mark the PR ready only when it reports `SHIP` for that exact commit.
 
 ## Reproducing Render Bugs
 
 fx's rendering is inline by default and deliberately emits a small ANSI subset. Three owner classes are the narrow exceptions, and each takes the alternate buffer exclusively through `AlternateScreenOwner` in `src/ui/shell_runtime.zig`: interactive permission review, the full-transcript screen, and catalog menus. Only one class may own the buffer at a time, and each must leave it and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes when it closes. Transcript rendering, question prompts, command-output expansion, and subagent delegation remain inline. Three tools exist for reproducing and regression-proofing render bugs:
-
-### tmux (live TTY repros)
-
-Best for resize and SIGWINCH interactions. The helper in `tests/e2e/tmux-helpers.ts` exposes `resizeWindow(cols, rows)`, `capturePaneGrid()`, and `capturePaneEscapes()`. See `tests/e2e/tui-resize.test.ts` for the canonical resize matrix.
-
-```bash
-cd tests/e2e && bun test tui-resize.test.ts
-```
 
 ### Debug terminal recording and replay
 
@@ -306,7 +267,7 @@ The tape is deterministic — any reviewer can replay it without a TTY, and a go
 
 ### Shared terminal engine (sub-second unit tests)
 
-`src/core/terminal/engine.zig` is the shared bounded text-terminal engine for hosted terminal sessions, recovery, replay, and deterministic rendering tests. `src/ui/resize_tests.zig` drives `TranscriptRuntime` against it in process so resize behavior can be exercised with no fd or timing dependence.
+`src/core/terminal/engine.zig` is the shared bounded text-terminal engine for hosted terminal sessions, recovery, replay, and deterministic rendering tests. `src/ui/resize_tests.zig` drives `TranscriptRuntime` against it in process so resize behavior, including SIGWINCH handling, can be exercised with no fd and no timing dependence.
 
 ```bash
 zig build test                      # runs every VT and resize test

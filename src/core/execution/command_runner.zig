@@ -672,7 +672,6 @@ pub fn executeCommandInEnvironment(
 ) !command_contract.RunCommandResult {
     switch (environment) {
         .legacy => return executeCommand(cfg, arena, command, cwd),
-        .workspace_clean => return error.InvalidCommandEnvironment,
         .clean, .user => {},
     }
 

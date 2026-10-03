@@ -11,7 +11,6 @@ const session_codec = @import("../core/session/session_codec.zig");
 const session_display_metadata = @import("../core/session/session_display_metadata.zig");
 const session_store = @import("../core/session/session_store.zig");
 const legacy_background_migration = @import("../core/session/legacy_background_migration.zig");
-const js_host_session_store = @import("../core/session/js_host_session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
 const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
@@ -22,7 +21,6 @@ const model_catalog = @import("../core/gateway/model_catalog.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const host = @import("../core/hosts/host.zig");
-const host_target = @import("../core/hosts/target.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const model_provider = @import("../core/config/model_provider.zig");
@@ -38,146 +36,6 @@ else
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
 const writeJsonStr = jsonrpc.writeJsonStr;
-
-pub fn handleNewLibfxSession(
-    state: *server.ServerState,
-    alloc: Allocator,
-    msg: *jsonrpc.Message,
-) !void {
-    try server.releaseActiveSession(state);
-    const session_id = try session_store.generateSessionId(alloc);
-    var session_id_owned = true;
-    defer if (session_id_owned) alloc.free(session_id);
-    const model = try alloc.dupe(u8, state.selected_model);
-    var model_owned = true;
-    defer if (model_owned) alloc.free(model);
-    var session_rt = session_runtime.SessionRuntime.initWithProviders(
-        state.cfg.max_history_turns,
-        state.cfg.provider_set.deferredUsageProviders(),
-    );
-    var session_rt_owned = true;
-    defer if (session_rt_owned) session_rt.deinit(alloc);
-
-    state.active_session = .{
-        .session_id = session_id,
-        .model = model,
-        .provider = state.provider,
-        .mode = state.cfg.mode_registry.default_mode_id,
-        .workspace_root = state.workspace_root,
-        .api_key = state.api_key,
-        .credential_source = state.credential_source,
-        .account_id = state.account_id,
-        .agent_step_limit = state.agent_step_limit,
-        .max_tool_result_bytes = state.max_tool_result_bytes,
-        .fast_mode = state.fast_mode,
-        .effort = state.effort,
-        .first_call_tool_choice = state.first_call_tool_choice,
-        .permission_mode = state.permission_mode,
-        .permission_rules = state.permission_rules,
-        .session_rt = session_rt,
-        .cancel_flag = std.atomic.Value(bool).init(false),
-        .pending_prompt_id = null,
-    };
-    session_id_owned = false;
-    model_owned = false;
-    session_rt_owned = false;
-    try writeNewSessionResponse(state, alloc, msg, session_id);
-}
-
-pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
-    try server.releaseActiveSession(state);
-
-    var durable = try freshAcpState(state, alloc);
-    var durable_owned = true;
-    defer if (durable_owned) durable.deinit(alloc);
-    const session_id = try alloc.dupe(u8, durable.id);
-    var session_id_owned = true;
-    defer if (session_id_owned) alloc.free(session_id);
-    const model = try alloc.dupe(u8, durable.preferences.model);
-    var model_owned = true;
-    defer if (model_owned) alloc.free(model);
-    var session_rt = session_runtime.SessionRuntime.initWithProviders(
-        state.cfg.max_history_turns,
-        state.cfg.provider_set.deferredUsageProviders(),
-    );
-    var session_rt_owned = true;
-    defer if (session_rt_owned) session_rt.deinit(alloc);
-    const revision = js_host_session_store.commit(alloc, durable, null) catch
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.internal_error,
-            .message = "Failed to create session",
-        });
-    var revision_owned = true;
-    defer if (revision_owned) alloc.free(revision);
-
-    state.active_session = .{
-        .session_id = session_id,
-        .wasm_state = durable,
-        .wasm_revision = revision,
-        .model = model,
-        .provider = durable.preferences.provider,
-        .mode = state.cfg.mode_registry.default_mode_id,
-        .workspace_root = state.workspace_root,
-        .api_key = state.api_key,
-        .credential_source = state.credential_source,
-        .credential_refresh_after_ms = state.credential_refresh_after_ms,
-        .account_id = state.account_id,
-        .agent_step_limit = state.agent_step_limit,
-        .max_tool_result_bytes = state.max_tool_result_bytes,
-        .fast_mode = state.fast_mode,
-        .effort = state.effort,
-        .first_call_tool_choice = state.first_call_tool_choice,
-        .permission_mode = state.permission_mode,
-        .permission_rules = state.permission_rules,
-        .session_rt = session_rt,
-        .cancel_flag = std.atomic.Value(bool).init(false),
-        .pending_prompt_id = null,
-    };
-    durable_owned = false;
-    revision_owned = false;
-    session_id_owned = false;
-    model_owned = false;
-    session_rt_owned = false;
-
-    try writeNewSessionResponse(state, alloc, msg, session_id);
-}
-
-pub fn commitWasmSessionLocked(alloc: Allocator, session: *server.ActiveSessionState) !void {
-    const base = if (session.wasm_state) |*value| value else return error.SessionPersistenceUnavailable;
-    var next = try base.dupe(alloc);
-    var next_owned = true;
-    defer if (next_owned) next.deinit(alloc);
-    const history = try session.session_rt.snapshotHistory(alloc);
-    types.freeHistoryTurnSlice(alloc, next.history);
-    next.history = history;
-    const permission_state = try session.session_rt.snapshotPermissionState(alloc);
-    next.permission_state.deinit(alloc);
-    next.permission_state = permission_state;
-    next.context_history_start = 0;
-    next.conversation_language = session.session_rt.languageSnapshot();
-    next.updated_at_ms = io_mod.milliTimestamp();
-    alloc.free(next.preferences.model);
-    next.preferences.model = try alloc.dupe(u8, session.model);
-    next.preferences.provider = session.provider;
-    next.preferences.effort = session.effort;
-    next.preferences.fast_mode = session.fast_mode;
-    const usage = try session.session_rt.usage.snapshot(alloc);
-    if (next.usage) |*old| old.deinit(alloc);
-    next.usage = usage;
-
-    const revision = try js_host_session_store.commit(alloc, next, session.wasm_revision);
-    if (session.wasm_revision) |old| alloc.free(old);
-    session.wasm_revision = revision;
-    base.deinit(alloc);
-    session.wasm_state = next;
-    next_owned = false;
-}
-
-pub fn commitWasmSession(alloc: Allocator, session: *server.ActiveSessionState) !void {
-    session.session_write_mutex.lockUncancelable(io_mod.getIo());
-    defer session.session_write_mutex.unlock(io_mod.getIo());
-    try commitWasmSessionLocked(alloc, session);
-}
 
 fn rejectServerConnections(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !bool {
     const raw = msg.params_raw orelse return true;
@@ -288,10 +146,8 @@ fn writeNewSessionResponse(
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"configOptions\":[");
-    if (comptime !host_target.is_wasm) {
-        try writeProviderConfigOption(&out.writer, state.active_session.?.provider, state.configured_providers.definitions);
-        try out.writer.writeAll(",");
-    }
+    try writeProviderConfigOption(&out.writer, state.active_session.?.provider, state.configured_providers.definitions);
+    try out.writer.writeAll(",");
     try writeModelConfigOption(
         &out.writer,
         state.active_session.?.model,
@@ -316,132 +172,6 @@ fn writeNewSessionResponse(
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 
     try sendAvailableCommands(state, alloc, session_id, "[]");
-}
-
-pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
-    const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{
-        .code = ErrorCode.invalid_params,
-        .message = "Missing params",
-    });
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
-        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid params" });
-    defer parsed.deinit();
-    const session_id = if (parsed.value == .object)
-        if (parsed.value.object.get("sessionId")) |value|
-            if (value == .string) value.string else return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing sessionId" })
-        else
-            return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing sessionId" })
-    else
-        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing sessionId" });
-
-    if (!try rejectServerConnections(state, alloc, msg)) return;
-    if (state.active_session) |*active| {
-        if (sameSessionId(active.session_id, session_id)) {
-            for (active.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
-            try sendActiveSessionInfoUpdate(state, alloc);
-            return writeLoadSessionResponse(state, alloc, msg, active.model);
-        }
-    }
-
-    var loaded = (js_host_session_store.load(alloc, session_id) catch
-        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Session could not be loaded" })) orelse
-        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Session not found" });
-    var loaded_owned = true;
-    defer if (loaded_owned) loaded.deinit(alloc);
-    const sid_copy = try alloc.dupe(u8, loaded.state.id);
-    var sid_owned = true;
-    defer if (sid_owned) alloc.free(sid_copy);
-    if (loaded.state.preferences.provider != .openrouter) {
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_request,
-            .message = "Subscription models are unavailable in this WASM runtime",
-        });
-    }
-    const model_copy = try alloc.dupe(u8, loaded.state.preferences.model);
-    var model_owned = true;
-    defer if (model_owned) alloc.free(model_copy);
-    var session_rt = session_runtime.SessionRuntime.initWithProviders(state.cfg.max_history_turns, state.cfg.provider_set.deferredUsageProviders());
-    var session_rt_owned = true;
-    defer if (session_rt_owned) session_rt.deinit(alloc);
-    try session_rt.restoreWithPermissionState(
-        alloc,
-        loaded.state.conversation_language,
-        loaded.state.history,
-        loaded.state.permission_state,
-    );
-    if (loaded.state.usage) |usage| try session_rt.usage.restore(alloc, usage, loaded.state.created_at_ms);
-
-    try server.releaseActiveSession(state);
-    state.active_session = .{
-        .session_id = sid_copy,
-        .wasm_state = loaded.state,
-        .wasm_revision = loaded.revision,
-        .model = model_copy,
-        .provider = loaded.state.preferences.provider,
-        .mode = state.cfg.mode_registry.default_mode_id,
-        .workspace_root = state.workspace_root,
-        .api_key = state.api_key,
-        .credential_source = state.credential_source,
-        .credential_refresh_after_ms = state.credential_refresh_after_ms,
-        .account_id = state.account_id,
-        .agent_step_limit = state.agent_step_limit,
-        .max_tool_result_bytes = state.max_tool_result_bytes,
-        .fast_mode = loaded.state.preferences.fast_mode,
-        .effort = loaded.state.preferences.effort,
-        .first_call_tool_choice = state.first_call_tool_choice,
-        .permission_mode = state.permission_mode,
-        .permission_rules = state.permission_rules,
-        .session_rt = session_rt,
-        .cancel_flag = std.atomic.Value(bool).init(false),
-        .pending_prompt_id = null,
-    };
-    loaded_owned = false;
-    sid_owned = false;
-    model_owned = false;
-    session_rt_owned = false;
-    for (state.active_session.?.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
-    try sendActiveSessionInfoUpdate(state, alloc);
-    try writeLoadSessionResponse(state, alloc, msg, state.active_session.?.model);
-}
-
-pub fn handleListWasmSessions(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
-    const entries = js_host_session_store.list(alloc) catch
-        return state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
-    defer {
-        for (entries) |*entry| entry.deinit(alloc);
-        alloc.free(entries);
-    }
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll("{\"sessions\":[");
-    for (entries, 0..) |entry, index| {
-        if (index > 0) try out.writer.writeByte(',');
-        try out.writer.writeAll("{\"sessionId\":");
-        try writeJsonStr(entry.id, &out.writer);
-        try out.writer.writeAll(",\"cwd\":");
-        try writeJsonStr(state.workspace_root, &out.writer);
-        try out.writer.writeAll(",\"updatedAt\":");
-        const iso = try formatIso8601(alloc, entry.updated_at_ms);
-        defer alloc.free(iso);
-        try writeJsonStr(iso, &out.writer);
-        try out.writer.writeByte('}');
-    }
-    try out.writer.writeAll("]}");
-    try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
-}
-
-pub fn handleRemoveWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
-    const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing params" });
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
-        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid params" });
-    defer parsed.deinit();
-    const value = if (parsed.value == .object) parsed.value.object.get("sessionId") else null;
-    const session_id = if (value) |id| if (id == .string) id.string else return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing sessionId" }) else return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing sessionId" });
-    js_host_session_store.remove(session_id) catch return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Failed to remove session" });
-    if (state.active_session) |*active| {
-        if (sameSessionId(active.session_id, session_id)) try server.releaseActiveSession(state);
-    }
-    try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
 const RestoreKind = enum {
@@ -696,10 +426,8 @@ fn writeLoadSessionResponse(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"configOptions\":[");
-    if (comptime !host_target.is_wasm) {
-        try writeProviderConfigOption(&out.writer, state.active_session.?.provider, state.configured_providers.definitions);
-        try out.writer.writeAll(",");
-    }
+    try writeProviderConfigOption(&out.writer, state.active_session.?.provider, state.configured_providers.definitions);
+    try out.writer.writeAll(",");
     try writeModelConfigOption(
         &out.writer,
         model,
@@ -1335,8 +1063,6 @@ pub fn sendActiveSessionInfoUpdate(state: *server.ServerState, alloc: Allocator)
     }
     const updated_at_ms = if (active.writable) |*writable|
         writable.state.updated_at_ms
-    else if (active.wasm_state) |durable|
-        durable.updated_at_ms
     else
         io_mod.milliTimestamp();
     const updated_at = try formatIso8601(alloc, @max(updated_at_ms, 0));
@@ -1433,14 +1159,12 @@ pub fn writeProviderConfigOption(
     try w.writeAll("{\"id\":\"provider\",\"name\":\"Provider\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(current.label(), w);
     try w.writeAll(",\"options\":[{\"value\":\"openrouter\",\"name\":\"OpenRouter\"}");
-    if (comptime !host_target.is_wasm) {
-        for (definitions) |definition| {
-            try w.writeAll(",{\"value\":");
-            try writeJsonStr(definition.id, w);
-            try w.writeAll(",\"name\":");
-            try writeJsonStr(definition.id, w);
-            try w.writeAll("}");
-        }
+    for (definitions) |definition| {
+        try w.writeAll(",{\"value\":");
+        try writeJsonStr(definition.id, w);
+        try w.writeAll(",\"name\":");
+        try writeJsonStr(definition.id, w);
+        try w.writeAll("}");
     }
     try w.writeAll("]}");
 }
