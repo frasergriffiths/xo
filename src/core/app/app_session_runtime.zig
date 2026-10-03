@@ -3116,7 +3116,6 @@ pub fn Runtime(comptime App: type) type {
                 }
                 if (snapshot_file_ownership) |ownership| ownership.transfer();
                 ensureCachedSessionTitle(app) catch {};
-                commitJsHostSnapshot(app, "history_turn");
                 return .committed;
             }
             var remember_failure: ?RememberFailure = null;
@@ -3134,7 +3133,6 @@ pub fn Runtime(comptime App: type) type {
                 }
                 if (snapshot_file_ownership) |ownership| ownership.transfer();
                 ensureCachedSessionTitle(app) catch {};
-                commitJsHostSnapshot(app, "history_turn");
                 return .committed;
             };
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
@@ -3210,7 +3208,6 @@ pub fn Runtime(comptime App: type) type {
             }
             if (snapshot_file_ownership) |ownership| ownership.transfer();
             ensureCachedSessionTitle(app) catch {};
-            commitJsHostSnapshot(app, "history_turn");
             return .committed;
         }
 
@@ -3252,9 +3249,7 @@ pub fn Runtime(comptime App: type) type {
                 };
             }
 
-            if (result.session_error == null) {
-                commitJsHostSnapshot(app, "preferences");
-            }
+            if (result.session_error == null) {}
 
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
@@ -5542,60 +5537,6 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
-        fn commitJsHostSnapshot(app: *App, boundary: []const u8) void {
-            if (comptime !@hasField(App, "session_persistence")) return;
-            commitJsHostSnapshotEnabled(app, boundary);
-        }
-
-        fn commitJsHostSnapshotEnabled(app: *App, boundary: []const u8) void {
-            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const owner = if (app.session_persistence.js_host_session) |*value|
-                value
-            else
-                return;
-            var next = snapshotCurrentState(
-                app,
-                owner.state,
-                io_mod.milliTimestamp(),
-            ) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "event=js_host_session_commit outcome=dropped boundary={s} id={s} err={s}",
-                    .{ boundary, owner.state.id, @errorName(err) },
-                );
-                return;
-            };
-            var next_owned = true;
-            defer if (next_owned) next.deinit(app.alloc);
-            const revision = app.session_persistence.js_host_store.commit(
-                app.alloc,
-                next,
-                owner.revision,
-            ) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "event=js_host_session_commit outcome=dropped boundary={s} id={s} expected_revision={s} err={s}",
-                    .{
-                        boundary,
-                        owner.state.id,
-                        owner.revision orelse "",
-                        @errorName(err),
-                    },
-                );
-                return;
-            };
-
-            if (owner.revision) |old_revision| app.alloc.free(old_revision);
-            owner.state.deinit(app.alloc);
-            owner.state = next;
-            owner.revision = revision;
-            next_owned = false;
-            if (comptime @hasField(@TypeOf(app.session), "usage")) {
-                if (owner.state.usage) |usage| app.session.usage.markClean(usage);
-            }
-        }
-
         fn snapshotCurrentState(
             app: *App,
             base_state: session_codec.DurableSessionState,
@@ -6614,276 +6555,6 @@ fn makeJsHostTestState(
         .total_output_tokens = 23,
     };
 }
-
-test "js-host resume restores transcript context preferences usage and revision" {
-    const alloc = std.testing.allocator;
-    var fake = FakeJsHostSessionStore{
-        .state = try makeJsHostTestState(
-            alloc,
-            "restored-session",
-            "remember this prompt",
-            "remembered reply",
-        ),
-        .updated_at_ms = 99,
-    };
-    defer fake.deinit(alloc);
-    var app = try TestApp.init(alloc, "/workspace");
-    defer app.deinit();
-    try Runtime(TestApp).configureStartupPreferences(
-        &app,
-        .gateway,
-        "startup/model",
-        .user_global,
-        "startup/model",
-        .auto,
-        false,
-        true,
-        null,
-        null,
-        null,
-    );
-    app.session_persistence.js_host_store = fake.store();
-    app.requested_resume = .last;
-
-    try Runtime(TestApp).resumeRequestedJsHostSession(&app);
-
-    try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
-    try std.testing.expectEqual(@as(usize, 1), app.cards.items.len);
-    try std.testing.expectEqualStrings("remember this prompt", app.cards.items[0].text);
-    try std.testing.expect(std.mem.find(u8, app.assistant_text.items, "remembered reply") != null);
-    try std.testing.expectEqualStrings("restored/model", app.selected_model.items);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
-    try std.testing.expect(app.fast_mode);
-    try std.testing.expect(!Runtime(TestApp).fastModeModelBound(&app));
-    try std.testing.expectEqual(@as(u64, 17), app.total_input_tokens);
-    try std.testing.expectEqual(@as(u64, 23), app.total_output_tokens);
-    var restored_usage = try app.session.usage.snapshot(alloc);
-    defer restored_usage.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 41), restored_usage.api_duration_ms);
-    try std.testing.expectEqualStrings(
-        "restored-session",
-        app.session_persistence.js_host_session.?.state.id,
-    );
-    try std.testing.expectEqualStrings(
-        "revision-1",
-        app.session_persistence.js_host_session.?.revision.?,
-    );
-}
-
-test "js-host compaction store failure preserves live history and revision" {
-    const alloc = std.testing.allocator;
-    var fake: FakeJsHostSessionStore = .{
-        .state = try makeJsHostTestState(alloc, "saved-session", "old request", "old reply"),
-        .commit_error = error.SessionRevisionConflict,
-    };
-    defer fake.deinit(alloc);
-    var app = try TestApp.init(alloc, "/workspace");
-    defer app.deinit();
-    try configureTestPreferences(&app);
-    app.session_persistence.js_host_store = fake.store();
-    app.requested_resume = .last;
-    try Runtime(TestApp).resumeRequestedJsHostSession(&app);
-    const summary: types.CompactedSummaryHistoryTurn = .{
-        .summary = @constCast("<context_handoff>new summary</context_handoff>"),
-        .removed_turn_count = 1,
-        .compaction_count = 1,
-    };
-    try std.testing.expectError(error.SessionRevisionConflict, Runtime(TestApp).commitContextCompaction(&app, summary, null, null));
-    try std.testing.expectEqualStrings("old reply", app.session.agent.history.items[0].assistant.assistant);
-    try std.testing.expectEqualStrings("revision-1", app.session_persistence.js_host_session.?.revision.?);
-    try std.testing.expect(fake.committed_state == null);
-    fake.commit_error = null;
-    try Runtime(TestApp).commitContextCompaction(&app, summary, null, null);
-    try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
-    try std.testing.expect(app.session.agent.history.items[0] == .compacted_summary);
-    try std.testing.expectEqualStrings("revision-next", app.session_persistence.js_host_session.?.revision.?);
-    try std.testing.expectEqualStrings("revision-1", fake.expected_revision.?);
-    try std.testing.expectEqualStrings(summary.summary, fake.committed_state.?.history[0].compacted_summary.summary);
-}
-
-test "js-host resume store failures and missing records fall back to fresh sessions" {
-    const alloc = std.testing.allocator;
-    const cases = [_]enum { list_failure, load_missing, corrupt_payload }{
-        .list_failure,
-        .load_missing,
-        .corrupt_payload,
-    };
-    for (cases) |case| {
-        var fake = FakeJsHostSessionStore{
-            .state = try makeJsHostTestState(alloc, "unusable-session", "old prompt", "old reply"),
-        };
-        defer fake.deinit(alloc);
-        switch (case) {
-            .list_failure => fake.list_error = error.SessionStoreUnavailable,
-            .load_missing => fake.load_missing = true,
-            .corrupt_payload => fake.load_error = error.InvalidSessionFormat,
-        }
-        var app = try TestApp.init(alloc, "/workspace");
-        defer app.deinit();
-        try Runtime(TestApp).configureStartupPreferences(
-            &app,
-            .gateway,
-            "fresh/model",
-            .user_global,
-            "fresh/model",
-            .auto,
-            false,
-            true,
-            null,
-            null,
-            null,
-        );
-        app.session_persistence.js_host_store = fake.store();
-        app.requested_resume = .last;
-
-        try Runtime(TestApp).resumeRequestedJsHostSession(&app);
-
-        const owner = app.session_persistence.js_host_session orelse
-            return error.TestExpectedFreshJsHostSession;
-        try std.testing.expect(!std.mem.eql(u8, "unusable-session", owner.state.id));
-        try std.testing.expectEqual(@as(usize, 0), owner.state.history.len);
-        try std.testing.expect(owner.revision == null);
-        try std.testing.expect(std.mem.find(u8, app.transcript.items, "Run /help for commands") != null);
-    }
-}
-
-test "js-host picker request stays unsupported and starts fresh" {
-    const alloc = std.testing.allocator;
-    var fake = FakeJsHostSessionStore{};
-    defer fake.deinit(alloc);
-    var app = try TestApp.init(alloc, "/workspace");
-    defer app.deinit();
-    try Runtime(TestApp).configureStartupPreferences(
-        &app,
-        .gateway,
-        "fresh/model",
-        .user_global,
-        "fresh/model",
-        .auto,
-        false,
-        true,
-        null,
-        null,
-        null,
-    );
-    app.session_persistence.js_host_store = fake.store();
-    app.requested_resume = .pick;
-
-    try Runtime(TestApp).resumeRequestedJsHostSession(&app);
-
-    try std.testing.expect(app.session_persistence.js_host_session != null);
-    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
-    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "picker is unavailable") != null);
-}
-
-test "js-host completed and interrupted turns propagate revisions preserve owner on conflict and reset fresh" {
-    const alloc = std.testing.allocator;
-    var fake = FakeJsHostSessionStore{};
-    defer fake.deinit(alloc);
-    var app = try TestApp.init(alloc, "/workspace");
-    defer app.deinit();
-    try Runtime(TestApp).configureStartupPreferences(
-        &app,
-        .gateway,
-        "fresh/model",
-        .user_global,
-        "fresh/model",
-        .auto,
-        false,
-        true,
-        null,
-        null,
-        null,
-    );
-    app.session_persistence.js_host_store = fake.store();
-    try Runtime(TestApp).beginFreshJsHostSession(&app);
-
-    const first_turn = try session_runtime.makeAssistantTurn(alloc, "first prompt", "first reply");
-    defer session_runtime.freeHistoryTurn(alloc, first_turn);
-    try Runtime(TestApp).appendHistoryTurn(&app, first_turn);
-    Runtime(TestApp).commitJsHostSnapshotEnabled(&app, "history_turn");
-    try std.testing.expectEqual(@as(usize, 1), fake.commit_count);
-    try std.testing.expect(fake.expected_revision == null);
-    try std.testing.expectEqual(@as(usize, 1), fake.committed_state.?.history.len);
-    try std.testing.expectEqualStrings(
-        "revision-next",
-        app.session_persistence.js_host_session.?.revision.?,
-    );
-
-    fake.commit_error = error.SessionRevisionConflict;
-    const second_turn: types.HistoryTurn = .{ .interrupted = .{
-        .user = .{ .text = @constCast("second prompt") },
-        .assistant = @constCast("partial reply"),
-    } };
-    try Runtime(TestApp).appendHistoryTurn(&app, second_turn);
-    Runtime(TestApp).commitJsHostSnapshotEnabled(&app, "history_turn");
-    try std.testing.expectEqual(@as(usize, 2), fake.commit_count);
-    try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
-    try std.testing.expectEqual(@as(usize, 1), app.session_persistence.js_host_session.?.state.history.len);
-    try std.testing.expectEqualStrings(
-        "revision-next",
-        app.session_persistence.js_host_session.?.revision.?,
-    );
-
-    const previous_id = try alloc.dupe(u8, app.session_persistence.js_host_session.?.state.id);
-    defer alloc.free(previous_id);
-    app.session.reset(alloc);
-    try Runtime(TestApp).beginFreshJsHostSession(&app);
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        previous_id,
-        app.session_persistence.js_host_session.?.state.id,
-    ));
-    try std.testing.expect(app.session_persistence.js_host_session.?.revision == null);
-    try std.testing.expectEqual(@as(usize, 0), app.session_persistence.js_host_session.?.state.history.len);
-}
-
-test "js-host preference changes snapshot the updated session preferences" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(alloc, &tmp);
-    defer {
-        alloc.free(paths.home);
-        alloc.free(paths.workspace);
-    }
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-    var fake = FakeJsHostSessionStore{};
-    defer fake.deinit(alloc);
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-    try Runtime(TestApp).configureStartupPreferences(
-        &app,
-        .gateway,
-        "fresh/model",
-        .user_global,
-        "fresh/model",
-        .auto,
-        false,
-        true,
-        null,
-        null,
-        null,
-    );
-    app.session_persistence.js_host_store = fake.store();
-    try Runtime(TestApp).beginFreshJsHostSession(&app);
-
-    var result = Runtime(TestApp).commitRuntimePreferences(&app, .{
-        .model = "browser/model",
-        .effort = types.ReasoningEffort.literal("high"),
-        .fast_mode = true,
-    });
-    defer result.deinit(alloc);
-    Runtime(TestApp).commitJsHostSnapshotEnabled(&app, "preferences");
-
-    try std.testing.expect(result.session_error == null);
-    try std.testing.expectEqual(@as(usize, 1), fake.commit_count);
-    try std.testing.expectEqualStrings("browser/model", fake.committed_state.?.preferences.model);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), fake.committed_state.?.preferences.effort);
-    try std.testing.expect(fake.committed_state.?.preferences.fast_mode);
-}
-
 test "cold resume image id rebase rejects overflow before admission" {
     var images = [_]types.ImageAttachment{.{
         .id = std.math.maxInt(usize),
@@ -8460,7 +8131,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "1111111111111111111111111111111111111111",
                 .revision = "abcdef0123456789abcdef0123456789abcdef01",
             },
-            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
+            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/frasergriffiths/xo/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
         },
         .{
             .upgrade = .{
@@ -8469,7 +8140,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "",
                 .revision = "abcdef0123456789abcdef0123456789abcdef01",
             },
-            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/commit/abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
+            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/frasergriffiths/xo/commit/abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
         },
     };
 
