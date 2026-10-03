@@ -192,6 +192,14 @@ Do not bypass the permission system for new tools.
 
 ## Testing
 
+Three repository checks run alongside the Zig suite and must all pass:
+
+```bash
+./scripts/check-public-surface.sh      # the shipped public surface is what it claims
+./scripts/check-compactor-boundary.sh  # the compactor never depends on the agent runtime
+python3 scripts/check-workflows.py     # every Actions job has a runner and real dependencies
+```
+
 Both test suites are Zig and run through one command:
 
 ```bash

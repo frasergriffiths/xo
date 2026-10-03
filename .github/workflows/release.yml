@@ -101,6 +101,7 @@ jobs:
     needs: check-version
     if: needs.check-version.outputs.needed == 'true'
     name: Build macos-x86_64
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
