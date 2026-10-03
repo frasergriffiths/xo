@@ -4,6 +4,21 @@ This is a written plan, not a record of finished work. Nothing in it has been
 executed. I measured every count and path below on commit `main` in this checkout on
 2026-10-01.
 
+## Stale since the SDK removal
+
+The measurements below predate the removal of the WebAssembly SDK and the
+TypeScript suites, so treat them as a starting point rather than current counts.
+Since 2026-10-01:
+
+- `sdk/` is gone, along with the Wasm and NAPI build surfaces, the npm package
+  `libfx`, and the `publish-libfx.yml` workflow. Nothing under `sdk/` needs
+  renaming.
+- `tests/e2e/` and `tests/evals/` are gone, which was the largest block in the
+  table below by occurrence count. Re-measure before planning that work.
+- The repository moved from `vercel-labs/fx` to `frasergriffiths/xo`.
+
+Re-run the grep in this document before acting on it.
+
 ## Policy: total rename, no back-compat
 
 Every occurrence of the brand becomes `xo`. No deprecation windows, no dual-read
