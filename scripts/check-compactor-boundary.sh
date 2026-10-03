@@ -19,7 +19,6 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 compactor_dir="$root/src/core/compactor"
-agent_dir="$root/src/core/agent"
 
 if [[ ! -d "$compactor_dir" ]]; then
   echo "error: $compactor_dir does not exist" >&2
