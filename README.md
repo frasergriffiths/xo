@@ -40,7 +40,8 @@ fx setup
 ```
 
 Alternatively, set `OPENROUTER_API_KEY` in your environment instead of saving
-a key. `fx logout` removes a saved key.
+a key. Open `/provider` and choose `remove` in the Providers menu to delete a
+saved key.
 
 Then start the interactive shell from a project:
 
@@ -57,10 +58,11 @@ fx preserves those tmux views while resizing, including when the switcher zooms 
 
 ## Providers
 
-fx ships with two built-in providers:
+fx ships with three built-in providers:
 
 - **OpenRouter:** set `OPENROUTER_API_KEY`, or save a key with `fx setup` or `/provider`.
-- **Groq:** set `GROQ_API_KEY`, or save a key with `fx setup` or `/provider`.
+- **Groq:** set `GROQ_API_KEY`, or save a key with `/provider`.
+- **OpenAI-compatible:** point fx at any OpenAI Chat Completions endpoint. Set `FX_OPENAI_COMPATIBLE_API_KEY`, or save a key with `/provider` and enter the base URL when asked. The base URL defaults to `https://api.openai.com/v1`.
 
 ## Documentation
 

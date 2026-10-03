@@ -75,8 +75,8 @@ pub const top_level_specs = [_]TopLevelSpec{
         .usage = "provider",
         .summary = "Connect fx to a model provider with an API key",
         .details = &.{
-            "Running fx provider with no arguments opens the provider picker. Choose OpenRouter or Groq, then paste or type that provider's API key and press enter; fx saves it to the macOS Keychain.",
-            "You can also set OPENROUTER_API_KEY or GROQ_API_KEY in the environment instead of saving a key.",
+            "Running fx provider with no arguments opens the provider picker. Choose OpenRouter, Groq, or OpenAI-compatible, then paste or type that provider's API key and press enter; fx saves it to the macOS Keychain.",
+            "You can also set OPENROUTER_API_KEY, GROQ_API_KEY, or FX_OPENAI_COMPATIBLE_API_KEY in the environment instead of saving a key.",
         },
     },
     .{

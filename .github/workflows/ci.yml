@@ -42,7 +42,10 @@ jobs:
         run: ./scripts/check-compactor-boundary.sh
 
       - name: Check workflow definitions
-        run: python3 scripts/check-workflows.py
+        run: |
+          python3 -m venv "$RUNNER_TEMP/check-env"
+          "$RUNNER_TEMP/check-env/bin/pip" install --quiet --disable-pip-version-check pyyaml
+          "$RUNNER_TEMP/check-env/bin/python" scripts/check-workflows.py
 
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}

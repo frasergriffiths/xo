@@ -36,7 +36,7 @@ Build and test commands:
 
 ```bash
 zig build          # build the binary
-zig build test     # run all unit tests
+zig build test     # run every test reachable from the two test roots
 zig build run      # build and run
 zig fmt src/       # format all source files
 ```
@@ -85,9 +85,13 @@ Before implementing, answer in order:
 If unclear, define the contract first.
 
 Deterministic coverage belongs beside the source it exercises, as a Zig unit
-test. Behavior that spans modules belongs in the `tests/` suite. Terminal
-rendering and resize behavior belong in `src/ui/resize_tests.zig`, which drives
-`TranscriptRuntime` in process against the shared terminal engine.
+test. Behavior that spans modules belongs in the `tests/` suite.
+
+A test only runs when its file is reachable from one of the two test roots in
+`build.zig`: `src/main.zig` or `tests.zig`. Zig discovers `test` blocks only in
+files those roots reach through `@import`, so a file nothing imports is never
+compiled and its assertions never run. Put the test in the file that owns the
+behavior, or add the file to `tests.zig` with a `refAllDecls`.
 
 ### Adding a Command
 
@@ -203,7 +207,7 @@ python3 scripts/check-workflows.py     # every Actions job has a runner and real
 Both test suites are Zig and run through one command:
 
 ```bash
-zig build test                        # everything
+zig build test                        # every test reachable from the two test roots
 zig build test -Dtest-filter=resume   # only tests whose name contains "resume"
 ```
 
@@ -217,8 +221,10 @@ zig build test -Dtest-filter=resume   # only tests whose name contains "resume"
 Zig scopes `@import` to a module's root directory, so a file inside `tests/`
 can only reach `src/` when both belong to the same module.
 
-Terminal rendering and resize behavior are covered in process by
-`src/ui/resize_tests.zig`, which needs no fd, no tmux, and no timing luck.
+Terminal rendering and resize behavior have **no** automated coverage today.
+`src/ui/` contains no executed test blocks. Reproduce render bugs with the
+debug terminal recording and replay below, or add a Zig unit test beside the
+transcript or terminal code it exercises, and confirm it actually runs.
 
 ## Pull Request Classification
 
@@ -282,15 +288,13 @@ FX_RECORD=/tmp/bug.fxtape ./zig-out/bin/fx
 
 The tape is deterministic — any reviewer can replay it without a TTY, and a golden file can be checked in as a regression test.
 
-### Shared terminal engine (sub-second unit tests)
+### Shared terminal engine
 
-`src/core/terminal/engine.zig` is the shared bounded text-terminal engine for hosted terminal sessions, recovery, replay, and deterministic rendering tests. `src/ui/resize_tests.zig` drives `TranscriptRuntime` against it in process so resize behavior, including SIGWINCH handling, can be exercised with no fd and no timing dependence.
+`src/core/terminal/engine.zig` is the shared bounded text-terminal engine for hosted terminal sessions, recovery, and replay. It currently has no test blocks of its own.
 
-```bash
-zig build test                      # runs every VT and resize test
-```
+`zig build test` runs the compactor, config, and `tests/` suites. It does not run VT or resize tests; none exist.
 
-When a tmux or tape-based scenario exposes a bug, reproduce it as a Zig unit test in `resize_tests.zig` (or a new sibling) before fixing. The test lands the fix as a regression.
+When a tmux or tape-based scenario exposes a bug, reproduce it with a recording under `FX_DEBUG_RECORD` first, then fix. If you can express the regression as a Zig unit test, put it beside the code it exercises and confirm it runs; a golden file replayed through `fx replay --golden` is the other option.
 
 ## Binary Size Observability
 
