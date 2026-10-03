@@ -13,7 +13,6 @@ The driver requires:
 - Zig `0.16.0`
 - LLVM `21.1.8` tools and profile runtime from one configured LLVM root
 - the selected Xcode macOS SDK and native Apple linker with arm64 support
-- Bun `1.3.14`
 - Hyperfine `1.20.0`
 - the selected source commit, update channel, bitcode hash, corpus hash, and profile-generation flags
 
@@ -92,11 +91,20 @@ release. Overwrite applies only to an identical attempt-qualified name.
 
 ## Corpus
 
-[`corpus.json`](corpus.json) references existing test owners instead of copying their behavior. Training contains five direct CLI commands and twenty-seven deterministic E2E files covering CLI, configuration, tools, Gateway lifecycle, fake web and vision routes, ACP, sessions, terminal hosting, TUI startup, resizing, rendering, permissions, interruption, subagents, and recovery. A bounded `profile_runs` count can weight a direct training command without duplicating manifest entries or final behavior checks. Twenty-two additional deterministic E2E files verify the final candidate without influencing LLVM's hot and cold classification.
+[`corpus.json`](corpus.json) lists CLI invocations rather than test files. Training
+holds five direct commands, `help`, `--version`, `status --json`, `doctor --json`,
+and `sessions --json`. A bounded `profile_runs` count weights a direct training
+command without duplicating manifest entries or final behavior checks.
 
-Every root `tests/e2e/*.test.ts` file must be classified as training, verification-only, or intentionally excluded. The corpus loader fails on missing, duplicate, stale, or unclassified files, so a new E2E owner cannot silently bypass release qualification. New tests added to an already classified file inherit that file's classification.
+Every scenario must be classified as training, verification-only, or intentionally
+excluded. The corpus loader fails on missing, duplicate, stale, or unclassified
+scenarios, so new coverage cannot silently bypass release qualification.
 
-Sound-bearing `notifications.test.ts` and `tui-command-permissions.test.ts` are explicitly excluded. The credential-dependent `tui-agent.test.ts` suite is replaced by deterministic fake-Gateway permission-error coverage. Live-model and live-network files are forbidden. Corpus processes receive per-scenario homes and isolated tmux sockets and cannot inherit model credentials, the caller's tmux session, an external LLVM profile destination, or caller-selected fx tracing. The CLI suite explicitly links the host Keychains directory into only its scenario home so its uniquely named fake macOS Keychain assertions can run; no other scenario receives that access.
+Corpus processes receive per-scenario homes and isolated tmux sockets and cannot
+inherit model credentials, the caller's tmux session, an external LLVM profile
+destination, or caller-selected fx tracing. The CLI suite explicitly links the
+host Keychains directory into only its scenario home so its uniquely named fake
+macOS Keychain assertions can run; no other scenario receives that access.
 
 Each training scenario must create a new nonempty raw profile. The driver merges that batch into the accumulator atomically, deletes only the successfully merged raw files, and stops before profile use on any missing scenario, timeout, warning, merge failure, or cleanup failure.
 

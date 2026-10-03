@@ -9079,7 +9079,7 @@ test "gateway chat request sends extended time and attribution headers" {
 
     if (fixture.failure) |err| return err;
     try std.testing.expectEqualStrings(user_agent, fixture.capturedHeaderValue("user-agent").?);
-    try std.testing.expectEqualStrings("https://github.com/vercel-labs/fx", fixture.capturedHeaderValue("http-referer").?);
+    try std.testing.expectEqualStrings("https://github.com/frasergriffiths/xo", fixture.capturedHeaderValue("http-referer").?);
     try std.testing.expectEqualStrings("fx", fixture.capturedHeaderValue("x-title").?);
     try std.testing.expectEqualStrings(
         vercel_gateway_extended_time_value,

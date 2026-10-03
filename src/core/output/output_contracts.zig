@@ -2993,7 +2993,7 @@ test "core upgrade snapshot identifies dev revisions" {
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
         "upgraded to dev abcdef012345 (v0.3.66)\n" ++
-            "changes: https://github.com/vercel-labs/fx/compare/111111111111...abcdef0123456789abcdef0123456789abcdef01\n",
+            "changes: https://github.com/frasergriffiths/xo/compare/111111111111...abcdef0123456789abcdef0123456789abcdef01\n",
         text,
     );
 
