@@ -10,7 +10,7 @@ npm install libfx
 
 Node.js uses the native addon when available and falls back to WebAssembly.
 Browsers use WebAssembly with JSPI. The default package has no runtime
-dependencies and performs no MCP connection, skill scan, process spawn, or
+dependencies and performs no skill scan, process spawn, or
 filesystem read when imported.
 
 ## Agent
@@ -188,7 +188,7 @@ or a history change. The next prompt can run normally.
 
 The checkpoint contains conversation history and usage only. The host owns
 durable storage and must resupply models, credentials, instructions, tools,
-MCP clients, and skill records. Reasoning effort and fast mode are
+and skill records. Reasoning effort and fast mode are
 agent-creation options and are not stored in a checkpoint: recreate the agent
 with new `model.effort` or `model.fast` values to change them, the same path as
 switching models.
@@ -262,47 +262,9 @@ A host tool may use any name, including the kernel's builtin names such as
 a host-defined `write_file` calls the host's `execute()` rather than the
 builtin file mutation.
 Instructions are limited to 64 KiB of UTF-8 text, including text assembled by
-the MCP and skills adapters. They are the complete host-owned system context:
+the skills adapter. They are the complete host-owned system context:
 libfx adds no hidden base prompt, and omitting `instructions` sends no system
 message.
-
-## MCP
-
-`libfx/mcp` accepts a host-owned MCP client. Transport, authentication,
-elicitation, and cleanup remain outside the kernel. The client uses the MCP
-TypeScript SDK v1 signature: `callTool(params, resultSchema?, options?)`, with
-cancellation passed in `options`. Tool text and structured data
-reach the model together. PNG, JPEG, GIF, and WebP tool images reach models that
-advertise image input support; other models receive an explicit omission notice.
-Images are retained in checkpoints within the existing checkpoint size limit.
-Each image may contain up to 5 MiB of base64 data, with at most eight images and
-an 8 MiB result frame. Ordinary host tool objects remain JSON text. Resource and
-prompt options supply text instructions; non-text context has an omission notice.
-Tool catalogs are paginated up to the existing 64-tool bound. Tool names are
-normalized for model APIs, with collisions kept distinct and original names used
-for calls to the MCP client. Each tool description and JSON schema may contain up
-to 64 KiB, within the control message's 8 MiB limit.
-
-```js
-import { createMcpAdapter } from "libfx/mcp";
-
-const mcp = await createMcpAdapter(client, {
-  prefix: "github_",
-  resources: ["repo://instructions"],
-  prompts: ["review"],
-});
-
-const agent = await createFxAgent({
-  apiKey,
-  model,
-  tools: mcp.tools,
-  instructions: mcp.instructions,
-});
-
-// ...
-await agent.close();
-await mcp.close();
-```
 
 ## Skills
 
@@ -425,7 +387,7 @@ export async function POST(request) {
 ```
 
 Use the application's normal authentication and request limits around the
-route. JavaScript tools and MCP clients remain host-owned and must be supplied
+route. JavaScript tools remain host-owned and must be supplied
 when creating an agent, including after checkpoint restoration. The native
 backend does not enable the CLI's built-in shell or filesystem tools.
 
@@ -469,5 +431,5 @@ resume with the same or a newer SDK build. Older snapshots remain readable.
 
 Treat `nativeAddon` and `gatewayChatUrl` as trusted host
 configuration. Do not embed long-lived credentials in public browser code.
-Host tool functions, MCP clients, and skill loaders retain their own authority;
+Host tool functions and skill loaders retain their own authority;
 libfx validates and sequences them but does not grant operating-system access.

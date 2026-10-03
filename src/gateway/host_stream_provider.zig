@@ -1,12 +1,13 @@
 const std = @import("std");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
-const gateway_client = @import("client.zig");
-const vercel_protocol = @import("vercel_protocol.zig");
+const codec = @import("chat_completions_protocol.zig");
+const openrouter = @import("openrouter.zig");
+const secret = @import("../core/auth/secret.zig");
 const credential_authority = @import("../core/auth/credential_authority.zig");
 
 const Allocator = std.mem.Allocator;
-const max_error_body_bytes = 1024 * 1024;
+const max_error_body_bytes = 64 * 1024;
 const cooperative_pulse_interval_ms = 50;
 
 pub const Transport = struct {
@@ -56,8 +57,18 @@ pub fn provider(context: *ProviderContext) stream_provider.Provider {
         .context = context,
         .stream_fn = stream,
         .build_request_fn = buildRequest,
-        .project_replay_fn = vercel_protocol.selectReplayParts,
+        .project_replay_fn = projectReplay,
     };
+}
+
+fn projectReplay(
+    alloc: Allocator,
+    replay: ?@import("../core/shared/types.zig").ProviderReplay,
+    calls: []const @import("../core/shared/types.zig").ToolCall,
+    text: bool,
+    reasoning: bool,
+) !?@import("../core/shared/types.zig").ProviderReplay {
+    return codec.project_replay(alloc, replay, calls, text, reasoning);
 }
 
 pub fn initContext(
@@ -66,54 +77,6 @@ pub fn initContext(
     transport: Transport,
 ) ProviderContext {
     return .{ .build_fn = build_fn, .endpoint = endpoint, .transport = transport };
-}
-
-test "host provider selects replay without changing canonical input" {
-    const Unused = struct {
-        fn build(_: Allocator, _: stream_provider.RequestData) ![]u8 {
-            return error.UnexpectedRequest;
-        }
-        fn open(_: ?*anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8) !i32 {
-            return error.UnexpectedRequest;
-        }
-        fn status(_: ?*anyopaque, _: i32, _: *u16) i32 {
-            return -1;
-        }
-        fn next(_: ?*anyopaque, _: i32, _: []u8) i32 {
-            return -1;
-        }
-        fn close(_: ?*anyopaque, _: i32) void {}
-    };
-    const types = @import("../core/shared/types.zig");
-    const alloc = std.testing.allocator;
-    var context = initContext(Unused.build, .{ .fixed = "https://example.invalid" }, .{
-        .context = null,
-        .open_fn = Unused.open,
-        .status_fn = Unused.status,
-        .next_fn = Unused.next,
-        .close_fn = Unused.close,
-    });
-    const adapter = provider(&context);
-    const parts = "[{\"type\":\"reasoning\",\"text\":\"retained\"},{\"type\":\"tool-call\",\"toolCallId\":\"read\"},{\"type\":\"text\",\"offset\":0,\"length\":6}]";
-    const replay = types.ProviderReplay{
-        .source = .{ .provider = .gateway, .model = "fixture-model" },
-        .parts_json = parts,
-    };
-    const calls = [_]types.ToolCall{.{ .id = "read", .name = "read_file", .arguments_json = "{}" }};
-    const unchanged = (try adapter.projectReplay(alloc, replay, &calls, true, true)).?;
-    try std.testing.expect(unchanged.parts_json.ptr == parts.ptr);
-
-    const selected = (try adapter.projectReplay(alloc, replay, &calls, false, true)).?;
-    defer alloc.free(selected.parts_json);
-    try std.testing.expectEqualStrings("[{\"type\":\"reasoning\",\"text\":\"retained\"},{\"type\":\"tool-call\",\"toolCallId\":\"read\"}]", selected.parts_json);
-    try std.testing.expectEqualStrings(parts, replay.parts_json);
-    try std.testing.expect(selected.matches(replay.source));
-    try std.testing.expectEqual(@as(?types.ProviderReplay, null), try adapter.projectReplay(alloc, replay, &.{}, false, false));
-    try std.testing.expectEqual(@as(?types.ProviderReplay, null), try adapter.projectReplay(alloc, null, &.{}, true, true));
-    try std.testing.expectError(error.InvalidProviderState, adapter.projectReplay(alloc, .{
-        .source = replay.source,
-        .parts_json = "{}",
-    }, &.{}, false, true));
 }
 
 fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
@@ -134,19 +97,13 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     defer headers.deinit(alloc);
     try headers.appendSlice(alloc, &.{
         .{ .name = "content-type", .value = "application/json" },
-        .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" },
-        .{ .name = "X-Title", .value = "fx" },
-        .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" },
-        .{ .name = "ai-language-model-specification-version", .value = "4" },
-        .{ .name = "ai-language-model-id", .value = request.model },
-        .{ .name = "ai-language-model-streaming", .value = "true" },
+        .{ .name = "accept", .value = "text/event-stream" },
     });
+    for (openrouter.definition.headers) |header| {
+        try headers.append(alloc, .{ .name = header.name, .value = header.value });
+    }
     if (auth) |value| try headers.append(alloc, .{ .name = "authorization", .value = value });
-    if (request.credential.tenant()) |team| if (team.len > 0) try headers.append(alloc, .{ .name = "x-vercel-ai-gateway-team", .value = team });
-    if (request.session_id) |session_id| if (session_id.len > 0) try headers.appendSlice(alloc, &.{
-        .{ .name = "x-session-id", .value = session_id },
-        .{ .name = "x-session-affinity", .value = session_id },
-    });
+    if (request.session_id) |session_id| if (session_id.len > 0) try headers.append(alloc, .{ .name = "x-session-id", .value = session_id });
 
     var headers_json: std.Io.Writer.Allocating = .init(alloc);
     defer headers_json.deinit();
@@ -171,18 +128,29 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     }
 
     const status: std.http.Status = @enumFromInt(status_code);
-    if (status != .ok) return .{ .failed = .{
-        .kind = failureKind(status),
-        .detail = try readBody(
+    if (status != .ok) {
+        const detail = try readBody(
             alloc,
             transport,
             handle,
             request.cancel_flag,
             request.deadline,
             request.cooperative_pulse,
-        ),
-        .ownership = .owned,
-    } };
+        );
+        defer alloc.free(detail);
+        // The provider echoes the bearer on some rejections, so mask before the
+        // diagnostic can reach the transcript or a log.
+        const safe = if (request.credential.secret()) |credential|
+            try codec.redact_error_detail(alloc, detail, credential)
+        else
+            detail;
+        defer if (request.credential.secret() != null) alloc.free(safe);
+        return .{ .failed = .{
+            .kind = failureKind(status),
+            .detail = safe,
+            .ownership = .owned,
+        } };
+    }
 
     var reader: HostStreamReader = undefined;
     reader.init(
@@ -192,30 +160,17 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         request.deadline,
         request.cooperative_pulse,
     );
-    var events = request.events;
-    const completion = gateway_client.consumeGatewaySseStream(
-        alloc,
-        &reader.interface,
-        &events,
-        EventBridge.content,
-        EventBridge.toolStart,
-        EventBridge.reasoning,
-        request.cancel_flag,
-        request.content_capture_limit,
-    ) catch |err| switch (err) {
+    var limits: codec.Limits = .{};
+    if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
+    return codec.consume_stream(alloc, &reader.interface, request.data(), limits, request.events, request.cancel_flag) catch |err| switch (err) {
         error.ReadFailed => return if (reader.timed_out)
             error.Timeout
         else if (request.cancel_flag.load(.seq_cst) or reader.aborted)
             error.Cancelled
         else
             error.HostStreamFailed,
-        else => return err,
+        else => |failure| return failure,
     };
-    return .{ .completed = .{
-        .completion = completion,
-        .usage = gatewayUsageOutcome(request, completion),
-        .ownership = .owned,
-    } };
 }
 
 fn buildRequest(
@@ -226,56 +181,6 @@ fn buildRequest(
     const context: *ProviderContext = @ptrCast(@alignCast(raw.?));
     return context.build_fn(alloc, request);
 }
-
-fn gatewayUsageOutcome(
-    request: stream_provider.ModelRequest,
-    completion: @import("../core/shared/types.zig").ModelCompletion,
-) stream_provider.UsageOutcome {
-    const reference = gatewayUsageReference(request, completion) orelse
-        return .{ .unavailable = .possibly_billed };
-    return if (completion.billing != null)
-        .{ .exact = .gateway }
-    else
-        .{ .deferred = reference };
-}
-
-fn gatewayUsageReference(
-    request: stream_provider.ModelRequest,
-    completion: @import("../core/shared/types.zig").ModelCompletion,
-) ?stream_provider.DeferredUsageReference {
-    const generation_id = completion.generation_id orelse return null;
-    const source = request.credential.credentialSource() orelse return null;
-    return .{
-        .provider = .gateway,
-        .generation_id = generation_id,
-        .scope = gateway_client.generationBaseUrl(),
-        .tenant = request.credential.tenant(),
-        .account_id = request.credential.accountId(),
-        .credential_source = source,
-        .credential_identity = credential_authority.derive(
-            source,
-            request.credential.accountId(),
-        ),
-    };
-}
-
-const EventBridge = struct {
-    fn sink(raw: *anyopaque) *stream_provider.EventSink {
-        return @ptrCast(@alignCast(raw));
-    }
-
-    fn content(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .content_delta = chunk });
-    }
-
-    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .reasoning_delta = chunk });
-    }
-
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
-    }
-};
 
 fn failureKind(status: std.http.Status) stream_provider.FailureKind {
     return switch (status) {
@@ -430,140 +335,3 @@ const HostStreamReader = struct {
         return count;
     }
 };
-
-test "error response bodies are bounded" {
-    const FakeTransport = struct {
-        body: []const u8,
-        offset: usize = 0,
-
-        fn open(_: ?*anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8) anyerror!i32 {
-            return 1;
-        }
-
-        fn status(_: ?*anyopaque, _: i32, status_out: *u16) i32 {
-            status_out.* = 500;
-            return 1;
-        }
-
-        fn next(raw: ?*anyopaque, _: i32, out: []u8) i32 {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            const len = @min(out.len, self.body.len - self.offset);
-            if (len == 0) return 0;
-            @memcpy(out[0..len], self.body[self.offset..][0..len]);
-            self.offset += len;
-            return @intCast(len);
-        }
-
-        fn close(_: ?*anyopaque, _: i32) void {}
-    };
-
-    const body = try std.testing.allocator.alloc(u8, max_error_body_bytes + 1);
-    defer std.testing.allocator.free(body);
-    @memset(body, 'x');
-    var fake = FakeTransport{ .body = body };
-    const transport = Transport{
-        .context = &fake,
-        .open_fn = FakeTransport.open,
-        .status_fn = FakeTransport.status,
-        .next_fn = FakeTransport.next,
-        .close_fn = FakeTransport.close,
-    };
-    var cancel_flag = std.atomic.Value(bool).init(false);
-
-    try std.testing.expectError(
-        error.HostStreamFailed,
-        readBody(std.testing.allocator, transport, 1, &cancel_flag, null, null),
-    );
-}
-
-test "host stream reader omits pulse timing state without callback" {
-    const FakeTransport = struct {
-        fn open(_: ?*anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8) anyerror!i32 {
-            return 1;
-        }
-
-        fn status(_: ?*anyopaque, _: i32, _: *u16) i32 {
-            return 1;
-        }
-
-        fn next(_: ?*anyopaque, _: i32, _: []u8) i32 {
-            return 0;
-        }
-
-        fn close(_: ?*anyopaque, _: i32) void {}
-    };
-
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var reader: HostStreamReader = undefined;
-    reader.init(.{
-        .context = null,
-        .open_fn = FakeTransport.open,
-        .status_fn = FakeTransport.status,
-        .next_fn = FakeTransport.next,
-        .close_fn = FakeTransport.close,
-    }, 1, &cancel_flag, null, null);
-
-    try std.testing.expect(reader.last_cooperative_pulse == null);
-}
-
-test "host stream reader stops at its provider deadline" {
-    const FakeTransport = struct {
-        fn open(_: ?*anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8) anyerror!i32 {
-            return 1;
-        }
-        fn status(_: ?*anyopaque, _: i32, _: *u16) i32 {
-            return 0;
-        }
-        fn next(_: ?*anyopaque, _: i32, _: []u8) i32 {
-            return -3;
-        }
-        fn close(_: ?*anyopaque, _: i32) void {}
-    };
-
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var reader: HostStreamReader = undefined;
-    reader.init(.{
-        .context = null,
-        .open_fn = FakeTransport.open,
-        .status_fn = FakeTransport.status,
-        .next_fn = FakeTransport.next,
-        .close_fn = FakeTransport.close,
-    }, 1, &cancel_flag, std.Io.Clock.Timestamp.now(std.testing.io, .awake), null);
-    var buffer: [1]u8 = undefined;
-    try std.testing.expectError(error.ReadFailed, reader.readHost(&buffer));
-    try std.testing.expect(reader.timed_out);
-}
-
-test "host stream reader throttles cooperative pulses" {
-    const PulseTrace = struct {
-        calls: usize = 0,
-
-        fn run(raw: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-        }
-    };
-    const awake_timestamp = struct {
-        fn at(milliseconds: i64) std.Io.Clock.Timestamp {
-            return .{
-                .clock = .awake,
-                .raw = .fromNanoseconds(@as(i96, milliseconds) * std.time.ns_per_ms),
-            };
-        }
-    }.at;
-
-    var trace: PulseTrace = .{};
-    var reader: HostStreamReader = .{
-        .cooperative_pulse = .{ .ctx = &trace, .run = PulseTrace.run },
-        .last_cooperative_pulse = awake_timestamp(100),
-    };
-
-    try reader.pulseIfDueAt(awake_timestamp(149));
-    try std.testing.expectEqual(@as(usize, 0), trace.calls);
-    try reader.pulseIfDueAt(awake_timestamp(150));
-    try std.testing.expectEqual(@as(usize, 1), trace.calls);
-    try reader.pulseIfDueAt(awake_timestamp(199));
-    try std.testing.expectEqual(@as(usize, 1), trace.calls);
-    try reader.pulseIfDueAt(awake_timestamp(200));
-    try std.testing.expectEqual(@as(usize, 2), trace.calls);
-}

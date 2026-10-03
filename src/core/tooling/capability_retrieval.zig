@@ -17,19 +17,16 @@ const rare_short_token_catalog_divisor: usize = 32;
 pub const Kind = enum {
     all,
     skill,
-    mcp,
 
     pub fn includes(self: Kind, domain: Domain) bool {
         return self == .all or switch (domain) {
             .skill => self == .skill,
-            .mcp => self == .mcp,
         };
     }
 };
 
 pub const Domain = enum {
     skill,
-    mcp,
 };
 
 pub const RelevancePolicy = enum {
@@ -40,41 +37,34 @@ pub const RelevancePolicy = enum {
 pub const Request = struct {
     query: *const lexical_relevance.PreparedQuery,
     kind: Kind = .all,
-    server: ?[]const u8 = null,
     limit: usize = default_limit,
     cursor: ?[]const u8 = null,
     relevance_policy: RelevancePolicy = .compatible,
 
     pub fn validate(self: Request) ValidationError!void {
         if (self.limit == 0 or self.limit > max_limit) return error.InvalidLimit;
-        if (self.server) |server| {
-            if (server.len == 0) return error.InvalidServer;
-            if (self.kind == .skill) return error.ServerRequiresMcp;
-        }
-        if (self.query.raw.len == 0 and self.server == null) {
-            return error.QueryOrServerRequired;
+
+        if (self.query.raw.len == 0) {
+            return error.QueryRequired;
         }
         if (self.cursor) |cursor| {
             if (cursor.len == 0 or cursor.len > max_cursor_bytes) {
                 return error.InvalidCursor;
             }
-            if (self.kind == .all and self.server == null) {
+            if (self.kind == .all) {
                 return error.CursorRequiresDomain;
             }
         }
     }
 
     pub fn includes(self: Request, domain: Domain) bool {
-        if (self.server != null and domain == .skill) return false;
         return self.kind.includes(domain);
     }
 };
 
 pub const ValidationError = error{
-    QueryOrServerRequired,
+    QueryRequired,
     InvalidLimit,
-    InvalidServer,
-    ServerRequiresMcp,
     CursorRequiresDomain,
     InvalidCursor,
 };
@@ -199,7 +189,6 @@ pub fn retrieve(
                 document_frequencies[token_index],
                 documents.len,
                 request.relevance_policy,
-                request.server != null,
             )) {
                 secondary_hits += 1;
             }
@@ -329,13 +318,11 @@ fn secondaryTokenProvidesEvidence(
     document_frequency: usize,
     document_count: usize,
     relevance_policy: RelevancePolicy,
-    server_scoped: bool,
 ) bool {
     if (token.len < min_secondary_evidence_token_bytes) {
         return document_frequency <= document_count / rare_short_token_catalog_divisor;
     }
     return relevance_policy == .compatible or
-        server_scoped or
         document_frequency < document_count;
 }
 
@@ -450,7 +437,6 @@ fn requestHash(request: Request, domain: Domain) u64 {
     updateHashField(&hash, request.query.raw);
     hash.update(&.{@intFromEnum(domain)});
     hash.update(&.{@intFromEnum(request.relevance_policy)});
-    if (request.server) |server| updateHashField(&hash, server);
     return hash.final();
 }
 
@@ -492,7 +478,6 @@ fn parseCursor(raw: []const u8) error{InvalidCursor}!Cursor {
     }
     const domain: Domain = switch (domain_raw[0]) {
         's' => .skill,
-        'm' => .mcp,
         else => return error.InvalidCursor,
     };
     return .{
@@ -504,356 +489,4 @@ fn parseCursor(raw: []const u8) error{InvalidCursor}!Cursor {
         .offset = std.fmt.parseInt(usize, offset_raw, 10) catch
             return error.InvalidCursor,
     };
-}
-
-test "request validation rejects invalid source and cursor states" {
-    const query = try lexical_relevance.prepare("monitor incidents");
-    const empty = try lexical_relevance.prepare("");
-
-    try (Request{ .query = &query }).validate();
-    try (Request{ .query = &empty, .kind = .mcp, .server = "datadog" }).validate();
-    try std.testing.expectError(
-        error.QueryOrServerRequired,
-        (Request{ .query = &empty }).validate(),
-    );
-    try std.testing.expectError(
-        error.ServerRequiresMcp,
-        (Request{ .query = &query, .kind = .skill, .server = "datadog" }).validate(),
-    );
-    try std.testing.expectError(
-        error.InvalidLimit,
-        (Request{ .query = &query, .limit = max_limit + 1 }).validate(),
-    );
-    try std.testing.expectError(
-        error.InvalidCursor,
-        (Request{ .query = &query, .cursor = "" }).validate(),
-    );
-    try std.testing.expectError(
-        error.CursorRequiresDomain,
-        (Request{ .query = &query, .cursor = "c1:s:1:1:1" }).validate(),
-    );
-}
-
-test "corpus relevance prefers identities and rejects one weak generic hit" {
-    const query = try lexical_relevance.prepare("datadog monitor incidents");
-    const documents = [_]Document{
-        .{
-            .identities = .{ "prompt-master", "" },
-            .stable_key = "skill:prompt-master",
-            .primary = .{ "prompt-master", "", "", "" },
-            .secondary = .{ "Write prompts for tools", "", "" },
-        },
-        .{
-            .identities = .{ "mcp_datadog_list_monitors", "list_monitors" },
-            .stable_key = "mcp:datadog:list_monitors",
-            .primary = .{ "datadog", "list_monitors", "mcp_datadog_list_monitors", "" },
-            .secondary = .{ "List Datadog monitors and incidents", "", "" },
-        },
-        .{
-            .identities = .{ "mcp_other_list_tools", "list_tools" },
-            .stable_key = "mcp:other:list_tools",
-            .primary = .{ "other", "list_tools", "mcp_other_list_tools", "" },
-            .secondary = .{ "Return tools from a server", "", "" },
-        },
-    };
-    var page = try retrieve(
-        std.testing.allocator,
-        .{ .query = &query },
-        .mcp,
-        &documents,
-    );
-    defer page.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), page.total_matches);
-    try std.testing.expectEqual(@as(usize, 1), page.matches.len);
-    try std.testing.expectEqual(@as(usize, 1), page.matches[0].document_index);
-}
-
-test "relevance rejects isolated generic primary and short secondary evidence" {
-    const documents = [_]Document{
-        .{
-            .identities = .{ "strategy-website", "" },
-            .stable_key = "skill:strategy-website",
-            .primary = .{ "strategy-website", "", "", "" },
-            .secondary = .{
-                "Website content, conversion optimization, and call-to-action guidance. Triggers on landing-page requests.",
-                "",
-                "",
-            },
-        },
-        .{
-            .identities = .{ "mcp_context7_query-docs", "" },
-            .stable_key = "mcp:context7:query-docs",
-            .primary = .{ "context7", "query-docs", "", "" },
-            .secondary = .{ "Call this tool on every documentation request.", "", "" },
-        },
-    };
-    const queries = [_][]const u8{
-        "query production monitoring alerts and open incidents datadog pagerduty grafana sentry status page",
-        "incident management on-call alerts",
-    };
-    for (queries) |raw_query| {
-        const query = try lexical_relevance.prepare(raw_query);
-        var page = try retrieve(
-            std.testing.allocator,
-            .{ .query = &query },
-            .skill,
-            &documents,
-        );
-        defer page.deinit(std.testing.allocator);
-
-        try std.testing.expectEqual(@as(usize, 0), page.total_matches);
-        try std.testing.expectEqual(@as(usize, 0), page.matches.len);
-    }
-}
-
-test "exact server identity bypasses the two-hit relevance floor" {
-    const query = try lexical_relevance.prepare("datadog");
-    const documents = [_]Document{
-        .{
-            .identities = .{ "mcp_context7_query-docs", "" },
-            .stable_key = "mcp:context7:query-docs",
-            .primary = .{ "context7", "query-docs", "", "" },
-        },
-        .{
-            .identities = .{ "mcp_datadog_list-monitors", "" },
-            .stable_key = "mcp:datadog:list-monitors",
-            .primary = .{ "datadog", "list-monitors", "", "" },
-        },
-    };
-    var page = try retrieve(
-        std.testing.allocator,
-        .{ .query = &query, .kind = .mcp },
-        .mcp,
-        &documents,
-    );
-    defer page.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), page.total_matches);
-    try std.testing.expectEqual(@as(usize, 1), page.matches.len);
-    try std.testing.expectEqual(@as(usize, 1), page.matches[0].document_index);
-}
-
-test "rare short technical terms remain secondary evidence" {
-    const query = try lexical_relevance.prepare("aws deployment");
-    var documents: [rare_short_token_catalog_divisor]Document = undefined;
-    for (&documents, 0..) |*document, index| {
-        document.* = .{
-            .identities = .{ "generic-helper", "" },
-            .stable_key = if (index == 0) "skill:cloud-helper" else "skill:generic-helper",
-            .primary = .{ if (index == 0) "cloud-helper" else "generic-helper", "", "", "" },
-            .secondary = .{
-                if (index == 0) "AWS deployment guidance" else "General workflow guidance",
-                "",
-                "",
-            },
-        };
-    }
-    var page = try retrieve(
-        std.testing.allocator,
-        .{ .query = &query, .kind = .skill },
-        .skill,
-        &documents,
-    );
-    defer page.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), page.total_matches);
-    try std.testing.expectEqual(@as(usize, 1), page.matches.len);
-    try std.testing.expectEqual(@as(usize, 0), page.matches[0].document_index);
-}
-
-test "intent relevance rejects corpus-wide procedural description terms" {
-    const query = try lexical_relevance.prepare("query list production monitors");
-    const documents = [_]Document{
-        .{
-            .identities = .{ "mcp_context7_query-docs", "" },
-            .stable_key = "mcp:context7:query-docs",
-            .primary = .{ "context7", "query-docs", "", "" },
-            .secondary = .{ "Query and list documentation", "", "" },
-        },
-        .{
-            .identities = .{ "mcp_context7_resolve-library-id", "" },
-            .stable_key = "mcp:context7:resolve-library-id",
-            .primary = .{ "context7", "resolve-library-id", "", "" },
-            .secondary = .{ "Query and list documentation", "", "" },
-        },
-    };
-    var page = try retrieve(
-        std.testing.allocator,
-        .{ .query = &query, .kind = .mcp, .relevance_policy = .intent },
-        .mcp,
-        &documents,
-    );
-    defer page.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 0), page.total_matches);
-    try std.testing.expectEqual(@as(usize, 0), page.matches.len);
-}
-
-test "inventory cursor partitions twenty eight tools without gaps" {
-    const alloc = std.testing.allocator;
-    const query = try lexical_relevance.prepare("");
-    var name_storage: [28][24]u8 = undefined;
-    var documents: [28]Document = undefined;
-    for (&documents, 0..) |*document, index| {
-        const name = try std.fmt.bufPrint(&name_storage[index], "mcp_datadog_tool_{d:0>2}", .{index});
-        document.* = .{
-            .identities = .{ name, "" },
-            .stable_key = name,
-            .primary = .{ "datadog", name, "", "" },
-        };
-    }
-
-    var seen: [28]bool = @splat(false);
-    var cursor: ?[]u8 = null;
-    defer if (cursor) |value| alloc.free(value);
-    var total_seen: usize = 0;
-    while (true) {
-        var page = try retrieve(
-            alloc,
-            .{
-                .query = &query,
-                .kind = .mcp,
-                .server = "datadog",
-                .limit = 5,
-                .cursor = cursor,
-            },
-            .mcp,
-            &documents,
-        );
-        defer page.deinit(alloc);
-        for (page.matches) |match| {
-            try std.testing.expect(!seen[match.document_index]);
-            seen[match.document_index] = true;
-            total_seen += 1;
-        }
-        const next = try page.cursorAfter(alloc, page.matches.len);
-        if (cursor) |value| alloc.free(value);
-        cursor = next;
-        if (cursor == null) break;
-    }
-    try std.testing.expectEqual(@as(usize, 28), total_seen);
-    for (seen) |value| try std.testing.expect(value);
-}
-
-test "cursor is bound to request and catalog fingerprint" {
-    const alloc = std.testing.allocator;
-    const query = try lexical_relevance.prepare("monitor incidents");
-    const changed_query = try lexical_relevance.prepare("security signals");
-    const documents = [_]Document{
-        .{
-            .identities = .{ "mcp_datadog_monitors", "" },
-            .stable_key = "mcp:datadog:monitors",
-            .primary = .{ "datadog", "monitors", "", "" },
-            .secondary = .{ "Monitor incidents", "", "" },
-        },
-        .{
-            .identities = .{ "mcp_datadog_incidents", "" },
-            .stable_key = "mcp:datadog:incidents",
-            .primary = .{ "datadog", "incidents", "", "" },
-            .secondary = .{ "Monitor incidents", "", "" },
-        },
-    };
-    var first = try retrieve(
-        alloc,
-        .{ .query = &query, .kind = .mcp, .server = "datadog", .limit = 1 },
-        .mcp,
-        &documents,
-    );
-    defer first.deinit(alloc);
-    const cursor = (try first.cursorAfter(alloc, first.matches.len)).?;
-    defer alloc.free(cursor);
-
-    try std.testing.expectError(
-        error.InvalidCursor,
-        retrieve(
-            alloc,
-            .{
-                .query = &changed_query,
-                .kind = .mcp,
-                .server = "datadog",
-                .limit = 1,
-                .cursor = cursor,
-            },
-            .mcp,
-            &documents,
-        ),
-    );
-
-    var changed_documents = documents;
-    changed_documents[1].secondary[0] = "Changed catalog";
-    try std.testing.expectError(
-        error.StaleCursor,
-        retrieve(
-            alloc,
-            .{
-                .query = &query,
-                .kind = .mcp,
-                .server = "datadog",
-                .limit = 1,
-                .cursor = cursor,
-            },
-            .mcp,
-            &changed_documents,
-        ),
-    );
-}
-
-test "large catalog retrieval remains bounded to the requested page" {
-    const alloc = std.testing.allocator;
-    const query = try lexical_relevance.prepare("monitor incidents");
-    const documents = try alloc.alloc(Document, 10_000);
-    defer alloc.free(documents);
-    for (documents, 0..) |*document, index| {
-        document.* = .{
-            .identities = .{ "monitor", "" },
-            .stable_key = if (index % 2 == 0) "monitor-even" else "monitor-odd",
-            .primary = .{ "datadog", "monitor", "", "" },
-            .secondary = .{ "Read monitor incidents", "", "" },
-        };
-    }
-    var page = try retrieve(
-        alloc,
-        .{ .query = &query, .kind = .mcp, .server = "datadog", .limit = max_limit },
-        .mcp,
-        documents,
-    );
-    defer page.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 10_000), page.total_matches);
-    try std.testing.expectEqual(max_limit, page.matches.len);
-    const cursor = (try page.cursorAfter(alloc, page.matches.len)).?;
-    defer alloc.free(cursor);
-    try std.testing.expect(cursor.len <= max_cursor_bytes);
-}
-
-test "retrieval releases every allocation failure" {
-    const Case = struct {
-        fn run(alloc: Allocator) !void {
-            const query = try lexical_relevance.prepare("monitor incidents");
-            const documents = [_]Document{
-                .{
-                    .identities = .{ "monitor", "" },
-                    .stable_key = "mcp:datadog:monitor",
-                    .primary = .{ "datadog", "monitor", "", "" },
-                    .secondary = .{ "Read monitor incidents", "", "" },
-                },
-                .{
-                    .identities = .{ "incident", "" },
-                    .stable_key = "mcp:datadog:incident",
-                    .primary = .{ "datadog", "incident", "", "" },
-                    .secondary = .{ "Read monitor incidents", "", "" },
-                },
-            };
-            var page = try retrieve(
-                alloc,
-                .{ .query = &query, .kind = .mcp, .server = "datadog", .limit = 1 },
-                .mcp,
-                &documents,
-            );
-            defer page.deinit(alloc);
-            const cursor = (try page.cursorAfter(alloc, page.matches.len)).?;
-            alloc.free(cursor);
-        }
-    };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

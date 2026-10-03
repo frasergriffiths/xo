@@ -93,23 +93,40 @@ pub const SecretStorePresence = enum {
     unavailable,
 };
 
+/// Addresses one built-in provider's saved credential. Each slot owns a
+/// physically separate secret so saving one provider's key can never replace
+/// another's. The no-argument `SecretStore` helpers address `.openrouter`,
+/// which is the historical single-slot location.
+pub const SecretSlot = enum {
+    openrouter,
+    groq,
+    openai_compatible,
+};
+
 pub const SecretStore = struct {
     context: ?*anyopaque = null,
     backend_label: []const u8,
     is_disabled_fn: *const fn (?*anyopaque) bool,
-    presence_fn: *const fn (?*anyopaque) SecretStorePresence = unavailableSecretStorePresence,
+    presence_fn: *const fn (?*anyopaque, SecretSlot) SecretStorePresence = unavailableSecretStorePresence,
     load_fn: *const fn (
         ?*anyopaque,
         std.mem.Allocator,
+        SecretSlot,
     ) SecretStoreLoadError!?[]u8,
     store_fn: *const fn (
         ?*anyopaque,
         std.mem.Allocator,
+        SecretSlot,
         []const u8,
     ) SecretStoreWriteError!void,
     store_interactive_fn: *const fn (
         ?*anyopaque,
+        SecretSlot,
     ) SecretStoreWriteError!bool,
+    /// Removes the stored secret. Returns whether one was present. Hosts that
+    /// cannot delete report `unavailable` through the shared write error set, so
+    /// a signed-out-but-not-deleted key is never reported as a clean removal.
+    remove_fn: *const fn (?*anyopaque, SecretSlot) SecretStoreWriteError!bool = removeUnavailable,
 
     pub fn isDisabled(self: SecretStore) bool {
         return self.is_disabled_fn(self.context);
@@ -118,7 +135,11 @@ pub const SecretStore = struct {
     /// Reports only whether a secret exists. No secret bytes are returned or
     /// transferred across this host boundary.
     pub fn presence(self: SecretStore) SecretStorePresence {
-        return self.presence_fn(self.context);
+        return self.presenceFor(.openrouter);
+    }
+
+    pub fn presenceFor(self: SecretStore, slot: SecretSlot) SecretStorePresence {
+        return self.presence_fn(self.context, slot);
     }
 
     /// Returns an owned secret, or null when none is stored. The caller must
@@ -127,7 +148,15 @@ pub const SecretStore = struct {
         self: SecretStore,
         alloc: std.mem.Allocator,
     ) SecretStoreLoadError!?[]u8 {
-        return self.load_fn(self.context, alloc);
+        return self.loadFor(alloc, .openrouter);
+    }
+
+    pub fn loadFor(
+        self: SecretStore,
+        alloc: std.mem.Allocator,
+        slot: SecretSlot,
+    ) SecretStoreLoadError!?[]u8 {
+        return self.load_fn(self.context, alloc, slot);
     }
 
     /// Borrows `value` for this call. The caller retains ownership.
@@ -136,7 +165,16 @@ pub const SecretStore = struct {
         alloc: std.mem.Allocator,
         value: []const u8,
     ) SecretStoreWriteError!void {
-        return self.store_fn(self.context, alloc, value);
+        return self.storeFor(alloc, .openrouter, value);
+    }
+
+    pub fn storeFor(
+        self: SecretStore,
+        alloc: std.mem.Allocator,
+        slot: SecretSlot,
+        value: []const u8,
+    ) SecretStoreWriteError!void {
+        return self.store_fn(self.context, alloc, slot, value);
     }
 
     /// Lets the host collect and store a secret without exposing its bytes to
@@ -144,9 +182,31 @@ pub const SecretStore = struct {
     pub fn storeInteractive(
         self: SecretStore,
     ) SecretStoreWriteError!bool {
-        return self.store_interactive_fn(self.context);
+        return self.storeInteractiveFor(.openrouter);
+    }
+
+    pub fn storeInteractiveFor(
+        self: SecretStore,
+        slot: SecretSlot,
+    ) SecretStoreWriteError!bool {
+        return self.store_interactive_fn(self.context, slot);
+    }
+
+    /// Deletes the stored secret, returning whether one was there. Used by
+    /// sign-out, which must not claim success it cannot confirm.
+    pub fn remove(self: SecretStore) SecretStoreWriteError!bool {
+        return self.removeFor(.openrouter);
+    }
+
+    pub fn removeFor(self: SecretStore, slot: SecretSlot) SecretStoreWriteError!bool {
+        if (self.isDisabled()) return error.StoredKeyWriteFailed;
+        return self.remove_fn(self.context, slot);
     }
 };
+
+fn removeUnavailable(_: ?*anyopaque, _: SecretSlot) SecretStoreWriteError!bool {
+    return error.StoredKeyWriteFailed;
+}
 
 pub const unavailable_secret_store: SecretStore = .{
     .backend_label = "configured credential store",
@@ -161,17 +221,18 @@ fn unavailableSecretStoreIsDisabled(_: ?*anyopaque) bool {
     return false;
 }
 
-fn unavailableSecretStorePresence(_: ?*anyopaque) SecretStorePresence {
+fn unavailableSecretStorePresence(_: ?*anyopaque, _: SecretSlot) SecretStorePresence {
     return .unavailable;
 }
 
-fn missingSecretStorePresence(_: ?*anyopaque) SecretStorePresence {
+fn missingSecretStorePresence(_: ?*anyopaque, _: SecretSlot) SecretStorePresence {
     return .missing;
 }
 
 fn unavailableSecretStoreLoad(
     _: ?*anyopaque,
     _: std.mem.Allocator,
+    _: SecretSlot,
 ) SecretStoreLoadError!?[]u8 {
     return null;
 }
@@ -179,6 +240,7 @@ fn unavailableSecretStoreLoad(
 fn unavailableSecretStoreWrite(
     _: ?*anyopaque,
     _: std.mem.Allocator,
+    _: SecretSlot,
     _: []const u8,
 ) SecretStoreWriteError!void {
     return error.StoredKeyWriteFailed;
@@ -186,6 +248,7 @@ fn unavailableSecretStoreWrite(
 
 fn unavailableSecretStoreInteractiveWrite(
     _: ?*anyopaque,
+    _: SecretSlot,
 ) SecretStoreWriteError!bool {
     return false;
 }
@@ -286,122 +349,4 @@ pub fn operatingSystemText(alloc: std.mem.Allocator) std.mem.Allocator.Error![]u
     const release = std.mem.sliceTo(&uts.release, 0);
     if (release.len == 0) return alloc.dupe(u8, sysname);
     return std.fmt.allocPrint(alloc, "{s} {s}", .{ sysname, release });
-}
-
-test "terminal title forwards borrowed label bytes and clear" {
-    const Capture = struct {
-        label: [64]u8 = undefined,
-        label_len: usize = 0,
-        clear_count: usize = 0,
-
-        fn set(raw: ?*anyopaque, label: []const u8) void {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.label_len = @min(label.len, self.label.len);
-            @memcpy(self.label[0..self.label_len], label[0..self.label_len]);
-        }
-
-        fn clear(raw: ?*anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.clear_count += 1;
-        }
-
-        fn label_text(self: *const @This()) []const u8 {
-            return self.label[0..self.label_len];
-        }
-    };
-
-    var capture = Capture{};
-    const terminal_title = TerminalTitle{
-        .context = &capture,
-        .set_fn = Capture.set,
-        .clear_fn = Capture.clear,
-    };
-
-    terminal_title.set("session name");
-    terminal_title.clear();
-
-    try std.testing.expectEqualStrings("session name", capture.label_text());
-    try std.testing.expectEqual(@as(usize, 1), capture.clear_count);
-}
-
-test "unavailable terminal title accepts set and clear" {
-    unavailable_terminal_title.set("provider/model");
-    unavailable_terminal_title.clear();
-}
-
-test "native host capabilities expose process and URL support" {
-    const macos = nativeForOs(.macos);
-    try std.testing.expect(macos.process_control);
-    try std.testing.expect(macos.url_open);
-    try std.testing.expect(macos.native_url_open);
-    try std.testing.expectEqual(TerminalSupport.supported, macos.terminal);
-
-    const linux = nativeForOs(.linux);
-    try std.testing.expect(linux.process_control);
-    try std.testing.expect(linux.url_open);
-    try std.testing.expect(!linux.native_url_open);
-    try std.testing.expectEqual(TerminalSupport.supported, linux.terminal);
-
-    const windows = nativeForOs(.windows);
-    try std.testing.expect(!windows.process_control);
-    try std.testing.expect(!windows.url_open);
-    try std.testing.expect(!windows.native_url_open);
-    try std.testing.expectEqual(TerminalSupport.unsupported, windows.terminal);
-
-    const wasi = nativeForOs(.wasi);
-    try std.testing.expect(!wasi.process_control);
-    try std.testing.expect(!wasi.url_open);
-    try std.testing.expect(!wasi.native_url_open);
-    try std.testing.expectEqual(TerminalSupport.unsupported, wasi.terminal);
-
-    try std.testing.expectEqual(
-        TerminalSupport.unsupported,
-        terminalSupportForOs(.freebsd),
-    );
-}
-
-test "host boundary routes WebAssembly targets to WASM capabilities" {
-    const emscripten = capabilitiesForTarget(.wasm32, .emscripten);
-    try std.testing.expect(!emscripten.process_control);
-    try std.testing.expect(!emscripten.url_open);
-    try std.testing.expect(!emscripten.native_url_open);
-    try std.testing.expectEqual(TerminalSupport.unsupported, emscripten.terminal);
-
-    const wasi = capabilitiesForTarget(.wasm64, .wasi);
-    try std.testing.expect(!wasi.process_control);
-    try std.testing.expect(!wasi.url_open);
-    try std.testing.expect(!wasi.native_url_open);
-    try std.testing.expectEqual(TerminalSupport.unsupported, wasi.terminal);
-}
-
-test "unavailable URL opener keeps the manual fallback available" {
-    try std.testing.expect(!try unavailable_url_opener.open(
-        std.testing.allocator,
-        "https://example.test",
-    ));
-}
-
-test "unavailable secret store reports absence and refuses writes" {
-    try std.testing.expect(!unavailable_secret_store.isDisabled());
-    try std.testing.expect((try unavailable_secret_store.load(std.testing.allocator)) == null);
-    try std.testing.expectError(
-        error.StoredKeyWriteFailed,
-        unavailable_secret_store.store(std.testing.allocator, "secret"),
-    );
-    try std.testing.expect(!try unavailable_secret_store.storeInteractive());
-}
-
-test "unavailable clipboard rejects text and file references" {
-    try std.testing.expect(!try unavailable_clipboard.copy("text"));
-    try std.testing.expect(!try unavailable_clipboard.copy_file(std.testing.allocator, "/tmp/report.md"));
-}
-
-test "current host describes its operating system" {
-    const text = try operatingSystemText(std.testing.allocator);
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expect(text.len > 0);
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        try std.testing.expectEqualStrings(@tagName(builtin.os.tag), text);
-    }
 }

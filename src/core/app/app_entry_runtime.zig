@@ -18,14 +18,11 @@ const skill_contract = @import("../skills/skill_contract.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
-const mcp_contract = @import("../mcp/mcp_contract.zig");
-const mcp_command_provider = @import("../mcp/command_provider.zig");
-const mcp_health = @import("../mcp/health.zig");
-const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const update_target = @import("../upgrade/update_target.zig");
-const test_builtin_gateway = if (builtin.is_test)
-    @import("../../builtins/gateway.zig")
+const test_openrouter = if (builtin.is_test)
+    @import("../../gateway/openrouter_test_fixtures.zig")
 else
     struct {};
 const test_builtin_commands = if (builtin.is_test)
@@ -93,14 +90,7 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
-    inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
-    inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
-        mcp_health.inspectLocalConfigUnavailable,
-    load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
-    add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
-        mcp_command_provider.addProfileServerUnavailable,
-    remove_mcp_profile_server: mcp_command_provider.RemoveProfileServerFn =
-        mcp_command_provider.removeProfileServerUnavailable,
+
     acp_runner: acp_runner.Runner,
 };
 
@@ -295,7 +285,6 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         }
     };
     if (comptime !cooperative) {
-        if (@hasDecl(App, "startMcpDiscovery")) app.startMcpDiscovery();
         if (@hasDecl(App, "rebindAfterInit")) app.rebindAfterInit();
     }
     var app_needs_deinit = true;
@@ -479,11 +468,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .context_registry = cfg.context_registry,
         .mode_registry = cfg.mode_registry,
         .tool_set = cfg.tool_set,
-        .inspect_mcp_profile_config = cfg.inspect_mcp_profile_config,
-        .inspect_mcp_local_config = cfg.inspect_mcp_local_config,
-        .load_mcp_runtime = cfg.load_mcp_runtime,
-        .add_mcp_profile_server = cfg.add_mcp_profile_server,
-        .remove_mcp_profile_server = cfg.remove_mcp_profile_server,
+
         .acp_runner = cfg.acp_runner,
     };
 }
@@ -559,16 +544,6 @@ const test_entry_context_registry = context_contract.Registry{ .default_provider
     .append_transient_fn = appendNoopTransientContextForTest,
 } };
 
-fn noMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
-    return null;
-}
-
-fn noMcpConfigInspectionForTest(
-    _: Allocator,
-) error{OutOfMemory}!mcp_contract.ProfileConfigDiagnostic {
-    return .clear;
-}
-
 fn unexpectedAcpRunForTest(_: ?*anyopaque, _: Allocator, _: acp_runner.Config) anyerror!void {
     return error.TestUnexpectedAcpRun;
 }
@@ -580,10 +555,10 @@ fn testConfig() Config {
         .default_model = "model",
         .default_agent_step_limit = 12,
         .models_path = "/models",
+        .gateway_provider = .{ .chat_url = .{ .context = @constCast(&test_openrouter), .resolve_fn = testResolveChatUrl } },
         .gateway_retry_count = 2,
         .gateway_chat_url = "https://gateway/chat",
-        .gateway_provider = test_builtin_gateway.provider,
-        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
+        .provider_set = provider_set.openrouter_only(test_openrouter.provider_bundle),
         .url_opener = host.unavailable_url_opener,
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "system" },
@@ -598,8 +573,7 @@ fn testConfig() Config {
         .max_history_turns = 32,
         .context_registry = test_entry_context_registry,
         .mode_registry = .{ .default_mode_id = "entry" },
-        .inspect_mcp_profile_config = noMcpConfigInspectionForTest,
-        .load_mcp_runtime = noMcpRuntimeForTest,
+
         .acp_runner = .{ .run_fn = unexpectedAcpRunForTest },
         .tool_set = .{
             .registry = .{ .tools = &.{} },
@@ -845,10 +819,6 @@ const TestApp = struct {
         appendTestEvent("file-index");
     }
 
-    fn startMcpDiscovery(_: *TestApp) void {
-        appendTestEvent("mcp-discovery");
-    }
-
     fn rebindAfterInit(_: *TestApp) void {
         appendTestEvent("rebind-after-init");
     }
@@ -863,528 +833,11 @@ const TestApp = struct {
     }
 };
 
-test "app entry returns after handled CLI success without initializing app" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.handled_success);
-    defer capture.deinit();
-    const skill_roots = [_]skill_contract.RootSpec{
-        .{ .source = .workspace_shared, .path = "skills" },
-    };
-    var cfg = testConfig();
-    var url_opener_context: u8 = 0;
-    var secret_store_context: u8 = 0;
-    cfg.url_opener.context = &url_opener_context;
-    cfg.secret_store.context = &secret_store_context;
-    cfg.skill_root_policy.workspace_roots = &skill_roots;
-    const outcome = try runWithDeps(TestApp, alloc, &.{@constCast("help")}, cfg, capture.deps());
-
-    try std.testing.expectEqual(RunOutcome.returned, outcome);
-    try std.testing.expectEqual(@as(usize, 1), capture.cli_calls);
-    try std.testing.expectEqualStrings("0.2.10", capture.seen_config.?.version);
-    try std.testing.expectEqualStrings("help", capture.seen_config.?.command_catalog.specs[0].token);
-    try std.testing.expectEqualStrings("test.entry_context", capture.seen_config.?.context_registry.defaultProvider().id);
-    try std.testing.expectEqualStrings("entry", capture.seen_config.?.mode_registry.default_mode_id);
-    try std.testing.expectEqualStrings("entry_test_tool", capture.seen_config.?.tool_set.order[0]);
-    try std.testing.expectEqualStrings("skills", capture.seen_config.?.skill_root_policy.workspace_roots[0].path);
-    try std.testing.expect(capture.seen_config.?.gateway_provider.chat_url.resolve_fn == test_builtin_gateway.chat_url_provider.resolve_fn);
-    try std.testing.expect(capture.seen_config.?.provider_set.gateway.cli_model_catalog.?.fetch_fn == test_builtin_gateway.cli_model_catalog_provider.fetch_fn);
-    try std.testing.expect(capture.seen_config.?.provider_set.gateway.fx_search.?.execute_fn == test_builtin_gateway.default_web_search_provider.execute_fn);
-    try std.testing.expect(capture.seen_config.?.provider_set.gateway.model_catalog.?.fetch_fn == test_builtin_gateway.model_catalog_provider.fetch_fn);
-    try std.testing.expect(capture.seen_config.?.url_opener.context == cfg.url_opener.context);
-    try std.testing.expect(capture.seen_config.?.url_opener.open_fn == cfg.url_opener.open_fn);
-    try std.testing.expect(capture.seen_config.?.secret_store.context == cfg.secret_store.context);
-    try std.testing.expect(capture.seen_config.?.secret_store.load_fn == cfg.secret_store.load_fn);
-    try std.testing.expect(capture.seen_config.?.inspect_mcp_profile_config == noMcpConfigInspectionForTest);
-    try std.testing.expect(capture.seen_config.?.load_mcp_runtime == noMcpRuntimeForTest);
-    try std.testing.expectEqual(@as(usize, 0), test_event_count);
-}
-
-test "app entry exits after handled CLI failure" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.handled_failure);
-    defer capture.deinit();
-    const outcome = try runWithDeps(TestApp, alloc, &.{@constCast("models")}, testConfig(), capture.deps());
-
-    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
-    try std.testing.expectEqual(@as(usize, 0), test_event_count);
-}
-
-test "app entry maps handled CLI exit without initializing app" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .handled_exit = 42 });
-    defer capture.deinit();
-    const outcome = try runWithDeps(TestApp, alloc, &.{ @constCast("replay"), @constCast("tape") }, testConfig(), capture.deps());
-
-    try std.testing.expectEqual(@as(u8, 42), outcome.exit);
-    try std.testing.expectEqual(@as(usize, 1), capture.cli_calls);
-    try std.testing.expectEqual(@as(usize, 0), test_event_count);
-}
-
-test "app entry returns after handled zero exit without initializing app" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .handled_exit = 0 });
-    defer capture.deinit();
-    const outcome = try runWithDeps(TestApp, alloc, &.{ @constCast("replay"), @constCast("tape") }, testConfig(), capture.deps());
-
-    try std.testing.expectEqual(RunOutcome.returned, outcome);
-    try std.testing.expectEqual(@as(usize, 1), capture.cli_calls);
-    try std.testing.expectEqual(@as(usize, 0), test_event_count);
-}
-
-test "app entry honors FX_BENCH before app initialization" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.bench_value = "1";
-    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
-
-    try std.testing.expectEqual(RunOutcome.returned, outcome);
-    try std.testing.expectEqual(@as(usize, 1), capture.cli_calls);
-    try std.testing.expectEqual(@as(usize, 0), test_event_count);
-}
-
-test "app entry runs interactive startup callbacks in active order" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
-
-    try std.testing.expectEqual(RunOutcome.returned, outcome);
-    try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
-}
-
-test "app entry reports persistence failure after teardown instead of a successful handoff" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.resume_handoff_id = "session-123";
-    capture.shutdown_failure = error.InputOutput;
-    capture.record_stderr_event = true;
-    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
-    try std.testing.expectEqual(RunOutcome{ .exit = 1 }, outcome);
-    try std.testing.expectEqualStrings("fx: session save failed: InputOutput\n", capture.stderr.written());
-    try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
-    try std.testing.expectEqualStrings("deinit", test_events[test_event_count - 2]);
-    try std.testing.expectEqualStrings("stderr-attempt", test_events[test_event_count - 1]);
-}
-
-test "app entry writes exact resume handoff after interactive teardown" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.resume_handoff_id = "session-123";
-    capture.record_stdout_event = true;
-
-    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
-
-    try std.testing.expectEqual(RunOutcome.returned, outcome);
-    try std.testing.expectEqualStrings(
-        "Continue session with: fx --resume session-123\n",
-        capture.stdout.written(),
-    );
-    try std.testing.expectEqual(@as(usize, 1), capture.stdout_calls);
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-    try expectEvents(&.{
-        "init:none",
-        "mcp-discovery",
-        "rebind-after-init",
-        "auto-upgrade",
-        "file-index",
-        "worker-thread",
-        "model-cache",
-        "run",
-        "terminal-release",
-        "deinit",
-        "stdout-attempt",
-    });
-}
-
-test "app entry bounds graceful-exit SIGINT suppression to handoff lifetime" {
-    const alloc = std.testing.allocator;
-    var original_action: std.posix.Sigaction = undefined;
-    const test_action: std.posix.Sigaction = .{
-        .handler = .{ .handler = testSigintHandler },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.INT, &test_action, &original_action);
-    defer std.posix.sigaction(std.posix.SIG.INT, &original_action, null);
-    test_sigint_count.store(0, .seq_cst);
-
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.resume_handoff_id = "session-123";
-    capture.raise_sigint_during_deinit = true;
-
-    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
-
-    try std.testing.expectEqual(RunOutcome.returned, outcome);
-    try std.testing.expectEqualStrings(
-        "Continue session with: fx --resume session-123\n",
-        capture.stdout.written(),
-    );
-    try std.testing.expectEqual(@as(usize, 0), test_sigint_count.load(.seq_cst));
-
-    _ = std.c.raise(std.posix.SIG.INT);
-    try std.testing.expectEqual(@as(usize, 1), test_sigint_count.load(.seq_cst));
-}
-
-test "app entry relaunches only after teardown with the validated handoff" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.resume_handoff_id = "session-123";
-    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
-    capture.record_stderr_event = true;
-
-    const outcome = try runWithDeps(
-        TestApp,
-        alloc,
-        &.{},
-        testConfig(),
-        capture.deps(),
-    );
-
-    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
-    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
-    try std.testing.expectEqual(@as(usize, 4), capture.replace_arg_count);
-    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
-    try std.testing.expectEqualStrings("resume", capture.replaceArg(1));
-    try std.testing.expectEqualStrings("session-123", capture.replaceArg(2));
-    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(3));
-    try std.testing.expect(std.mem.find(
-        u8,
-        capture.stderr.written(),
-        "relaunch failed: InvalidExe",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        capture.stderr.written(),
-        "fx --resume session-123",
-    ) != null);
-    try expectEvents(&.{
-        "init:none",
-        "mcp-discovery",
-        "rebind-after-init",
-        "auto-upgrade",
-        "file-index",
-        "worker-thread",
-        "model-cache",
-        "run",
-        "terminal-release",
-        "deinit",
-        "stderr-attempt",
-    });
-}
-
-test "app entry carries the previous revision through upgrade relaunch" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.resume_handoff_id = "session-123";
-    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
-    capture.upgrade_previous_revision = "1111111111111111111111111111111111111111";
-
-    _ = try runWithDeps(
-        TestApp,
-        alloc,
-        &.{},
-        testConfig(),
-        capture.deps(),
-    );
-
-    try std.testing.expectEqual(@as(usize, 5), capture.replace_arg_count);
-    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(3));
-    try std.testing.expectEqualStrings(
-        "1111111111111111111111111111111111111111",
-        capture.replaceArg(4),
-    );
-}
-
-test "app entry never relaunches without a validated handoff" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
-
-    const outcome = try runWithDeps(
-        TestApp,
-        alloc,
-        &.{},
-        testConfig(),
-        capture.deps(),
-    );
-
-    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
-    try std.testing.expectEqual(@as(usize, 0), capture.replace_calls);
-    try std.testing.expect(std.mem.find(
-        u8,
-        capture.stderr.written(),
-        "no validated resume handoff",
-    ) != null);
-}
-
-test "app entry ignores resume handoff stdout failures" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.resume_handoff_id = "session-123";
-    capture.stdout_error = error.TestStdoutWriteFailed;
-
-    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
-
-    try std.testing.expectEqual(RunOutcome.returned, outcome);
-    try std.testing.expectEqual(@as(usize, 1), capture.stdout_calls);
-    try std.testing.expectEqualStrings("", capture.stdout.written());
-    try std.testing.expectEqualStrings("", capture.stderr.written());
+fn testResolveChatUrl(_: ?*anyopaque, fallback: []const u8) []const u8 {
+    return if (fallback.len == 0) test_openrouter.chat_url_provider.resolve_fn() else fallback;
 }
 
 fn runWithOuterCleanup(comptime App: type, alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunOutcome {
     defer appendTestEvent("outer-defer");
     return runWithDeps(App, alloc, args, cfg, deps);
-}
-
-test "app entry reports unexpected init errors once and preserves identity" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.init_error = error.TestInitFailed;
-    capture.record_stderr_event = true;
-
-    try std.testing.expectError(error.TestInitFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("fx: TestInitFailed\n", capture.stderr.written());
-    try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
-    try expectEvents(&.{ "init:none", "stderr-attempt" });
-}
-
-test "app entry releases terminal before reporting worker start errors" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.worker_error = error.TestWorkerStartFailed;
-    capture.record_stderr_event = true;
-
-    try std.testing.expectError(error.TestWorkerStartFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("fx: TestWorkerStartFailed\n", capture.stderr.written());
-    try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "terminal-release", "stderr-attempt", "deinit" });
-}
-
-test "app entry releases terminal before reporting initial context failures exactly" {
-    const alloc = std.testing.allocator;
-    const errors = [_]context_contract.ProviderError{
-        error.OutOfMemory,
-        error.NoSpaceLeft,
-        error.WriteFailed,
-    };
-
-    for (errors) |expected_error| {
-        var capture = TestCapture.init(.{ .interactive = .{} });
-        defer capture.deinit();
-        capture.run_error = expected_error;
-        capture.record_stderr_event = true;
-
-        try std.testing.expectError(
-            expected_error,
-            runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()),
-        );
-        var expected_stderr_buf: [64]u8 = undefined;
-        const expected_stderr = try std.fmt.bufPrint(
-            &expected_stderr_buf,
-            "fx: {s}\n",
-            .{@errorName(expected_error)},
-        );
-        try std.testing.expectEqualStrings(expected_stderr, capture.stderr.written());
-        try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
-        try expectEvents(&.{
-            "init:none",
-            "mcp-discovery",
-            "rebind-after-init",
-            "auto-upgrade",
-            "file-index",
-            "worker-thread",
-            "model-cache",
-            "run",
-            "terminal-release",
-            "stderr-attempt",
-            "deinit",
-        });
-    }
-}
-
-test "app entry reports run errors before deinit and outer cleanup" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.run_error = error.TestRunFailed;
-    capture.record_stderr_event = true;
-
-    try std.testing.expectError(error.TestRunFailed, runWithOuterCleanup(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("fx: TestRunFailed\n", capture.stderr.written());
-    try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
-    try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit", "outer-defer" });
-}
-
-test "app entry treats terminal input closure as abnormal cleanup without stderr" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.run_error = error.TerminalInputClosed;
-    capture.record_stderr_event = true;
-    capture.resume_handoff_id = "session-123";
-
-    const outcome = try runWithDeps(
-        TestApp,
-        alloc,
-        &.{},
-        testConfig(),
-        capture.deps(),
-    );
-
-    try std.testing.expectEqual(RunOutcome.returned, outcome);
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-    try std.testing.expectEqual(@as(usize, 0), capture.stderr_calls);
-    try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
-    try expectEvents(&.{
-        "init:none",
-        "mcp-discovery",
-        "rebind-after-init",
-        "auto-upgrade",
-        "file-index",
-        "worker-thread",
-        "model-cache",
-        "run",
-        "terminal-release",
-        "deinit",
-    });
-}
-
-test "app entry preserves run errors when fatal formatting fails" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.run_error = error.TestRunFailed;
-    capture.fail_unexpected_format = true;
-
-    try std.testing.expectError(error.TestRunFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-    try std.testing.expectEqual(@as(usize, 0), capture.stderr_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
-}
-
-test "app entry preserves run errors when fatal writer fails" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.run_error = error.TestRunFailed;
-    capture.stderr_error = error.TestStderrWriteFailed;
-    capture.record_stderr_event = true;
-
-    try std.testing.expectError(error.TestRunFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-    try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit" });
-}
-
-test "app entry passes requested resume into app init" {
-    const alloc = std.testing.allocator;
-    const id = try alloc.dupe(u8, "session-123");
-    var capture = TestCapture.init(.{ .interactive = .{ .requested_resume = .{ .id = id } } });
-    defer capture.deinit();
-    const outcome = try runWithDeps(TestApp, alloc, &.{ @constCast("resume"), @constCast("session-123") }, testConfig(), capture.deps());
-
-    try std.testing.expectEqual(RunOutcome.returned, outcome);
-    try expectEvents(&.{ "init:session-123", "mcp-discovery", "rebind-after-init", "resume-reconciliation", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
-}
-
-test "app entry maps noninteractive terminal startup to exit one" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.init_error = error.NotATerminal;
-    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
-
-    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
-    try std.testing.expectEqualStrings("fx requires an interactive terminal (TTY).\n", capture.stderr.written());
-    try expectEvents(&.{"init:none"});
-}
-
-test "app entry maps missing saved sessions to exit one" {
-    const alloc = std.testing.allocator;
-    const Case = struct { err: anyerror, stderr: []const u8 };
-    for ([_]Case{
-        .{ .err = error.NoSavedSessions, .stderr = "fx: no saved sessions for this workspace.\n" },
-        .{
-            .err = error.NoReadableSessions,
-            .stderr = "fx: no readable saved sessions for this workspace, and some saved sessions are unreadable; run `fx doctor` for recovery guidance.\n",
-        },
-    }) |case| {
-        var capture = TestCapture.init(.{ .interactive = .{} });
-        defer capture.deinit();
-        capture.init_error = case.err;
-        const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
-
-        try std.testing.expectEqual(@as(u8, 1), outcome.exit);
-        try std.testing.expectEqualStrings(case.stderr, capture.stderr.written());
-    }
-}
-
-test "app entry maps unavailable session state to one expected startup failure" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct {
-        init_error: anyerror,
-        message: []const u8,
-    }{
-        .{
-            .init_error = error.SessionBusy,
-            .message = "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
-        },
-        .{
-            .init_error = error.SessionLockUnsupported,
-            .message = "fx: the filesystem cannot provide the required session lock\n",
-        },
-        .{
-            .init_error = error.SessionAuthorityBoundaryUnavailable,
-            .message = "fx: a saved session has an unfinished update that could not be recovered; run `fx doctor` to identify the affected session\n",
-        },
-        .{
-            .init_error = error.SessionCommitBoundaryUnavailable,
-            .message = "fx: a saved session has an unfinished update that could not be recovered; run `fx doctor` to identify the affected session\n",
-        },
-        .{
-            .init_error = error.OneOffSessionNotResumable,
-            .message = "fx: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n",
-        },
-    };
-
-    for (cases) |case| {
-        var capture = TestCapture.init(.{ .interactive = .{} });
-        defer capture.deinit();
-        capture.init_error = case.init_error;
-        capture.fail_unexpected_format = true;
-
-        const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
-
-        try std.testing.expectEqual(@as(u8, 1), outcome.exit);
-        try std.testing.expectEqualStrings(case.message, capture.stderr.written());
-        try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
-        try expectEvents(&.{"init:none"});
-    }
-}
-
-test "app entry returns failure when terminal closure cannot save the session" {
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.run_error = error.TerminalInputClosed;
-    capture.shutdown_failure = error.InputOutput;
-    capture.resume_handoff_id = "session-123";
-    capture.record_stderr_event = true;
-    const outcome = try runWithDeps(TestApp, std.testing.allocator, &.{}, testConfig(), capture.deps());
-    try std.testing.expectEqual(RunOutcome{ .exit = 1 }, outcome);
-    try std.testing.expectEqualStrings("fx: session save failed: InputOutput\n", capture.stderr.written());
-    try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
-    try std.testing.expectEqualStrings("deinit", test_events[test_event_count - 2]);
-    try std.testing.expectEqualStrings("stderr-attempt", test_events[test_event_count - 1]);
 }

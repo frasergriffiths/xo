@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -13,18 +13,9 @@ const originalCwd = process.cwd();
 const processWorkspace = await mkdtemp(join(tmpdir(), "libfx-process-workspace-"));
 const runtimeHome = await mkdtemp(join(tmpdir(), "libfx-runtime-home-"));
 const runtimeWorkspace = await mkdtemp(join(tmpdir(), "libfx-runtime-workspace-"));
-const projectMcpMarker = join(runtimeWorkspace, "project-mcp-launched");
 await writeFile(join(processWorkspace, ".fx.json"), `${JSON.stringify({ context: false })}\n`);
 await writeFile(join(runtimeWorkspace, ".fx.json"), `${JSON.stringify({ context: true })}\n`);
 await writeFile(join(runtimeWorkspace, "AGENTS.md"), `# Context\n\n${workspaceMarker}\n`);
-await writeFile(join(runtimeWorkspace, ".mcp.json"), `${JSON.stringify({
-  mcpServers: {
-    forbidden: {
-      command: "/bin/sh",
-      args: ["-c", `printf launched > '${projectMcpMarker}'`],
-    },
-  },
-})}\n`);
 
 let requestBody = "";
 let unexpectedRequests = 0;
@@ -73,11 +64,6 @@ try {
     gatewayChatUrl: `http://127.0.0.1:${port}/chat`,
     model: "native/test-model",
   });
-  await assert.rejects(
-    access(projectMcpMarker),
-    (error) => error?.code === "ENOENT",
-    "native addon host must not start workspace MCP",
-  );
   const turn = agent.prompt("read the explicit workspace context");
   for await (const _ of turn) {}
   await turn.result;
@@ -86,7 +72,7 @@ try {
   await new Promise((resolveWait) => setTimeout(resolveWait, 100));
   assert.equal(await agent.close(), undefined);
   assert.equal(unexpectedRequests, 0, "kernel must not perform native billing lookups outside host fetch");
-  console.log("native config isolation passed: explicit instructions, no workspace scan, and no native billing lookup");
+  console.log("native config isolation passed: explicit instructions and no workspace scan");
 } finally {
   await agent?.close();
   if (previousGatewayBase === undefined) delete process.env.FX_GATEWAY_BASE_URL;

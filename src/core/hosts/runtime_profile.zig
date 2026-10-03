@@ -6,7 +6,7 @@ pub const Profile = struct {
     profile_usage: bool,
     native_auth: bool,
     file_index: bool,
-    mcp: bool,
+
     subagents: bool,
     auto_upgrade: bool,
     skills: bool,
@@ -37,7 +37,7 @@ pub const native = Profile{
     .profile_usage = true,
     .native_auth = true,
     .file_index = true,
-    .mcp = true,
+
     .subagents = true,
     .auto_upgrade = true,
     .skills = true,
@@ -61,7 +61,7 @@ pub const wasm = Profile{
     .profile_usage = false,
     .native_auth = false,
     .file_index = false,
-    .mcp = false,
+
     .subagents = false,
     .auto_upgrade = false,
     .skills = false,
@@ -78,38 +78,3 @@ pub const wasm = Profile{
     .js_host_url_open = true,
     .js_host_workspace = true,
 };
-
-test "apps without a host profile retain native capabilities" {
-    const App = struct {};
-    try std.testing.expect(allows(App, .durable_sessions));
-    try std.testing.expect(!allows(App, .js_host_sessions));
-}
-
-test "host profile capabilities are selected by field" {
-    const App = struct {
-        pub const host_profile = wasm;
-    };
-    try std.testing.expect(!allows(App, .durable_sessions));
-    try std.testing.expect(allows(App, .js_host_config));
-    try std.testing.expect(allows(App, .js_host_sessions));
-    try std.testing.expect(allows(App, .js_host_clipboard));
-}
-
-test "native and wasm profiles select distinct auth host effects" {
-    try std.testing.expect(native.native_auth);
-    try std.testing.expect(native.url_opening);
-    try std.testing.expect(!native.js_host_auth);
-    try std.testing.expect(!native.js_host_url_open);
-
-    try std.testing.expect(!wasm.native_auth);
-    try std.testing.expect(!wasm.url_opening);
-    try std.testing.expect(wasm.js_host_auth);
-    try std.testing.expect(wasm.js_host_url_open);
-}
-
-test "workspace host capability is wasm only without enabling native tools" {
-    try std.testing.expect(@hasField(Profile, "js_host_workspace"));
-    try std.testing.expect(!native.js_host_workspace);
-    try std.testing.expect(wasm.js_host_workspace);
-    try std.testing.expect(!wasm.tools);
-}

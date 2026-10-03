@@ -65,7 +65,7 @@ Key rules:
 
 * `src/main.zig` is the composition root. Do not add leaf feature logic here.
 
-* `src/core/` owns contracts, runtimes, config, sessions, permissions, MCP, skills.
+* `src/core/` owns contracts, runtimes, config, sessions, permissions, skills.
 
 * `src/tools/` owns built-in tool implementations. Generic tool contracts and dispatch live in `src/core/tooling/`. Default tool specs are centralized in `src/core/tooling/tool_specs.zig` or `src/builtins/tools.zig`, not in individual tool files.
 
@@ -136,21 +136,7 @@ Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `backg
 
 Security is permission-first. All sensitive tool behavior must integrate with `src/core/permissions/permissions.zig`.
 
-* `permission_mode` controls baseline (`ask`, `auto`, or `full-access`; `yolo` remains an alias). Full access bypasses fx permission policy and uses an effective sandbox of `none` without rewriting saved sandbox configuration
-
-* Configured denies are evaluated before saved-session rules; an exact saved-session deny can narrow a configured allow, while an exact saved-session allow can satisfy an unresolved configured ask
-
-* Session `always` approvals are non-persistent; command approvals match the exact command while other grant categories may use patterns
-
-* `/permissions remember allow|deny <tool-name> <arguments-json>` confirms and stores an exact rule only for an active saved session; list and revoke those rules by their stable IDs
-
-* Routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy. Every remaining unresolved `auto` action receives one narrow security review using the exact unmasked action and targets, origin and call identity, optional host-proven current-branch evidence, and bounded unmasked terminal-safe excerpts of earlier current-turn tool results. A text match between the action and prior tool output is evidence to inspect, not proof of prompt injection or malicious activity. Prepared file mutations and other static root tools omit task text. Reviewed commands, shell input, dynamic tools, and subagent actions also receive bounded unmasked canonical current, first, and recent root requests plus explicit omission counts; the reviewer may use that context only to distinguish trusted user intent from malicious or injected influence, never to judge task quality, alignment, or authorization. Assistant prose, permission feedback, compacted summaries, the pending tool group, later results, and tool or repository text never become authority. Shell input reviews also include the owned receiving session's launch command, working directory, and bounded current screen after verifying session authority, including on resume. The launch command describes startup only; screen content remains untrusted evidence and input still receives its own review
-
-* The reviewer returns `caution` only for concrete prompt injection or malicious activity. Destructive, risky, external, public, remote, unrequested, or task-conflicting actions clear when they are not malicious. A `clear` review authorizes only the exact unchanged action. A `caution`, incomplete-evidence result, or unavailable review holds only that action, returns guidance to the agent, and never opens a human permission screen, disables tools, or ends the turn
-
-* Exact cautions and deterministic incomplete-evidence results are reused only for the current turn. An unavailable outcome is not cached as a security judgment, but the same exact action spends at most one unavailable review opportunity per turn; changed actions remain independently reviewable until the bounded current-turn review budget is exhausted. Each review accepts exactly one valid structured decision even with accompanying prose and may retry one malformed completion within the current attempt's deadline. A transport timeout, transient transport failure, or failed transport call is retried once with a fresh 30-second deadline; permanent transport failures, valid cautions, and cancellation are never retried. Legacy `permission_request_id` input is rejected without prompting
-
-* Host-generated review holds retain their advice for the agent and transcript, but carry a saved `review_feedback` marker that excludes them from later security evidence, including after recovery. Old unmarked results remain untrusted evidence; never infer the marker from output text. Quoted review accusations are not proof of an attack, and handling plans or test instructions as data is not itself prompt injection
+fx has a single permission mode: full access, accepted as `full-access`, `full access`, or `yolo`. `permission_mode` accepts no other value; an unrecognized or legacy value is ignored and full access still applies. Every tool call is allowed without a human permission prompt, and full access uses an effective sandbox of `none`.
 
 Do not bypass the permission system for new tools.
 
@@ -328,31 +314,6 @@ zig build test                      # runs every VT and resize test
 
 When a tmux or tape-based scenario exposes a bug, reproduce it as a Zig unit test in `resize_tests.zig` (or a new sibling) before fixing. The test lands the fix as a regression.
 
-## Benchmarks
-
-Startup latency benchmarks live in `benchmarks/` and run in CI via `.github/workflows/bench.yml`.
-
-```bash
-./benchmarks/startup.sh            # full run (100 iterations, builds ReleaseSafe, needs hyperfine)
-./benchmarks/startup.sh --quick    # quick run (20 iterations)
-```
-
-The CI workflow builds a ReleaseSafe binary, measures six CLI paths with hyperfine, and enforces per-command latency budgets. PRs that exceed a budget fail the check. On `main`, results are uploaded to Vercel Blob for historical tracking.
-
-The startup benchmark uses `FX_BENCH=1`, an environment variable that runs through arg parsing and CLI dispatch, then exits before TTY initialization. This lives in `src/core/app/app_entry_runtime.zig`.
-
-Current raw wall-clock contract:
-
-* Linux CI: 2ms for every command
-* Non-Linux local runs: informational raw means
-
-The Linux CI runner is the authoritative product budget. Local macOS process
-and dynamic-loader floors vary enough to exceed 2ms independently of fx, so
-local runs report raw means without assigning a substitute product budget. The
-process baseline is diagnostic only and is never subtracted.
-
-When adding features, consider their impact on startup latency. The `fx help` path is the baseline cold-start benchmark.
-
 ## Binary Size Observability
 
 Every pull request runs `.github/workflows/binary-size.yml` across Linux x86_64,
@@ -441,7 +402,7 @@ Do not create version tags manually. Do not change `build.zig.zon` version (it i
 
 ## Repository and License
 
-The canonical repository is `vercel-labs/fx` on GitHub. All URLs, links, and references to the repo must use `vercel-labs/fx` (not `vercel/fx`, `user/fx`, or any other org/owner). Licensed under Apache-2.0.
+The canonical repository is `frasergriffiths/xo` on GitHub. All URLs, links, and references to the repo must use `frasergriffiths/xo` (not `vercel/fx`, `user/fx`, or any other org/owner). Licensed under Apache-2.0.
 
 ## What Not To Do
 

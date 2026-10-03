@@ -81,17 +81,8 @@ fn persist(id: []const u8, value: []const u8) void {
 }
 
 fn configIdForPermissionMode(mode: PermissionMode) []const u8 {
-    return switch (mode) {
-        .auto => "code",
-        .ask => "ask",
-        // The host persists product mode IDs. Yolo has no product mode, so its
-        // non-interactive behavior restores through the closest mode, code.
-        .yolo => "code",
-    };
-}
-
-test "host config maps permission modes to restorable product modes" {
-    try std.testing.expectEqualStrings("code", configIdForPermissionMode(.auto));
-    try std.testing.expectEqualStrings("ask", configIdForPermissionMode(.ask));
-    try std.testing.expectEqualStrings("code", configIdForPermissionMode(.yolo));
+    // The host persists product mode IDs. Full access has no separate product
+    // mode, so it restores through the closest one, which is the default.
+    _ = mode;
+    return "code";
 }

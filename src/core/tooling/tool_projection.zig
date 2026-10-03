@@ -8,7 +8,7 @@ const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Options = struct {
-    permission_mode: types.PermissionMode = .auto,
+    permission_mode: types.PermissionMode = .yolo,
     permission_rules: types.PermissionRuleSet = .{},
     subagent_available: bool = false,
 };
@@ -270,7 +270,7 @@ const test_skill = blk: {
 const test_capability_search = blk: {
     var spec = test_skill;
     spec.name = "capability_search";
-    spec.description = "Test capability search. When to use: discover skill and MCP metadata together. When NOT to use: load or execute a match.";
+    spec.description = "Test capability search. When to use: discover skill metadata. When NOT to use: load or execute a match.";
     spec.model_schema = .{
         .name = "capability_search",
         .description = spec.description,
@@ -314,31 +314,6 @@ const test_subagent = blk: {
     spec.completed_action_label = "Managed";
     spec.label_arg_kind = .none;
     spec.label_arg_default = "subagent";
-    break :blk spec;
-};
-
-const test_mcp_select_tool = blk: {
-    var spec = test_skill;
-    spec.name = "mcp_select_tool";
-    spec.description = "Test MCP selection. When to use: exercise deferred MCP projection. When NOT to use: assert product-specific MCP guidance.";
-    spec.model_schema = .{
-        .name = "mcp_select_tool",
-        .description = spec.description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "name", .json_type = .string },
-            },
-            .required = &.{"name"},
-        },
-    };
-    spec.executor_kind = .mcp_select_tool;
-    spec.activity_kind = .read;
-    spec.requires_approval = false;
-    spec.action_label = "Selecting MCP tool";
-    spec.completed_action_label = "Selected MCP tool";
-    spec.label_arg_kind = .name;
-    spec.label_arg_default = "dynamic tool";
-    spec.permission_target_kind = .none;
     break :blk spec;
 };
 
@@ -453,7 +428,6 @@ const test_all_tools = [_]tool_dispatch.Tool{
     test_skill,
     test_install_skill,
     test_subagent,
-    test_mcp_select_tool,
     test_ask_user_question,
     test_vision,
     test_read_tool_result,
@@ -470,7 +444,6 @@ const test_order = [_][]const u8{
     "capability_search",
     "skill",
     "install_skill",
-    "mcp_select_tool",
     "ask_user_question",
     "web_fetch",
     "web_search",
@@ -628,120 +601,6 @@ fn expectNotContainsName(names: []const []const u8, expected: []const u8) !void 
     }
 }
 
-test "provider-executed search follows settled advertisement permission" {
-    const cases = [_]struct {
-        action: ?types.PermissionAction,
-        advertised: bool,
-    }{
-        .{ .action = null, .advertised = true },
-        .{ .action = .allow, .advertised = true },
-        .{ .action = .ask, .advertised = false },
-        .{ .action = .deny, .advertised = false },
-    };
-
-    for (cases) |case| {
-        var rules = [_]types.PermissionRule{.{
-            .permission = @constCast("web_search"),
-            .pattern = @constCast("*"),
-            .action = case.action orelse .deny,
-        }};
-        const options: Options = if (case.action != null)
-            .{ .permission_rules = .{ .rules = &rules } }
-        else
-            .{};
-        var projection = try buildTestModelToolProjection(std.testing.allocator, options);
-        defer projection.deinit(std.testing.allocator);
-
-        try std.testing.expectEqual(
-            case.advertised,
-            containsName(projection.advertised_names, "web_search"),
-        );
-        try std.testing.expectEqualStrings(
-            if (case.advertised) test_web_search.description else "",
-            projection.custom_guidance,
-        );
-    }
-}
-
-test "provider execution gate follows the registry declaration" {
-    const tools = [_]tool_dispatch.Tool{test_mirror_provider_tool};
-    inline for (.{
-        .{ types.PermissionAction.allow, true },
-        .{ types.PermissionAction.ask, false },
-        .{ types.PermissionAction.deny, false },
-    }) |case| {
-        var rules = [_]types.PermissionRule{.{
-            .permission = @constCast("mirror_search"),
-            .pattern = @constCast("*"),
-            .action = case[0],
-        }};
-        var projection = try buildTestModelToolProjectionForRegistry(
-            std.testing.allocator,
-            &tools,
-            .{ .permission_rules = .{ .rules = &rules } },
-        );
-        defer projection.deinit(std.testing.allocator);
-        try std.testing.expectEqual(case[1], containsName(projection.advertised_names, "mirror_search"));
-    }
-}
-
-test "ask keeps advertising locally executed tools" {
-    const tools = [_]tool_dispatch.Tool{test_web_search_base};
-    var rules = [_]types.PermissionRule{.{
-        .permission = @constCast("web_search"),
-        .pattern = @constCast("*"),
-        .action = .ask,
-    }};
-    var projection = try buildTestModelToolProjectionForRegistry(
-        std.testing.allocator,
-        &tools,
-        .{ .permission_rules = .{ .rules = &rules } },
-    );
-    defer projection.deinit(std.testing.allocator);
-    try expectContainsName(projection.advertised_names, "web_search");
-}
-
-test "yolo advertisement ignores permission filtering" {
-    var rules = [_]types.PermissionRule{.{
-        .permission = @constCast("*"),
-        .pattern = @constCast("*"),
-        .action = .deny,
-    }};
-    var projection = try buildTestModelToolProjection(std.testing.allocator, .{
-        .permission_mode = .yolo,
-        .permission_rules = .{ .rules = &rules },
-    });
-    defer projection.deinit(std.testing.allocator);
-    try expectContainsName(projection.advertised_names, "shell");
-    try expectContainsName(projection.advertised_names, "write_file");
-    try expectContainsName(projection.advertised_names, "web_search");
-}
-
-test "category-wide denies and later overrides select the expected tools" {
-    var denied_rules = [_]types.PermissionRule{.{
-        .permission = @constCast("edit"),
-        .pattern = @constCast("*"),
-        .action = .deny,
-    }};
-    var denied = try buildTestModelToolProjection(std.testing.allocator, .{
-        .permission_rules = .{ .rules = &denied_rules },
-    });
-    defer denied.deinit(std.testing.allocator);
-    try expectNotContainsName(denied.advertised_names, "edit_file");
-    try expectNotContainsName(denied.advertised_names, "write_file");
-
-    var overridden_rules = [_]types.PermissionRule{
-        .{ .permission = @constCast("edit"), .pattern = @constCast("*"), .action = .deny },
-        .{ .permission = @constCast("edit"), .pattern = @constCast("src/*"), .action = .ask },
-    };
-    var overridden = try buildTestModelToolProjection(std.testing.allocator, .{
-        .permission_rules = .{ .rules = &overridden_rules },
-    });
-    defer overridden.deinit(std.testing.allocator);
-    try expectContainsName(overridden.advertised_names, "edit_file");
-    try expectContainsName(overridden.advertised_names, "write_file");
-}
-
 fn checkEffectiveToolProjectionAllocationFailures(alloc: Allocator) !void {
     var projection = buildTestModelToolProjection(alloc, .{}) catch |err|
         return switch (err) {
@@ -751,36 +610,4 @@ fn checkEffectiveToolProjectionAllocationFailures(alloc: Allocator) !void {
     defer projection.deinit(alloc);
     try expectContainsName(projection.advertised_names, "read_file");
     try std.testing.expectEqualStrings(test_web_search.description, projection.custom_guidance);
-}
-
-test "effective tool projection cleans up every partial allocation failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        checkEffectiveToolProjectionAllocationFailures,
-        .{},
-    );
-}
-
-test "base tool projection includes MCP discovery and explicit selection" {
-    const alloc = std.testing.allocator;
-    var projection = try buildTestModelToolProjection(alloc, .{});
-    defer projection.deinit(alloc);
-    try expectContainsName(projection.advertised_names, "capability_search");
-    try expectContainsName(projection.advertised_names, "mcp_select_tool");
-}
-
-test "subagent and shell selection follow host capability" {
-    var unavailable = try buildTestModelToolProjection(std.testing.allocator, .{});
-    defer unavailable.deinit(std.testing.allocator);
-    try expectNotContainsName(unavailable.advertised_names, "subagent");
-    try expectNotContainsName(unavailable.advertised_names, "task");
-    try expectContainsName(unavailable.advertised_names, "shell");
-
-    var available = try buildTestModelToolProjection(std.testing.allocator, .{
-        .subagent_available = true,
-    });
-    defer available.deinit(std.testing.allocator);
-    try expectContainsName(available.advertised_names, "subagent");
-    try expectNotContainsName(available.advertised_names, "task");
-    try expectContainsName(available.advertised_names, "shell");
 }

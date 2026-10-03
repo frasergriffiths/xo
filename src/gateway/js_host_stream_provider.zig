@@ -1,6 +1,9 @@
+const std = @import("std");
 const stream_provider = @import("../core/agent/stream_provider.zig");
+const codec = @import("chat_completions_protocol.zig");
 const host_stream_provider = @import("host_stream_provider.zig");
-const builtin_gateway = @import("../builtins/gateway.zig");
+const model_provider = @import("../core/config/model_provider.zig");
+const openrouter = @import("openrouter.zig");
 
 extern "fx" fn fx_http_stream_open(
     method_ptr: [*]const u8,
@@ -16,7 +19,20 @@ extern "fx" fn fx_http_stream_status(handle: i32, status_out: *u16) i32;
 extern "fx" fn fx_http_stream_next(handle: i32, out_ptr: [*]u8, out_cap: usize) i32;
 extern "fx" fn fx_http_stream_close(handle: i32) void;
 
-const provider_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, .{ .resolve = builtin_gateway.agentChatUrl }, .{
+const provider_identity: model_provider.ProviderId = .openrouter;
+
+fn buildRequest(alloc: std.mem.Allocator, request: stream_provider.RequestData) anyerror![]u8 {
+    return codec.build_request(alloc, request, .{
+        .tool_choice_mode = openrouter.definition.tool_choice_mode,
+        .provider = &provider_identity,
+        .upstream_routing = .{
+            .order = request.provider_options.provider_order,
+            .allow_fallback = !request.provider_options.provider_strict,
+        },
+    });
+}
+
+const provider_context = host_stream_provider.initContext(buildRequest, .{ .fixed = openrouter.chat_url }, .{
     .context = null,
     .open_fn = open,
     .status_fn = status,

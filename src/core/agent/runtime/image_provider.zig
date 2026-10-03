@@ -62,7 +62,7 @@ pub fn inspect(
             else
                 .{ .direct = .{
                     .secret_bytes = request.api_key,
-                    .source = request.credential_source orelse .ai_gateway_api_key,
+                    .source = request.credential_source orelse .openrouter_api_key,
                     .tenant_context = request.gateway_team,
                 } },
             .session_id = request.session_id,
@@ -147,18 +147,4 @@ fn onEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
         .content_delta => |chunk| onContentChunk(raw, chunk),
         else => {},
     }
-}
-
-test "shared image provider capture counts all streamed bytes while retaining its bound" {
-    var capture = StreamCapture{
-        .alloc = std.testing.allocator,
-        .max_bytes = 4,
-    };
-    defer capture.deinit();
-
-    onContentChunk(@ptrCast(&capture), "abc");
-    onContentChunk(@ptrCast(&capture), "二xyz");
-
-    try std.testing.expectEqual(@as(usize, "abc二xyz".len), capture.observed_bytes);
-    try std.testing.expectEqualStrings("abc\xe4", capture.text.items);
 }

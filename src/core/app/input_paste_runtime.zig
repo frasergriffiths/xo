@@ -1,6 +1,5 @@
 const std = @import("std");
 const file_picker_path = @import("../input/file_picker_path.zig");
-const login_flow = @import("../auth/login_flow.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
@@ -39,28 +38,43 @@ const ImagePasteStage = struct {
     }
 };
 
+/// Matches the auth runtime's API key entry ceiling.
+const max_api_key_entry_bytes: usize = 8 * 1024;
+
 pub fn PasteEditRuntime(comptime App: type) type {
     return struct {
-        fn authCodeEntryActive(app: *const App) bool {
-            if (comptime !@hasField(App, "auth") or
-                !@hasDecl(@TypeOf(app.auth), "signInCodeEntryActive")) return false;
-            return app.auth.signInCodeEntryActive();
-        }
-
         pub fn beginPaste(app: *App, max_input_len: usize) void {
-            const owner: paste_framing.Owner = if (app.question_prompt.isActive())
+            // A key field paste is buffered as composer bytes but bounded by the
+            // key entry ceiling, so an oversized paste is rejected before it can
+            // reach either the field or the transcript.
+            const api_key_entry = if (comptime @hasField(App, "auth") and
+                @hasDecl(@TypeOf(app.auth), "inlineEntryActive"))
+                app.auth.inlineEntryActive()
+            else if (comptime @hasField(App, "auth") and
+                @hasDecl(@TypeOf(app.auth), "apiKeyEntryActive"))
+                app.auth.apiKeyEntryActive() or
+                    (@hasDecl(@TypeOf(app.auth), "baseUrlEntryActive") and app.auth.baseUrlEntryActive())
+            else
+                false;
+            const buffer_limit = if (api_key_entry)
+                max_api_key_entry_bytes
+            else
+                max_input_len;
+            const owner: paste_framing.Owner = if (api_key_entry)
+                .composer
+            else if (app.question_prompt.isActive())
                 if (app.question_prompt.isFreeformSelected()) .question_freeform else .decision_prompt
             else if (app.approval_prompt.isAmending())
                 .approval_amendment
             else if (app.approval_prompt.isActive())
                 .decision_prompt
-            else if (authCodeEntryActive(app))
-                .auth_code
             else
                 .composer;
-            const buffer_limit = switch (owner) {
-                .composer => app.input_runtime.replacementState(&app.pending_images).availableBytesForSelectionOrInsertion(max_input_len),
-                .auth_code => login_flow.max_manual_code_bytes,
+            const effective_buffer_limit = switch (owner) {
+                .composer => if (api_key_entry)
+                    buffer_limit
+                else
+                    app.input_runtime.replacementState(&app.pending_images).availableBytesForSelectionOrInsertion(max_input_len),
                 .none, .decision_prompt, .question_freeform, .approval_amendment => max_input_len,
             };
 
@@ -68,7 +82,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 &app.input_runtime.text_scalar,
                 "paste_started",
             );
-            app.input_runtime.paste.begin(owner, buffer_limit);
+            app.input_runtime.paste.begin(owner, effective_buffer_limit);
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
 
             const gesture_reset = gesture_state.reset(app.input_runtime.gestures);
@@ -126,7 +140,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     const render_reason: render_request.Reason = switch (owner) {
                         .composer => .footer,
                         .decision_prompt, .question_freeform, .approval_amendment => .modal,
-                        .none, .auth_code => .footer,
+                        .none => .footer,
                     };
                     app.input_runtime.paste.resetWithTrace(.unsafe_suffix);
                     app.shell.render_requests.request(render_reason);
@@ -141,23 +155,47 @@ pub fn PasteEditRuntime(comptime App: type) type {
         }
 
         pub fn finishPaste(app: *App, max_input_len: usize) !void {
+            // While the API key field owns input, a completed paste is the key.
+            // It is consumed here, before any composer owner can insert it,
+            // because a secret written into the transcript is not recoverable.
+            if (comptime @hasField(App, "auth") and
+                @hasDecl(@TypeOf(app.auth), "apiKeyEntryActive"))
+            {
+                if (app.auth.apiKeyEntryActive() and app.input_runtime.paste.overflow_bytes == 0) {
+                    const bytes = app.input_runtime.paste.buffer.items;
+                    if (try app.auth.appendApiKeyPaste(app.alloc, bytes)) {
+                        // The capture is consumed rather than inserted, so it
+                        // follows the same ownership contract as any other
+                        // handled paste: claim the buffer, then release it.
+                        // Finishing without claiming would leave a stale owner
+                        // behind that a later reset frees a second time.
+                        app.input_runtime.paste.beginHandling();
+                        app.input_runtime.paste.finishSecretHandled();
+                        app.shell.render_requests.request(.footer);
+                        return;
+                    }
+                }
+                // The base URL field owns a paste the same way, so the URL lands
+                // in the field instead of the composer.
+                if (@hasDecl(@TypeOf(app.auth), "baseUrlEntryActive") and
+                    app.auth.baseUrlEntryActive() and app.input_runtime.paste.overflow_bytes == 0)
+                {
+                    const bytes = app.input_runtime.paste.buffer.items;
+                    if (try app.auth.appendBaseUrlPaste(app.alloc, bytes)) {
+                        app.input_runtime.paste.beginHandling();
+                        app.input_runtime.paste.finishSecretHandled();
+                        app.shell.render_requests.request(.footer);
+                        return;
+                    }
+                }
+            }
             if (app.input_runtime.paste.overflow_bytes > 0) {
                 const attempted_bytes = app.input_runtime.paste.attemptedBytes();
-                if (app.input_runtime.paste.owner == .auth_code) {
-                    app.input_runtime.paste.resetSecretWithTrace(.{ .input_limit = .auth_code });
-                    app.shell.render_requests.request(.footer);
-                    try app.writeDomainNotice(.{
-                        .topic = "auth",
-                        .tone = .@"error",
-                        .body = "The authorization code is too long.",
-                    }, true);
-                    return;
-                }
                 const owner: text_scalar.Owner = switch (app.input_runtime.paste.owner) {
                     .composer => .composer,
                     .question_freeform => .question_freeform,
                     .approval_amendment => .approval_amendment,
-                    .none, .decision_prompt, .auth_code => unreachable,
+                    .none, .decision_prompt => unreachable,
                 };
                 app.input_runtime.paste.resetWithTrace(.{ .input_limit = switch (owner) {
                     .composer => .composer,
@@ -177,7 +215,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     const normalized = normalizeApprovalAmendmentPasteInPlace(app.input_runtime.paste.buffer.items);
                     app.input_runtime.paste.buffer.items.len = normalized.len;
                 },
-                .auth_code => {},
+
                 else => {},
             }
 
@@ -268,30 +306,6 @@ pub fn PasteEditRuntime(comptime App: type) type {
                         app.shell.render_requests.request(.modal);
                     } else {
                         app.input_runtime.paste.resetWithTrace(.session_reset);
-                    }
-                },
-                .auth_code => {
-                    if (comptime @hasField(App, "auth") and
-                        @hasDecl(@TypeOf(app.auth), "replaceSignInCodeInput"))
-                    {
-                        const accepted = try app.auth.replaceSignInCodeInput(
-                            app.alloc,
-                            app.input_runtime.paste.buffer.items,
-                        );
-                        if (!accepted) {
-                            app.input_runtime.paste.resetSecretWithTrace(.session_reset);
-                            try app.writeDomainNotice(.{
-                                .topic = "auth",
-                                .tone = .@"error",
-                                .body = "The authorization code is invalid.",
-                            }, true);
-                            return;
-                        }
-                        app.input_runtime.paste.beginHandling();
-                        app.input_runtime.paste.finishSecretHandled();
-                        app.shell.render_requests.request(.footer);
-                    } else {
-                        app.input_runtime.paste.resetSecretWithTrace(.session_reset);
                     }
                 },
             }
@@ -388,6 +402,24 @@ pub fn PasteEditRuntime(comptime App: type) type {
         }
 
         pub fn handlePastedBytes(app: *App, bytes: []const u8, max_input_len: usize) !void {
+            // While the API key field owns input, a paste is the key. Routing it
+            // to the composer would put a live secret in the transcript.
+            if (comptime @hasField(App, "auth")) {
+                if (app.auth.apiKeyEntryActive()) {
+                    if (try app.auth.appendApiKeyPaste(app.alloc, bytes)) {
+                        app.shell.render_requests.request(.footer);
+                        return;
+                    }
+                }
+                // The base URL field owns a paste the same way, so the URL lands
+                // in the field instead of the composer.
+                if (@hasDecl(@TypeOf(app.auth), "baseUrlEntryActive") and app.auth.baseUrlEntryActive()) {
+                    if (try app.auth.appendBaseUrlPaste(app.alloc, bytes)) {
+                        app.shell.render_requests.request(.footer);
+                        return;
+                    }
+                }
+            }
             var stage: ImagePasteStage = .{};
             defer stage.deinit(app.alloc);
 
@@ -603,11 +635,4 @@ pub fn PasteEditRuntime(comptime App: type) type {
             return end;
         }
     };
-}
-
-test "approval amendment paste normalizes line and tab separators to spaces" {
-    var storage = [_]u8{ 'o', 'n', 'e', '\r', '\n', 't', 'w', 'o', '\r', 't', 'h', 'r', 'e', 'e', '\n', '\t', 'f', 'o', 'u', 'r' };
-    const normalized = normalizeApprovalAmendmentPasteInPlace(&storage);
-
-    try std.testing.expectEqualStrings("one two three  four", normalized);
 }

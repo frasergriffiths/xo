@@ -38,16 +38,10 @@ from scripts.pgso.pipeline import (
     verify_candidate,
 )
 from scripts.pgso.qualify import (
-    BENCHMARK_PLANS,
     STARTUP_COMMANDS,
     STARTUP_MINIMUM_SAMPLES,
-    BenchmarkPair,
-    build_profile_linked_benchmarks,
-    measure_heavy_workloads,
     measure_startup,
     measurement_payload,
-    profile_linked_benchmark_evidence,
-    relink_profile_linked_benchmarks,
     require_measurements_passed,
 )
 from scripts.pgso.runner import cancellation_guard, run_checked
@@ -301,17 +295,12 @@ def aggregate_measurement_shards(
     expected_names: Sequence[str],
     expected_identity: BuildIdentity,
     expected_artifact_sha256: str,
-    expected_profile_linkage: Mapping[str, Mapping[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     if not documents:
         raise PgsoError(f"no {phase} measurement evidence found")
     expected = tuple(expected_names)
     if len(expected) != len(set(expected)):
         raise PgsoError(f"expected {phase} measurements contain duplicates")
-    if expected_profile_linkage is not None and set(expected_profile_linkage) != set(
-        expected
-    ):
-        raise PgsoError(f"expected {phase} profile linkage is incomplete")
     measurements: dict[str, Mapping[str, object]] = {}
     shard_ids: set[str] = set()
     for raw_document in documents:
@@ -365,13 +354,6 @@ def aggregate_measurement_shards(
         )
         if comparison.get("passed") is not True:
             raise PgsoError(f"{phase} measurement comparison failed: {name}")
-        if expected_profile_linkage is not None:
-            linkage = _mapping(
-                document.get("profile_linkage"),
-                f"{phase} profile linkage",
-            )
-            if dict(linkage) != dict(expected_profile_linkage[name]):
-                raise PgsoError(f"{phase} profile linkage mismatch: {name}")
         measurements[name] = measurement
 
     missing = sorted(set(expected) - set(measurements))
@@ -577,131 +559,7 @@ def _load_candidate(
     _require_hash(paths.control_binary, control.get("sha256"), "control binary")
     profile = _mapping(evidence.get("profile"), "candidate profile evidence")
     _require_hash(paths.merged_profile, profile.get("sha256"), "production profile")
-    _load_prebuilt_benchmark_pairs(paths, evidence)
     return paths, evidence, identity, candidate_hash
-
-
-def _load_prebuilt_benchmark_pairs(
-    candidate_paths: PipelinePaths,
-    candidate_evidence: Mapping[str, object],
-) -> dict[str, BenchmarkPair]:
-    profile = _mapping(
-        candidate_evidence.get("profile"),
-        "candidate profile evidence",
-    )
-    supplements = _mapping(
-        profile.get("supplements"),
-        "candidate profile supplements",
-    )
-    pairs: dict[str, BenchmarkPair] = {}
-    for plan in BENCHMARK_PLANS:
-        evidence = _mapping(
-            supplements.get(plan.selector),
-            f"{plan.selector} profile supplement",
-        )
-        if evidence.get("profile_module") != plan.profile_module:
-            raise PgsoError(
-                f"benchmark profile module mismatch: {plan.selector}"
-            )
-        function_modes = _mapping(
-            evidence.get("functions"),
-            f"{plan.selector} supplement functions",
-        )
-        if not function_modes or any(
-            mode not in ("speed", "optimized_away")
-            for mode in function_modes.values()
-        ):
-            raise PgsoError(
-                f"benchmark profile functions are invalid: {plan.selector}"
-            )
-        benchmark_modes = _mapping(
-            evidence.get("benchmark_functions"),
-            f"{plan.selector} benchmark function modes",
-        )
-        if set(benchmark_modes) != set(function_modes) or any(
-            mode not in ("speed", "optimized_away")
-            for mode in benchmark_modes.values()
-        ):
-            raise PgsoError(
-                f"benchmark candidate functions are invalid: {plan.selector}"
-            )
-        pair_paths = PipelinePaths.open(
-            candidate_paths.root / "heavy" / plan.selector,
-            selector=plan.selector,
-        )
-        control_binary = (
-            pair_paths.root / "external-control" / plan.profile_module
-        )
-        _require_hash(
-            control_binary,
-            evidence.get("control_sha256"),
-            f"{plan.selector} benchmark control",
-        )
-        _require_hash(
-            pair_paths.candidate_binary,
-            evidence.get("candidate_sha256"),
-            f"{plan.selector} benchmark candidate",
-        )
-        _require_hash(
-            pair_paths.merged_profile,
-            evidence.get("benchmark_profile_sha256"),
-            f"{plan.selector} benchmark profile",
-        )
-        candidate_profile = pair_paths.profiles / "production.profdata"
-        _require_hash(
-            candidate_profile,
-            evidence.get("candidate_profile_sha256"),
-            f"{plan.selector} candidate profile",
-        )
-        mapped_profile_text = pair_paths.profiles / "production.proftext"
-        _require_hash(
-            mapped_profile_text,
-            evidence.get("mapped_profile_sha256"),
-            f"{plan.selector} mapped profile",
-        )
-        supplement_path = (
-            candidate_paths.profiles
-            / "supplements"
-            / f"{plan.selector}.proftext"
-        )
-        _require_hash(
-            supplement_path,
-            evidence.get("supplement_sha256"),
-            f"{plan.selector} profile supplement",
-        )
-        bitcode_sha256 = evidence.get("bitcode_sha256")
-        merged_raw_profiles = evidence.get("merged_raw_profiles")
-        if not isinstance(bitcode_sha256, str) or not isinstance(
-            merged_raw_profiles,
-            int,
-        ):
-            raise PgsoError(
-                f"benchmark profile identity is invalid: {plan.selector}"
-            )
-        mapped_functions = evidence.get("mapped_compatible_functions")
-        mapped_counter_total = evidence.get("mapped_counter_total")
-        if (
-            isinstance(mapped_functions, bool)
-            or not isinstance(mapped_functions, int)
-            or mapped_functions <= 0
-            or isinstance(mapped_counter_total, bool)
-            or not isinstance(mapped_counter_total, int)
-            or mapped_counter_total <= 0
-        ):
-            raise PgsoError(
-                f"mapped benchmark evidence is invalid: {plan.selector}"
-            )
-        pairs[plan.selector] = BenchmarkPair(
-            selector=plan.selector,
-            control_binary=control_binary,
-            candidate_binary=pair_paths.candidate_binary,
-            bitcode_sha256=bitcode_sha256,
-            merged_raw_profiles=merged_raw_profiles,
-            merged_profile=pair_paths.merged_profile,
-            profile_use_ir=pair_paths.profile_use_ir,
-            candidate_profile=candidate_profile,
-        )
-    return pairs
 
 
 def _artifact_document_paths(
@@ -754,14 +612,6 @@ def _load_documents(
 def run_plan(phase: str, corpus_path: pathlib.Path, maximum_shards: int) -> dict[str, object]:
     if phase == "startup":
         return {"include": [{"name": name} for name, _argv in STARTUP_COMMANDS]}
-    if phase == "heavy":
-        return {
-            "include": [
-                {"name": workload.name}
-                for plan in BENCHMARK_PLANS
-                for workload in plan.workloads
-            ]
-        }
     corpus = load_corpus(corpus_path, repo_root=REPO_ROOT)
     if phase == "training":
         scenarios = corpus.scenarios
@@ -877,12 +727,6 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
     if merged_count != len(documents):
         raise PgsoError("distributed profile merge count mismatch")
 
-    linked_benchmarks = build_profile_linked_benchmarks(
-        toolchain,
-        REPO_ROOT,
-        paths,
-    )
-
     spec = ArtifactSpec(
         repo_root=REPO_ROOT,
         target=identity.target,
@@ -891,11 +735,6 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
     emit_bitcode(toolchain, spec, paths, expected_sha256=identity.bitcode_sha256)
     apply_profile(toolchain, paths, identity.bitcode_sha256)
     link_candidate(toolchain, paths)
-    linked_benchmarks = relink_profile_linked_benchmarks(
-        toolchain,
-        paths,
-        linked_benchmarks,
-    )
     control = _mapping(seed_evidence.get("control"), "seed control evidence")
     minimum_macos = control.get("minimum_macos")
     if not isinstance(minimum_macos, str):
@@ -926,20 +765,11 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
         instrumented.get("smoke_profile"),
         "seed smoke profile evidence",
     )
-    production_ir = paths.profile_use_ir.read_text(
-        encoding="utf-8",
-        errors="replace",
-    )
-    supplement_evidence = profile_linked_benchmark_evidence(
-        linked_benchmarks,
-        production_ir,
-    )
     profile = {
         "sha256": sha256_file(paths.merged_profile),
         "size_bytes": paths.merged_profile.stat().st_size,
         "merged_raw_profiles": int(training["merged_raw_profiles"])
         + int(smoke_profile.get("merged_raw_profiles", 0)),
-        "supplements": supplement_evidence,
     }
     payload = {
         "schema_version": 1,
@@ -1021,42 +851,23 @@ def run_measurement_shard(arguments: argparse.Namespace) -> pathlib.Path:
         corpus,
         log_dir,
     )
-    hyperfine: pathlib.Path | None = None
-    if arguments.kind in ("startup", "heavy"):
-        hyperfine = _require_version(
-            arguments.hyperfine,
-            f"hyperfine {REQUIRED_HYPERFINE_VERSION}",
-            "Hyperfine",
-            log_dir / "hyperfine-version.json",
-        )
-    if arguments.kind == "startup":
-        results = measure_startup(
-            repo_root=REPO_ROOT,
-            control_binary=candidate_paths.control_binary,
-            candidate_binary=candidate_paths.candidate_binary,
-            hyperfine_binary=hyperfine,
-            output_dir=output / "measurements",
-            samples=arguments.samples,
-            timeout_s=arguments.timeout_seconds,
-            command_names=(arguments.name,),
-        )
-        phase = "startup"
-    else:
-        benchmark_pairs = _load_prebuilt_benchmark_pairs(
-            candidate_paths,
-            _evidence,
-        )
-        results = measure_heavy_workloads(
-            toolchain=None,
-            repo_root=REPO_ROOT,
-            output_dir=output / "measurements",
-            samples=arguments.samples,
-            timeout_s=arguments.timeout_seconds,
-            workload_names=(arguments.name,),
-            prebuilt_pairs=benchmark_pairs,
-            hyperfine_binary=hyperfine,
-        )
-        phase = "heavy"
+    hyperfine = _require_version(
+        arguments.hyperfine,
+        f"hyperfine {REQUIRED_HYPERFINE_VERSION}",
+        "Hyperfine",
+        log_dir / "hyperfine-version.json",
+    )
+    results = measure_startup(
+        repo_root=REPO_ROOT,
+        control_binary=candidate_paths.control_binary,
+        candidate_binary=candidate_paths.candidate_binary,
+        hyperfine_binary=hyperfine,
+        output_dir=output / "measurements",
+        samples=arguments.samples,
+        timeout_s=arguments.timeout_seconds,
+        command_names=(arguments.name,),
+    )
+    phase = "startup"
     if len(results) != 1:
         raise PgsoError(f"{phase} shard produced {len(results)} measurements")
     payload = {
@@ -1068,40 +879,6 @@ def run_measurement_shard(arguments: argparse.Namespace) -> pathlib.Path:
         "artifact_sha256": candidate_hash,
         "measurement": measurement_payload(results)[0],
     }
-    if phase == "heavy":
-        profile = _mapping(
-            _evidence.get("profile"),
-            "candidate profile evidence",
-        )
-        supplements = _mapping(
-            profile.get("supplements"),
-            "candidate profile supplements",
-        )
-        plan = next(
-            plan
-            for plan in BENCHMARK_PLANS
-            if any(workload.name == arguments.name for workload in plan.workloads)
-        )
-        supplement = _mapping(
-            supplements.get(plan.selector),
-            f"{plan.selector} profile supplement",
-        )
-        payload["profile_linkage"] = {
-            "production_profile_sha256": profile.get("sha256"),
-            "benchmark_profile_sha256": supplement.get(
-                "benchmark_profile_sha256"
-            ),
-            "candidate_profile_sha256": supplement.get(
-                "candidate_profile_sha256"
-            ),
-            "mapped_profile_sha256": supplement.get(
-                "mapped_profile_sha256"
-            ),
-            "benchmark_control_sha256": supplement.get("control_sha256"),
-            "benchmark_candidate_sha256": supplement.get("candidate_sha256"),
-            "supplement_sha256": supplement.get("supplement_sha256"),
-            "selector": plan.selector,
-        }
     manifest_path = output / "manifest.json"
     _write_json(manifest_path, payload)
     require_measurements_passed(phase, results)
@@ -1131,50 +908,9 @@ def run_aggregate(arguments: argparse.Namespace) -> pathlib.Path:
         expected_identity=identity,
         expected_artifact_sha256=candidate_hash,
     )
-    heavy_names = tuple(
-        workload.name
-        for plan in BENCHMARK_PLANS
-        for workload in plan.workloads
-    )
     profile = _mapping(
         candidate_evidence.get("profile"),
         "candidate profile evidence",
-    )
-    supplements = _mapping(
-        profile.get("supplements"),
-        "candidate profile supplements",
-    )
-    heavy_profile_linkage: dict[str, Mapping[str, object]] = {}
-    for plan in BENCHMARK_PLANS:
-        supplement = _mapping(
-            supplements.get(plan.selector),
-            f"{plan.selector} profile supplement",
-        )
-        linkage = {
-            "production_profile_sha256": profile.get("sha256"),
-            "benchmark_profile_sha256": supplement.get(
-                "benchmark_profile_sha256"
-            ),
-            "candidate_profile_sha256": supplement.get(
-                "candidate_profile_sha256"
-            ),
-            "mapped_profile_sha256": supplement.get(
-                "mapped_profile_sha256"
-            ),
-            "benchmark_control_sha256": supplement.get("control_sha256"),
-            "benchmark_candidate_sha256": supplement.get("candidate_sha256"),
-            "supplement_sha256": supplement.get("supplement_sha256"),
-            "selector": plan.selector,
-        }
-        for workload in plan.workloads:
-            heavy_profile_linkage[workload.name] = linkage
-    heavy = aggregate_measurement_shards(
-        _load_documents(arguments.heavy_dir),
-        phase="heavy",
-        expected_names=heavy_names,
-        expected_identity=identity,
-        expected_artifact_sha256=candidate_hash,
-        expected_profile_linkage=heavy_profile_linkage,
     )
     training = candidate_evidence.get("training")
     if not isinstance(training, dict):
@@ -1204,7 +940,6 @@ def run_aggregate(arguments: argparse.Namespace) -> pathlib.Path:
                 "candidate": behavior,
             },
             "startup": startup,
-            "heavy_workloads": heavy,
         },
     }
     manifest_path = output / "manifest.json"
@@ -1224,7 +959,7 @@ def _parser() -> argparse.ArgumentParser:
     _add_common(plan)
     plan.add_argument(
         "--phase",
-        choices=("training", "behavior", "startup", "heavy"),
+        choices=("training", "behavior", "startup"),
         required=True,
     )
     plan.add_argument("--maximum-shards", type=int, default=20)
@@ -1259,7 +994,6 @@ def _parser() -> argparse.ArgumentParser:
     _add_common(measurement)
     measurement.add_argument("--candidate-dir", required=True, type=pathlib.Path)
     measurement.add_argument("--output-dir", required=True, type=pathlib.Path)
-    measurement.add_argument("--kind", choices=("startup", "heavy"), required=True)
     measurement.add_argument("--name", required=True)
     measurement.add_argument("--hyperfine", default="hyperfine")
     measurement.add_argument("--samples", type=int, default=50)
@@ -1270,7 +1004,6 @@ def _parser() -> argparse.ArgumentParser:
     aggregate.add_argument("--candidate-dir", required=True, type=pathlib.Path)
     aggregate.add_argument("--behavior-dir", required=True, type=pathlib.Path)
     aggregate.add_argument("--startup-dir", required=True, type=pathlib.Path)
-    aggregate.add_argument("--heavy-dir", required=True, type=pathlib.Path)
     aggregate.add_argument("--output-dir", required=True, type=pathlib.Path)
     return parser
 

@@ -5,7 +5,6 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFxAgent } from "../node.js";
 import { createFxAgent as createSharedAgent } from "../fx-sdk.js";
-import { createMcpAdapter } from "../mcp.js";
 import { createSkillsAdapter } from "../skills.js";
 
 const maxInstructionsBytes = 65_536;
@@ -51,22 +50,6 @@ const skillAdapter = createSkillsAdapter([{ name: "limit", instructions: skillBo
 assert.equal(encoder.encode(skillAdapter.instructions).length, maxInstructionsBytes);
 assert.throws(
   () => createSkillsAdapter([{ name: "limit", instructions: `${skillBody}s` }]),
-  (error) => error instanceof RangeError && error.message.includes("65536"),
-);
-
-const mcpPrefix = "<mcp_resource>\n";
-const mcpSuffix = "\n</mcp_resource>";
-const mcpBody = "m".repeat(maxInstructionsBytes - encoder.encode(mcpPrefix + mcpSuffix).length);
-const mcpClient = {
-  async listTools() { return []; },
-  async callTool() { throw new Error("unused"); },
-  async readResource() { return { contents: [{ type: "text", text: mcpBody }] }; },
-};
-const mcpAdapter = await createMcpAdapter(mcpClient, { resources: ["memory://limit"] });
-assert.equal(encoder.encode(mcpAdapter.instructions).length, maxInstructionsBytes);
-mcpClient.readResource = async () => ({ contents: [{ type: "text", text: `${mcpBody}m` }] });
-await assert.rejects(
-  createMcpAdapter(mcpClient, { resources: ["memory://limit"] }),
   (error) => error instanceof RangeError && error.message.includes("65536"),
 );
 

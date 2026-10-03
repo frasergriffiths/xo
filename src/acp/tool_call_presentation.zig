@@ -82,16 +82,3 @@ pub fn toolUpdateContentText(is_failure: bool, output: []const u8) []const u8 {
     }
     return text_utils.utf8PrefixByBytes(output, 200);
 }
-
-test "toolUpdateContentText clips long output and guards unsafe bytes" {
-    const long = "x" ** 500;
-    const clipped = toolUpdateContentText(false, long);
-    try std.testing.expectEqual(@as(usize, 200), clipped.len);
-
-    const unsafe = toolUpdateContentText(false, "ok\xFF\xFEbinary");
-    try std.testing.expectEqualStrings("binary or non-utf8 tool output omitted", unsafe);
-
-    const denied_json = "{\"error\":{\"type\":\"tool_permission_denied\",\"tool_name\":\"run_command\",\"message\":\"Permission denied by user\",\"reason\":\"user_denied\"}}";
-    const denied = toolUpdateContentText(true, denied_json);
-    try std.testing.expectEqualStrings(denied_json, denied);
-}

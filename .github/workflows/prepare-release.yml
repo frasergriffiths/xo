@@ -137,7 +137,7 @@ jobs:
             -H "ai-language-model-specification-version: 4" \
             -H "ai-language-model-id: anthropic/claude-opus-4.7" \
             -H "ai-language-model-streaming: true" \
-            -H "HTTP-Referer: https://github.com/vercel-labs/fx" \
+            -H "HTTP-Referer: https://github.com/frasergriffiths/xo" \
             -H "X-Title: fx" \
             -d @/tmp/request.json -o /tmp/sse-response.txt -w '%{http_code}')
 
@@ -312,5 +312,4 @@ jobs:
           )"
 
           gh workflow run ci.yml --ref "$BRANCH"
-          gh workflow run bench.yml --ref "$BRANCH"
           gh workflow run full-ci.yml --ref "$BRANCH"

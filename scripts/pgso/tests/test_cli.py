@@ -92,7 +92,6 @@ class PgsoCliTests(unittest.TestCase):
                         "profile": {},
                         "corpus": {},
                         "startup": [],
-                        "heavy_workloads": [],
                     },
                 }
             )
@@ -153,7 +152,7 @@ class PgsoCliTests(unittest.TestCase):
         self.assertEqual("validate", payload["stage"])
         self.assertFalse(payload["eligible"])
 
-    def test_all_command_supplies_hyperfine_to_heavy_measurement(self) -> None:
+    def test_all_command_supplies_hyperfine_to_startup_measurement(self) -> None:
         @dataclasses.dataclass(frozen=True)
         class ToolchainInfo:
             host_arch: str = "arm64"
@@ -192,7 +191,7 @@ class PgsoCliTests(unittest.TestCase):
         control = self.root / "control"
         control.write_bytes(b"control")
         hyperfine = self.root / "hyperfine"
-        heavy_kwargs: list[dict[str, object]] = []
+        startup_kwargs: list[dict[str, object]] = []
 
         def merge_profile(_toolchain, _profiles, output, _log):
             output.write_bytes(b"profile")
@@ -207,13 +206,12 @@ class PgsoCliTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-        def capture_heavy(**kwargs):
-            heavy_kwargs.append(kwargs)
+        def capture_startup(**kwargs):
+            startup_kwargs.append(kwargs)
             return ()
 
         toolchain = ToolchainInfo()
         corpus = CorpusInfo(self.root / "corpus.json", "c" * 64)
-        linked: dict[str, object] = {}
         candidate = CandidateInfo("d" * 64, ArtifactInfo(), MetadataInfo())
         with mock.patch.multiple(
             "scripts.pgso.__main__",
@@ -232,15 +230,11 @@ class PgsoCliTests(unittest.TestCase):
             profile_evidence=mock.Mock(return_value={}),
             run_corpus=mock.Mock(return_value=CorpusResult()),
             _profile_summary=mock.Mock(return_value={}),
-            build_profile_linked_benchmarks=mock.Mock(return_value=linked),
             apply_profile=mock.Mock(side_effect=write_profile_use_ir),
             link_candidate=mock.Mock(side_effect=link_candidate),
-            relink_profile_linked_benchmarks=mock.Mock(return_value=linked),
             verify_candidate=mock.Mock(return_value=candidate),
-            profile_linked_benchmark_evidence=mock.Mock(return_value={}),
             run_behavior_corpus=mock.Mock(return_value=CorpusResult()),
-            measure_startup=mock.Mock(return_value=()),
-            measure_heavy_workloads=mock.Mock(side_effect=capture_heavy),
+            measure_startup=mock.Mock(side_effect=capture_startup),
         ) as mocks:
             mocks["Toolchain"].discover.return_value = toolchain
             manifest_path = run_command(arguments)
@@ -249,8 +243,8 @@ class PgsoCliTests(unittest.TestCase):
             (arguments.output_dir / "manifest.json").resolve(),
             manifest_path.resolve(),
         )
-        self.assertEqual(1, len(heavy_kwargs))
-        self.assertIs(hyperfine, heavy_kwargs[0].get("hyperfine_binary"))
+        self.assertEqual(1, len(startup_kwargs))
+        self.assertIs(hyperfine, startup_kwargs[0].get("hyperfine_binary"))
         payload = json.loads(manifest_path.read_text())
         self.assertEqual("passed", payload["status"])
         self.assertTrue(payload["eligible"])

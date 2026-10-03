@@ -31,7 +31,6 @@ const files = [
   ["sdk/fx-sdk.js", "fx-sdk.js"],
   ["sdk/wasm-module.js", "wasm-module.js"],
   ["sdk/core-output.js", "core-output.js"],
-  ["sdk/mcp.js", "mcp.js"],
   ["sdk/skills.js", "skills.js"],
   ["sdk/skills-node.js", "skills-node.js"],
   ["zig-out/bin/fx-core.wasm", "fx-core.wasm"],

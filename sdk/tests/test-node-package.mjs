@@ -35,7 +35,6 @@ try {
   assert.deepEqual(manifest.exports["./node"], { import: "./node.js", require: "./node.cjs" });
   assert.equal(manifest.exports["./browser"], "./browser.js");
   assert.equal(manifest.exports["./wasm"], "./fx-sdk.js");
-  assert.equal(manifest.exports["./mcp"], "./mcp.js");
   assert.equal(manifest.exports["./skills"], "./skills.js");
   assert.equal(manifest.exports["./skills/node"], "./skills-node.js");
 

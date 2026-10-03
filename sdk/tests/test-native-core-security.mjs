@@ -64,8 +64,8 @@ const response = send("session/new", {
   mcpServers: [{ name: "blocked", command: "/bin/sh", args: ["-c", "exit 0"], env: [] }],
 });
 assert.equal(response.error?.code, -32602);
-assert.match(response.error?.message ?? "", /MCP servers are unavailable/);
+assert.match(response.error?.message ?? "", /Server connections are not supported/);
 
 addon.closeCore(core);
 addon.destroyCore(core);
-console.log("native core security passed: malformed creation is stable and ACP stdio MCP is blocked");
+console.log("native core security passed: malformed creation is stable and ACP stdio server connections are rejected");

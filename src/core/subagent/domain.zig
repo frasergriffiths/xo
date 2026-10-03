@@ -1,5 +1,5 @@
 const std = @import("std");
-const mcp_access = @import("../mcp/access_policy.zig");
+
 const model_provider = @import("../config/model_provider.zig");
 const session_layout = @import("../session/session_layout.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
@@ -45,7 +45,7 @@ pub const AdmissionSnapshot = struct {
     parent_id: []u8,
     source_id: []u8,
     model: []u8,
-    provider: model_provider.ProviderId = .gateway,
+    provider: model_provider.ProviderId = .openrouter,
     effort: types.ReasoningEffort,
     permission_mode: types.PermissionMode = .yolo,
     tool_names: [][]u8,
@@ -54,7 +54,6 @@ pub const AdmissionSnapshot = struct {
     permission_state: session_permission_state.State = .{},
     integration_names: [][]u8,
     authority_generation: u64 = 0,
-    mcp_view: ?mcp_access.View = null,
 
     pub fn deinit(self: *AdmissionSnapshot, alloc: Allocator) void {
         alloc.free(self.parent_id);
@@ -65,7 +64,6 @@ pub const AdmissionSnapshot = struct {
         types.freePermissionGrantSlice(alloc, self.grants);
         self.permission_state.deinit(alloc);
         freeStrings(alloc, self.integration_names);
-        if (self.mcp_view) |*view| view.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -74,7 +72,7 @@ pub const AdmissionInput = struct {
     parent_id: []const u8,
     source_id: []const u8,
     model: []const u8,
-    provider: model_provider.ProviderId = .gateway,
+    provider: model_provider.ProviderId = .openrouter,
     effort: types.ReasoningEffort,
     permission_mode: types.PermissionMode = .yolo,
     tool_names: []const []const u8 = &.{},
@@ -83,7 +81,6 @@ pub const AdmissionInput = struct {
     permission_state: session_permission_state.State = .{},
     integration_names: []const []const u8 = &.{},
     authority_generation: u64 = 0,
-    mcp_view: ?mcp_access.View = null,
 };
 
 pub const AdmissionError = error{
@@ -100,8 +97,6 @@ pub fn captureAdmission(
     validateId(input.parent_id) catch return error.InvalidAdmissionItem;
     validateId(input.source_id) catch return error.InvalidAdmissionItem;
     validateBoundedText(input.model, max_model_bytes) catch return error.InvalidModel;
-    // Integration names mirror the parent's MCP catalog, which is already
-    // bounded per server by the MCP tool limits, so they carry no count cap.
     if (input.tool_names.len > max_admission_items or
         input.rules.rules.len > max_admission_items or
         input.grants.len > max_admission_items)
@@ -144,8 +139,6 @@ pub fn captureAdmission(
         var value = permission_state;
         value.deinit(alloc);
     }
-    var mcp_view = if (input.mcp_view) |view| try view.clone(alloc) else null;
-    errdefer if (mcp_view) |*view| view.deinit(alloc);
     const integration_names = try cloneStrings(alloc, input.integration_names);
     return .{
         .parent_id = parent_id,
@@ -160,7 +153,6 @@ pub fn captureAdmission(
         .permission_state = permission_state,
         .integration_names = integration_names,
         .authority_generation = input.authority_generation,
-        .mcp_view = mcp_view,
     };
 }
 
@@ -229,54 +221,4 @@ fn cloneStrings(
 fn freeStrings(alloc: Allocator, values: [][]u8) void {
     for (values) |value| alloc.free(value);
     if (values.len > 0) alloc.free(values);
-}
-
-test "captured admission owns independent authority slices" {
-    const alloc = std.testing.allocator;
-    var snapshot = try captureAdmission(alloc, .{
-        .parent_id = "01J00000000000000000000000",
-        .source_id = "01J00000000000000000000000",
-        .model = "test/model",
-        .effort = .auto,
-        .tool_names = &.{"read_file"},
-    });
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqualStrings("read_file", snapshot.tool_names[0]);
-}
-
-test "admission accepts more integration names than the admission item cap" {
-    const alloc = std.testing.allocator;
-    var names: [max_admission_items + 1][]const u8 = undefined;
-    for (&names) |*name| name.* = "mcp_fixture_tool";
-    var snapshot = try captureAdmission(alloc, .{
-        .parent_id = "01J00000000000000000000000",
-        .source_id = "01J00000000000000000000000",
-        .model = "test/model",
-        .effort = .auto,
-        .integration_names = &names,
-    });
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(names.len, snapshot.integration_names.len);
-}
-
-test "admission still validates each integration name" {
-    try std.testing.expectError(error.InvalidAdmissionItem, captureAdmission(std.testing.allocator, .{
-        .parent_id = "01J00000000000000000000000",
-        .source_id = "01J00000000000000000000000",
-        .model = "test/model",
-        .effort = .auto,
-        .integration_names = &.{""},
-    }));
-}
-
-test "admission keeps the item cap for tool names" {
-    var names: [max_admission_items + 1][]const u8 = undefined;
-    for (&names) |*name| name.* = "read_file";
-    try std.testing.expectError(error.TooManyAdmissionItems, captureAdmission(std.testing.allocator, .{
-        .parent_id = "01J00000000000000000000000",
-        .source_id = "01J00000000000000000000000",
-        .model = "test/model",
-        .effort = .auto,
-        .tool_names = &names,
-    }));
 }

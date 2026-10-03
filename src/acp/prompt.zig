@@ -27,10 +27,7 @@ const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const diff_mod = @import("../core/output/diff.zig");
 const file_mutation = @import("../core/tooling/file_mutation.zig");
 const file_mutation_contract = @import("../core/tooling/file_mutation_contract.zig");
-const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
-const mcp_model_catalog = @import("../core/mcp/model_catalog.zig");
-const mcp_elicitation = @import("../core/mcp/elicitation.zig");
-const mrtr = @import("../core/mcp/mrtr.zig");
+
 const permission_auto_classifier = @import("../core/permissions/auto_classifier.zig");
 const auto_classifier_context = @import("../core/permissions/auto_classifier_context.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
@@ -62,15 +59,15 @@ const tool_admission = @import("../core/tooling/tool_admission.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const tool_specs = @import("../core/tooling/tool_specs.zig");
 const tool_set_contract = @import("../core/tooling/tool_set.zig");
-const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
+
 const tool_presentation = @import("../core/tooling/tool_presentation.zig");
 const tool_call_presentation = @import("tool_call_presentation.zig");
 const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const tool_runtime = @import("../core/tooling/tool_runtime.zig");
 const command_output_content = @import("../core/tooling/command_output_content.zig");
 const builtin_tools = @import("../builtins/tools.zig");
-const test_builtin_gateway = if (std_builtin.is_test)
-    @import("../builtins/gateway.zig")
+const test_openrouter = if (std_builtin.is_test)
+    @import("../gateway/openrouter_test_fixtures.zig")
 else
     struct {};
 const types = @import("../core/shared/types.zig");
@@ -90,7 +87,6 @@ const PermissionGrant = types.PermissionGrant;
 const PermissionMode = types.PermissionMode;
 const ToolPermissionDecision = types.ToolPermissionDecision;
 const ToolExecutionResult = agent_runtime.ToolExecutionResult;
-const McpHasToolFn = tool_mcp_runtime.HasToolFn;
 
 pub const TerminalOutcome = union(enum) {
     stop_reason: acp_types.StopReason,
@@ -331,7 +327,6 @@ const AcpContext = struct {
             self.state.web_search_runtime.configure(.{
                 .api_key = session.api_key,
                 .credential_source = session.credential_source,
-                .gateway_team = self.state.gateway_team,
                 .worker_model = session.model,
                 .gateway_retry_count = self.state.cfg.gateway_retry_count,
                 .gateway_chat_url = self.state.cfg.gateway_chat_url,
@@ -339,7 +334,7 @@ const AcpContext = struct {
                 .usage_allocator = self.state.alloc,
             });
         }
-        var tc: tool_runtime.Context = .{
+        const tc: tool_runtime.Context = .{
             .workspace_root = self.state.workspace_root,
             .access_scope = self.state.workspace_access.scope(self.state.workspace_root),
             .ignored_list_entries = self.state.cfg.ignored_list_entries,
@@ -355,9 +350,7 @@ const AcpContext = struct {
             .account_id = session.account_id,
             .provider = session.provider,
             .provider_capabilities = provider_capabilities,
-            .oauth_transport = self.state.cfg.gateway_provider.oauth_transport,
             .secret_store = self.state.cfg.secret_store,
-            .gateway_team = self.state.gateway_team,
             .model = session.model,
             .gateway_retry_count = self.state.cfg.gateway_retry_count,
             .gateway_chat_url = self.state.cfg.gateway_chat_url,
@@ -390,8 +383,7 @@ const AcpContext = struct {
             .context_registry = self.state.cfg.context_registry,
             .output_chunk_ctx = @ptrCast(self),
             .on_output_chunk = onCommandOutputChunk,
-            .mcp_progress_ctx = @ptrCast(self),
-            .on_mcp_progress = onMcpProgress,
+
             .session_child_capability = if (session.writable) |*writable|
                 writable.childCapability() catch null
             else
@@ -420,18 +412,7 @@ const AcpContext = struct {
                 .session_id = session.session_id,
             },
         };
-        if (comptime !host_target.is_wasm) {
-            if (session.mcp != null) {
-                tc.mcp_ctx = @ptrCast(self);
-                tc.mcp_has_tool = mcpHasTool;
-                tc.mcp_validate_tool = mcpValidateTool;
-                tc.mcp_call_tool = mcpCallTool;
-                tc.mcp_search_tools = mcpSearchTools;
-                tc.mcp_tool_schema = mcpToolSchemaJson;
-                tc.mcp_snapshot_tool = mcpSnapshotTool;
-                tc.mcp_call_feature = mcpCallFeature;
-            }
-        }
+        if (comptime !host_target.is_wasm) {}
         return tc;
     }
 
@@ -540,53 +521,8 @@ fn callHostTool(
         false;
     return if (is_error) .{ .failure = owned } else .{ .success = owned };
 }
+const Osc8Link = struct { uri: []const u8, end: usize };
 
-const AcpElicitationResponderContext = struct {
-    const AcceptedLegacyUrl = struct {
-        acp_id: []u8,
-
-        fn deinit(self: *AcceptedLegacyUrl, alloc: Allocator) void {
-            alloc.free(self.acp_id);
-            self.* = undefined;
-        }
-    };
-
-    acp: *AcpContext,
-    tool_call_id: []const u8,
-    operation_cancel_flag: ?*const std.atomic.Value(bool),
-    accepted_url_ids: std.ArrayListUnmanaged([]u8) = .empty,
-    accepted_legacy_urls: std.ArrayListUnmanaged(AcceptedLegacyUrl) = .empty,
-
-    fn deinit(self: *AcpElicitationResponderContext) void {
-        for (self.accepted_url_ids.items) |id| self.acp.state.alloc.free(id);
-        self.accepted_url_ids.deinit(self.acp.state.alloc);
-        for (self.accepted_legacy_urls.items) |*accepted| {
-            server.removeLegacyUrl(self.acp.state, accepted.acp_id);
-            accepted.deinit(self.acp.state.alloc);
-        }
-        self.accepted_legacy_urls.deinit(self.acp.state.alloc);
-        self.* = undefined;
-    }
-
-    fn responder(self: *AcpElicitationResponderContext) ?tool_mcp_runtime.InputResponder {
-        const capabilities = self.acp.state.client_elicitation;
-        if (!capabilities.any()) return null;
-        return .{
-            .context = @ptrCast(self),
-            .capabilities = capabilities,
-            .callback = respondToAcpMcpInput,
-            .continuation_terminal = finishAcpUrlElicitations,
-        };
-    }
-};
-
-const Osc8Link = struct {
-    uri: []const u8,
-    end: usize,
-};
-
-/// Parses an OSC-8 hyperlink sequence (`ESC ]8;params;uri ST`) starting at
-/// `index`. An empty uri marks the end of a hyperlink span.
 fn parseOsc8Link(text: []const u8, index: usize) ?Osc8Link {
     if (!std.mem.startsWith(u8, text[index..], "\x1b]8;")) return null;
     const end = display_width.ansiSequenceEnd(text, index);
@@ -666,10 +602,8 @@ pub fn handlePrompt(
     if (!try server.selectCredentialForProvider(state, session.provider)) {
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
-            .message = if (session.provider == .codex)
-                credentials.missing_chatgpt_credential_message
-            else if (session.provider == .grok)
-                credentials.missing_grok_credential_message
+            .message = if (session.provider == .openrouter)
+                credentials.missing_credential_message
             else
                 credentials.missing_credential_message,
         } };
@@ -828,7 +762,6 @@ pub fn handlePrompt(
         .credential_source = session.credential_source,
         .account_id = if (session.account_id) |account_id| @constCast(account_id) else null,
         .provider = session.provider,
-        .gateway_team = state.gateway_team,
         .permission_mode = captured_permission_mode,
         .history = context_history,
         .unversioned_history_count = session.session_rt.unversionedHistoryEnd(),
@@ -942,7 +875,6 @@ fn maybeStartAcpTitleTask(
         .model = title_model,
         .prompt_excerpt = excerpt,
         .api_key = if (session.api_key.len > 0) session.api_key else null,
-        .gateway_team = state.gateway_team,
         .account_id = session.account_id,
         .credential_source = session.credential_source,
         .stream_provider = agent_stream,
@@ -1438,7 +1370,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
-        .snapshot_mcp_definition = snapshotMcpDefinition,
+
         .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
@@ -1512,7 +1444,6 @@ fn refreshGatewayCredential(
     alloc: Allocator,
     source: types.CredentialSource,
     mode: auth_runtime.CredentialRefreshMode,
-    expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw));
     return server.refreshModelCredential(
@@ -1520,7 +1451,7 @@ fn refreshGatewayCredential(
         alloc,
         source,
         mode,
-        expected_account_id,
+        null,
     );
 }
 
@@ -1582,7 +1513,7 @@ fn resolveModelCapabilities(
             .access = credentials.catalogAccessForCredentialAndAccount(
                 session.credential_source,
                 session.api_key,
-                ctx.state.gateway_team,
+                null,
                 session.account_id,
             ),
             .endpoint = ctx.state.cfg.gateway_models_path,
@@ -1612,7 +1543,7 @@ fn resolveModelOverride(
             .access = credentials.catalogAccessForCredentialAndAccount(
                 session.credential_source,
                 session.api_key,
-                ctx.state.gateway_team,
+                null,
                 session.account_id,
             ),
             .endpoint = ctx.state.cfg.gateway_models_path,
@@ -1668,26 +1599,6 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?
     try ctx.state.cfg.context_registry.appendDefaultStatic(.{
         .project_context = project_context orelse ctx.modelVisibleProjectContext(),
     }, arena, messages);
-    if (ctx.state.cfg.minimal_kernel) return;
-    const active_session = if (ctx.state.active_session) |*session| session else null;
-    var snapshot = if (active_session) |session|
-        if (session.mcp) |mcp|
-            try mcp.snapshotModelCatalog(arena, session.permission_rules, false)
-        else
-            try mcp_model_catalog.Snapshot.empty(arena)
-    else
-        try mcp_model_catalog.Snapshot.empty(arena);
-    defer snapshot.deinit(arena);
-    const section = try mcp_model_catalog.render(arena, snapshot);
-    if (section.text.len > 0) {
-        try messages.append(arena, .{ .role = .system, .content = section.text });
-    }
-    if (section.notice) |notice| try pushContextNotice(raw_ctx, notice);
-}
-
-fn snapshotMcpDefinition(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    return tool_runtime.snapshotMcpDefinition(ctx.toolContext(), arena, name, known);
 }
 
 fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
@@ -1738,11 +1649,10 @@ fn requestToolPermissionOutcome(raw_ctx: *anyopaque, arena: Allocator, call: Too
     );
 }
 
-fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) !command_admission.PermissionOutcome {
+fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     var tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(ctx.toolContext(), advertised_dynamic_tool_names);
     tool_ctx.permission_review_turn = review_turn;
-    tool_ctx.mcp_review_schema_json = mcp_review_schema_json;
     const admission = tool_ctx.admissionInputWithLiveAuthority(live_authority);
     return if (revalidation) |request| switch (request) {
         .action => |action| tool_admission.revalidateLiveActionPermissionOutcome(
@@ -1862,13 +1772,12 @@ fn writePermissionOption(
     try writer.writeByte('}');
 }
 
-fn describeToolAction(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+fn describeToolAction(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     return tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
         .call = call,
         .display_target = display_target,
-        .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
     });
 }
 
@@ -1884,39 +1793,25 @@ fn resolveToolActionDisplayTarget(raw_ctx: *anyopaque, arena: Allocator, call: T
     );
 }
 
-fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     if (try tool_presentation.formatSubagentPlainAction(arena, call, .completed)) |line| return line;
     return tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
         .call = call,
         .display_target = display_target,
-        .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
     });
 }
 
-fn describeToolActionDenied(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+fn describeToolActionDenied(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     if (try tool_presentation.formatSubagentPlainAction(arena, call, .{ .stopped = label })) |line| return line;
     const action = try tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
         .call = call,
         .display_target = display_target,
-        .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
     });
     return std.fmt.allocPrint(arena, "{s}: {s}", .{ label, action });
-}
-
-fn lifecycleDynamicMcpToolAvailable(ctx: *AcpContext, name: []const u8, advertised_dynamic_tool_names: []const []const u8) bool {
-    if (comptime host_target.is_wasm) return false;
-    return dynamicMcpToolAvailable(ctx.toolRegistry(), name, advertised_dynamic_tool_names, @ptrCast(ctx), mcpHasTool, .unrestricted);
-}
-
-fn dynamicMcpToolAvailable(registry: tool_dispatch.Registry, name: []const u8, advertised_dynamic_tool_names: []const []const u8, mcp_ctx: ?*anyopaque, has_tool: ?McpHasToolFn, access: tool_mcp_runtime.Access) bool {
-    if (!tool_presentation.isAdvertisedDynamicMcpName(registry, name, advertised_dynamic_tool_names)) return false;
-    const raw_ctx = mcp_ctx orelse return false;
-    const has = has_tool orelse return false;
-    return has(raw_ctx, name, access);
 }
 
 fn permissionTargetForCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
@@ -1938,13 +1833,6 @@ fn executeToolCall(
     ctx.sendToolCallProgressText(acp_id, null) catch {};
 
     var tool_ctx = ctx.toolContext();
-    var elicitation_responder = AcpElicitationResponderContext{
-        .acp = ctx,
-        .tool_call_id = acp_id,
-        .operation_cancel_flag = tool_ctx.cancel_flag,
-    };
-    defer elicitation_responder.deinit();
-    tool_ctx.mcp_input_responder = elicitation_responder.responder();
     tool_ctx.root_user_intent_context = request.root_user_intent_context;
     tool_ctx.root_user_messages = request.root_user_messages;
     tool_ctx.root_user_evidence_complete = request.root_user_evidence_complete;
@@ -2409,370 +2297,6 @@ fn onCommandOutputChunk(raw_ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleI
     try ctx.sendToolCallProgressText(id.call_id, chunk);
 }
 
-fn onMcpProgress(raw_ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text: []const u8) void {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    ctx.sendToolCallProgressText(lifecycle_id.call_id, text) catch |err| {
-        debug_trace.logf("mcp", "failed to publish ACP MCP progress err={s}", .{@errorName(err)});
-    };
-}
-
-const AcpInputResponse = struct {
-    key: []const u8,
-    json: []u8,
-
-    fn deinit(self: *AcpInputResponse, alloc: Allocator) void {
-        alloc.free(self.json);
-        self.* = undefined;
-    }
-};
-
-fn respondToAcpMcpInput(
-    raw_ctx: *anyopaque,
-    alloc: Allocator,
-    origin: tool_mcp_runtime.InputOrigin,
-    required: tool_mcp_runtime.InputRequired,
-) anyerror![]const u8 {
-    const responder: *AcpElicitationResponderContext = @ptrCast(@alignCast(raw_ctx));
-    const requests = try mrtr.parseRequestJsonForWire(
-        alloc,
-        required.input_requests_json,
-        origin.wire,
-        .{},
-    );
-    defer {
-        for (requests) |*request| request.deinit(alloc);
-        alloc.free(requests);
-    }
-    if (requests.len == 0) return error.McpInputRequired;
-
-    const responses = try alloc.alloc(AcpInputResponse, requests.len);
-    var response_count: usize = 0;
-    errdefer {
-        for (responses[0..response_count]) |*response| response.deinit(alloc);
-        alloc.free(responses);
-    }
-
-    var cancelled = false;
-    for (requests) |request| {
-        const response_json = if (cancelled)
-            try alloc.dupe(u8, "{\"action\":\"cancel\"}")
-        else response: {
-            const input_request = switch (request.payload) {
-                .elicitation_create => |value| value,
-                else => return error.McpInputRequired,
-            };
-            if (!responder.acp.state.client_elicitation.supports(input_request.mode)) {
-                return error.McpInputRequired;
-            }
-            const direct = try requestAcpElicitation(
-                responder,
-                alloc,
-                origin,
-                input_request,
-            );
-            if (std.mem.eql(u8, direct, "{\"action\":\"cancel\"}")) cancelled = true;
-            break :response direct;
-        };
-        responses[response_count] = .{ .key = request.key, .json = response_json };
-        response_count += 1;
-    }
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeByte('{');
-    for (responses, 0..) |response, index| {
-        if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(response.key, .{}, &out.writer);
-        try out.writer.writeByte(':');
-        try out.writer.writeAll(response.json);
-    }
-    try out.writer.writeByte('}');
-    const result = try out.toOwnedSlice();
-    for (responses) |*response| response.deinit(alloc);
-    alloc.free(responses);
-    return result;
-}
-
-fn requestAcpElicitation(
-    responder: *AcpElicitationResponderContext,
-    alloc: Allocator,
-    origin: tool_mcp_runtime.InputOrigin,
-    input_request: mcp_elicitation.Request,
-) ![]u8 {
-    const state = responder.acp.state;
-    const outbound_id = (try server.beginOutboundRequest(state, .elicitation)) orelse
-        return error.McpInputRequired;
-    var awaiting = true;
-    errdefer if (awaiting) {
-        server.cancelOutboundRequest(state, outbound_id);
-        if (server.awaitOutboundResponse(state, outbound_id, .elicitation)) |owned| {
-            var response = owned;
-            response.deinit(state.alloc);
-        }
-    };
-
-    var id_buffer: [48]u8 = undefined;
-    const url_id = if (input_request.mode == .url)
-        try std.fmt.bufPrint(&id_buffer, "fx-{d}", .{outbound_id})
-    else
-        null;
-    const legacy_source_id = if (origin.wire.isLegacy() and input_request.mode == .url)
-        input_request.elicitation_id orelse return error.McpInputRequired
-    else
-        null;
-    var legacy_url_retained = false;
-    if (legacy_source_id) |source_id| {
-        if (!try server.reserveLegacyUrl(
-            state,
-            origin,
-            source_id,
-            url_id.?,
-            responder.acp.session_id,
-            responder.tool_call_id,
-        )) return error.McpInputRequired;
-        if (activeMcp(responder.acp)) |runtime| {
-            runtime.reconcileLegacyUrlCompletion(
-                origin,
-                source_id,
-                server.legacyUrlCompletionSink(state),
-            );
-        }
-    }
-    defer if (legacy_source_id != null and !legacy_url_retained) {
-        server.removeLegacyUrl(state, url_id.?);
-    };
-    const display_message = try formatAcpElicitationMessage(alloc, origin.server_name, input_request);
-    defer alloc.free(display_message);
-    const params = try mcp_elicitation.projectToAcpCreateParams(
-        alloc,
-        input_request,
-        .{ .session = .{
-            .session_id = responder.acp.session_id,
-            .tool_call_id = responder.tool_call_id,
-        } },
-        url_id,
-        display_message,
-        .{},
-    );
-    defer alloc.free(params);
-    try state.writer.writeRequest(
-        alloc,
-        .{ .integer = @intCast(outbound_id) },
-        "elicitation/create",
-        params,
-    );
-
-    const maybe_response = try awaitAcpElicitationResponse(
-        state,
-        outbound_id,
-        origin,
-        responder.operation_cancel_flag,
-    );
-    awaiting = false;
-    var response = maybe_response orelse return error.Cancelled;
-    defer response.deinit(state.alloc);
-    if (response.cancelled) return error.Cancelled;
-    if (response.error_json != null) return error.McpInputRequired;
-    const response_json = response.result_json orelse return error.McpInputRequired;
-
-    var projected_request = try mcp_elicitation.parseRequest(alloc, .acp, params, .{});
-    defer projected_request.deinit(alloc);
-    const canonical_response = try mcp_elicitation.canonicalResponse(
-        alloc,
-        projected_request,
-        response_json,
-        .{},
-    );
-    errdefer alloc.free(canonical_response);
-    const action = try mcp_elicitation.validateResponse(
-        alloc,
-        projected_request,
-        canonical_response,
-        .{},
-    );
-    var transition_state: mcp_elicitation.RequestState = .pending;
-    const live_witness = if (activeMcp(responder.acp)) |runtime|
-        runtime.inputIdentityWitness(origin.server_name)
-    else
-        null;
-    const transition = mcp_elicitation.decideTransition(
-        transition_state,
-        bindingForAcpInput(responder, origin),
-        answerBindingForAcpInput(responder, origin, live_witness),
-        acpAwakeMillis(),
-        live_witness != null,
-    );
-    switch (transition) {
-        .consume => transition_state = .consumed,
-        .reject => return error.McpInputRequired,
-    }
-    std.debug.assert(transition_state == .consumed);
-
-    if (input_request.mode == .url and action == .accept) {
-        if (legacy_source_id != null) {
-            const runtime = activeMcp(responder.acp) orelse return error.McpInputRequired;
-            const accept_result = runtime.acceptLegacyUrlCompletion(
-                origin,
-                url_id.?,
-                server.legacyUrlCompletionSink(state),
-            ) orelse return error.McpInputRequired;
-            if (accept_result == .awaiting_completion) {
-                const retained_acp_id = try state.alloc.dupe(u8, url_id.?);
-                errdefer state.alloc.free(retained_acp_id);
-                try responder.accepted_legacy_urls.append(state.alloc, .{
-                    .acp_id = retained_acp_id,
-                });
-                legacy_url_retained = true;
-            }
-        } else {
-            const retained_id = try state.alloc.dupe(u8, url_id.?);
-            errdefer state.alloc.free(retained_id);
-            try responder.accepted_url_ids.append(state.alloc, retained_id);
-        }
-    }
-    return canonical_response;
-}
-
-fn formatAcpElicitationMessage(
-    alloc: Allocator,
-    server_name: []const u8,
-    request: mcp_elicitation.Request,
-) ![]u8 {
-    return switch (request.mode) {
-        .form => std.fmt.allocPrint(
-            alloc,
-            "fx received a form request from MCP server {s}. {s}",
-            .{ server_name, request.message },
-        ),
-        .url => std.fmt.allocPrint(
-            alloc,
-            "fx received a URL request from MCP server {s} for host {s}. {s}",
-            .{ server_name, request.url_host orelse "unknown", request.message },
-        ),
-        .unknown => error.McpInputRequired,
-    };
-}
-
-fn bindingForAcpInput(
-    responder: *AcpElicitationResponderContext,
-    origin: tool_mcp_runtime.InputOrigin,
-) mcp_elicitation.Binding {
-    return .{
-        .server_name = origin.server_name,
-        .scope = .{ .acp_session = .{
-            .session_id = responder.acp.session_id,
-            .tool_call_id = responder.tool_call_id,
-        } },
-        .runtime_generation = origin.runtime_generation,
-        .connection_generation = origin.connection_generation,
-        .client_generation = origin.client_generation,
-        .catalog_generation = origin.catalog_generation,
-        .request_generation = origin.request_generation,
-        .auth_generation = origin.auth_generation,
-        .deadline_ms = origin.deadline_ms,
-    };
-}
-
-fn answerBindingForAcpInput(
-    responder: *AcpElicitationResponderContext,
-    origin: tool_mcp_runtime.InputOrigin,
-    witness: ?tool_mcp_runtime.InputIdentityWitness,
-) mcp_elicitation.AnswerBinding {
-    const current: tool_mcp_runtime.InputIdentityWitness = witness orelse .{
-        .runtime_generation = origin.runtime_generation,
-        .connection_generation = origin.connection_generation,
-        .client_generation = origin.client_generation,
-        .catalog_generation = origin.catalog_generation,
-        .auth_generation = origin.auth_generation,
-    };
-    return .{
-        .server_name = origin.server_name,
-        .scope = .{ .acp_session = .{
-            .session_id = responder.acp.session_id,
-            .tool_call_id = responder.tool_call_id,
-        } },
-        .runtime_generation = current.runtime_generation,
-        .connection_generation = current.connection_generation,
-        .client_generation = current.client_generation,
-        .catalog_generation = current.catalog_generation,
-        .request_generation = origin.request_generation,
-        .auth_generation = current.auth_generation,
-    };
-}
-
-const AcpElicitationWait = union(enum) {
-    response: ?server.OutboundResponse,
-    deadline: anyerror!void,
-    cancelled: anyerror!void,
-};
-
-fn awaitAcpElicitationResponse(
-    state: *server.ServerState,
-    id: u64,
-    origin: tool_mcp_runtime.InputOrigin,
-    operation_cancel_flag: ?*const std.atomic.Value(bool),
-) !?server.OutboundResponse {
-    const Cleanup = struct {
-        fn drain(state_alloc: Allocator, select: *std.Io.Select(AcpElicitationWait)) void {
-            while (select.cancel()) |item| switch (item) {
-                .response => |maybe_response| if (maybe_response) |owned| {
-                    var response = owned;
-                    response.deinit(state_alloc);
-                },
-                .deadline, .cancelled => {},
-            };
-        }
-    };
-
-    var select_buffer: [3]AcpElicitationWait = undefined;
-    var select: std.Io.Select(AcpElicitationWait) = .init(io_mod.getIo(), &select_buffer);
-    try select.concurrent(.response, server.awaitOutboundResponse, .{ state, id, server.OutboundKind.elicitation });
-    select.concurrent(.deadline, waitForAcpElicitationDeadline, .{origin.deadline_ms}) catch |err| {
-        Cleanup.drain(state.alloc, &select);
-        return err;
-    };
-    select.concurrent(.cancelled, waitForAcpElicitationCancellation, .{
-        origin.lifecycle_cancel_flag,
-        operation_cancel_flag,
-    }) catch |err| {
-        Cleanup.drain(state.alloc, &select);
-        return err;
-    };
-    const event = select.await() catch |err| {
-        Cleanup.drain(state.alloc, &select);
-        return err;
-    };
-    return switch (event) {
-        .response => |response| result: {
-            Cleanup.drain(state.alloc, &select);
-            break :result response;
-        },
-        .deadline, .cancelled => result: {
-            server.cancelOutboundRequest(state, id);
-            Cleanup.drain(state.alloc, &select);
-            break :result null;
-        },
-    };
-}
-
-fn waitForAcpElicitationDeadline(deadline_ms: i64) anyerror!void {
-    while (acpAwakeMillis() < deadline_ms) {
-        const remaining = deadline_ms - acpAwakeMillis();
-        try io_mod.getIo().sleep(.fromMilliseconds(@intCast(@max(@min(remaining, 20), 1))), .awake);
-    }
-}
-
-fn waitForAcpElicitationCancellation(
-    lifecycle_cancel_flag: ?*const std.atomic.Value(bool),
-    operation_cancel_flag: ?*const std.atomic.Value(bool),
-) anyerror!void {
-    while ((lifecycle_cancel_flag == null or !lifecycle_cancel_flag.?.load(.acquire)) and
-        (operation_cancel_flag == null or !operation_cancel_flag.?.load(.acquire)))
-    {
-        try io_mod.getIo().sleep(.fromMilliseconds(10), .awake);
-    }
-}
-
 fn acpAwakeMillis() i64 {
     const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
     const milliseconds = @divFloor(now.raw.nanoseconds, std.time.ns_per_ms);
@@ -2780,108 +2304,6 @@ fn acpAwakeMillis() i64 {
         std.math.minInt(i64)
     else
         std.math.maxInt(i64);
-}
-
-fn finishAcpUrlElicitations(
-    raw_ctx: *anyopaque,
-    alloc: Allocator,
-    _: tool_mcp_runtime.InputOrigin,
-    outcome: tool_mcp_runtime.ContinuationTerminal,
-) void {
-    const responder: *AcpElicitationResponderContext = @ptrCast(@alignCast(raw_ctx));
-    for (responder.accepted_url_ids.items) |id| {
-        if (outcome == .completed) {
-            var params: std.Io.Writer.Allocating = .init(alloc);
-            defer params.deinit();
-            params.writer.writeAll("{\"elicitationId\":") catch continue;
-            std.json.Stringify.value(id, .{}, &params.writer) catch continue;
-            params.writer.writeByte('}') catch continue;
-            responder.acp.state.writer.writeNotification(
-                alloc,
-                "elicitation/complete",
-                params.writer.buffered(),
-            ) catch {};
-        }
-        responder.acp.state.alloc.free(id);
-    }
-    responder.accepted_url_ids.clearRetainingCapacity();
-    for (responder.accepted_legacy_urls.items) |*accepted| {
-        if (outcome != .completed) {
-            server.removeLegacyUrl(responder.acp.state, accepted.acp_id);
-        }
-        accepted.deinit(responder.acp.state.alloc);
-    }
-    responder.accepted_legacy_urls.clearRetainingCapacity();
-}
-
-fn mcpHasTool(raw_ctx: *anyopaque, name: []const u8, access: tool_mcp_runtime.Access) bool {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activeMcp(ctx) orelse return false;
-    return mcp.hasToolWithAccess(name, access);
-}
-
-fn mcpValidateTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const runtime = activeMcp(ctx) orelse return .not_available;
-    return runtime.validateToolArgumentsByNameWithAccess(
-        arena,
-        name,
-        arguments_json,
-        access,
-    );
-}
-
-fn mcpCallTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, max_tool_result_bytes: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activeMcp(ctx) orelse return null;
-    return mcp.callToolByNameWithOptions(
-        arena,
-        name,
-        arguments_json,
-        max_tool_result_bytes,
-        options,
-    );
-}
-
-fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!tool_mcp_runtime.SearchResult {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activeMcp(ctx) orelse return error.McpServerNotFound;
-    return mcp.searchToolsPrepared(arena, request, permission_rules, limits, access, cancel_flag);
-}
-
-fn mcpSnapshotTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.DefinitionSnapshot {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const runtime = activeMcp(ctx) orelse return .unavailable;
-    return runtime.snapshotToolDefinition(arena, name, known, permission_rules, limits, access);
-}
-
-fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activeMcp(ctx) orelse return null;
-    return mcp.toolSchemaJsonByNameWithAccess(
-        arena,
-        name,
-        permission_rules,
-        limits,
-        access,
-        cancel_flag,
-    );
-}
-
-fn mcpCallFeature(
-    raw_ctx: *anyopaque,
-    arena: Allocator,
-    request: tool_mcp_runtime.FeatureRequest,
-    options: tool_mcp_runtime.FeatureCallOptions,
-) anyerror!tool_mcp_runtime.FeatureResult {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activeMcp(ctx) orelse return error.McpRuntimeUnavailable;
-    return mcp.callFeatureForModel(arena, request, options);
-}
-
-fn activeMcp(ctx: *AcpContext) ?*mcp_runtime.McpRuntime {
-    const session = if (ctx.state.active_session) |*active| active else return null;
-    return session.mcp;
 }
 
 pub const mapToolKind = tool_call_presentation.mapToolKind;
@@ -2898,936 +2320,8 @@ fn providerTerminalStatus(outcome: types.ToolOutcomeKind) ?acp_types.ToolCallSta
     };
 }
 
-test "ACP subagent titles and terminal descriptions share request projection" {
-    const alloc = std.testing.allocator;
-    const call: ToolCall = .{ .id = "review", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check replay\"}}" };
-    const title = try describeToolTitle(builtin_tools.registry, alloc, call);
-    defer alloc.free(title);
-    try std.testing.expectEqualStrings("reviewer · Check replay", title);
-    const completed = (try tool_presentation.formatSubagentPlainAction(alloc, call, .completed)).?;
-    defer alloc.free(completed);
-    try std.testing.expectEqualStrings("reviewer replied · Check replay", completed);
-    const interrupted = (try tool_presentation.formatSubagentPlainAction(alloc, call, .{ .stopped = "Interrupted" })).?;
-    defer alloc.free(interrupted);
-    try std.testing.expectEqualStrings("reviewer interrupted · Check replay", interrupted);
-}
-
-test "ACP shell title uses the call-aware action label" {
-    const alloc = std.testing.allocator;
-    const title = try describeToolTitle(builtin_tools.registry, alloc, .{
-        .id = "close",
-        .name = "shell",
-        .arguments_json = "{\"action\":\"stop\",\"session_id\":\"terminal-a\"}",
-    });
-    defer alloc.free(title);
-    try std.testing.expectEqualStrings("Stopping", title);
-}
-
-test "ACP lifecycle action preserves dynamic MCP availability boundaries" {
-    const Fixture = struct {
-        calls: usize = 0,
-        available: bool = false,
-
-        fn hasTool(raw_ctx: *anyopaque, _: []const u8, _: tool_mcp_runtime.Access) bool {
-            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
-            self.calls += 1;
-            return self.available;
-        }
-    };
-    const alloc = std.testing.allocator;
-    const advertised = [_][]const u8{"mcp_lookup"};
-    var fixture = Fixture{};
-
-    const missing = dynamicMcpToolAvailable(builtin_tools.registry, "mcp_lookup", &advertised, @ptrCast(&fixture), Fixture.hasTool, .unrestricted);
-    try std.testing.expect(!missing);
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    const missing_label = try tool_presentation.formatPlainAction(alloc, .{
-        .tool_registry = builtin_tools.registry,
-        .call = .{ .id = "missing", .name = "mcp_lookup", .arguments_json = "{}" },
-        .is_available_dynamic_mcp_tool = missing,
-    });
-    defer alloc.free(missing_label);
-    try std.testing.expectEqualStrings("Working: mcp_lookup", missing_label);
-
-    const builtin = dynamicMcpToolAvailable(builtin_tools.registry, "terminal", &.{"shell"}, @ptrCast(&fixture), Fixture.hasTool, .unrestricted);
-    try std.testing.expect(!builtin);
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-}
-
-test "ACP lifecycle resolves dynamic MCP availability through session context" {
-    const alloc = std.testing.allocator;
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .auto);
-    defer state.deinit();
-
-    const runtime = try alloc.create(mcp_runtime.McpRuntime);
-    runtime.* = mcp_runtime.McpRuntime.init(alloc);
-    var runtime_owned = true;
-    defer if (runtime_owned) {
-        runtime.deinit();
-        alloc.destroy(runtime);
-    };
-    try runtime.addServer(.{
-        .name = try alloc.dupe(u8, "fixture"),
-    });
-    const mcp_server = runtime.servers.items[0];
-    mcp_server.state.store(.ready, .release);
-    try mcp_server.tool_catalog.tools.append(alloc, .{
-        .original_name = try alloc.dupe(u8, "echo"),
-        .prefixed_name = try alloc.dupe(u8, "mcp_fixture_echo"),
-        .description = try alloc.dupe(u8, "Echo input"),
-        .input_schema_json = try alloc.dupe(u8, "{\"type\":\"object\"}"),
-        .tags = &.{},
-    });
-    state.active_session.?.mcp = runtime;
-    runtime_owned = false;
-
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = "session_1",
-    };
-    try std.testing.expect(lifecycleDynamicMcpToolAvailable(
-        &ctx,
-        "mcp_fixture_echo",
-        &.{"mcp_fixture_echo"},
-    ));
-    try std.testing.expect(!lifecycleDynamicMcpToolAvailable(
-        &ctx,
-        "mcp_fixture_echo",
-        &.{},
-    ));
-    try std.testing.expect(!lifecycleDynamicMcpToolAvailable(
-        &ctx,
-        "mcp_missing",
-        &.{"mcp_missing"},
-    ));
-}
-
-test "mapToolKind maps common tools" {
-    try std.testing.expectEqual(acp_types.ToolCallKind.read, mapToolKind("read_file"));
-    try std.testing.expectEqual(acp_types.ToolCallKind.edit, mapToolKind("write_file"));
-    try std.testing.expectEqual(acp_types.ToolCallKind.edit, mapToolKind("edit_file"));
-    try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("grep_files"));
-    try std.testing.expectEqual(acp_types.ToolCallKind.fetch, mapToolKind("web_fetch"));
-    try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("exa_search"));
-    try std.testing.expectEqual(acp_types.ToolCallKind.execute, mapToolKind("run_command"));
-    try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("unknown_tool"));
-}
-
-test "ACP maps selected-model image capability failures to one stable error" {
-    const failures = [_]anyerror{
-        error.ModelImageCapabilityUnavailable,
-        error.SubscriptionNativeImageUnavailable,
-    };
-    for (failures) |failure| {
-        const outcome = try promptExecutionFailure(failure);
-        switch (outcome) {
-            .rpc_error => |rpc_error| {
-                try std.testing.expectEqual(ErrorCode.invalid_params, rpc_error.code);
-                try std.testing.expectEqualStrings(
-                    "Image prompts are unavailable for the selected model",
-                    rpc_error.message,
-                );
-            },
-            .stop_reason => return error.UnexpectedStopReason,
-        }
-    }
-    try std.testing.expectError(error.OutOfMemory, promptExecutionFailure(error.OutOfMemory));
-}
-
-test "provider terminal status maps only terminal outcomes" {
-    try std.testing.expectEqual(acp_types.ToolCallStatus.completed, providerTerminalStatus(.completed).?);
-    try std.testing.expectEqual(acp_types.ToolCallStatus.failed, providerTerminalStatus(.failed).?);
-    try std.testing.expectEqual(acp_types.ToolCallStatus.failed, providerTerminalStatus(.denied).?);
-    try std.testing.expectEqual(acp_types.ToolCallStatus.failed, providerTerminalStatus(.cancelled).?);
-    try std.testing.expect(providerTerminalStatus(.deferred) == null);
-}
-
-test "ACP usage checkpoints honor the active session write boundary" {
-    const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    var snapshot = try usage.snapshot(alloc);
-    defer snapshot.deinit(alloc);
-
-    var active: server.ActiveSessionState = undefined;
-    active.session_id = @constCast("session-test");
-    active.writable = null;
-    active.session_write_mutex = .init;
-    var state: server.ServerState = undefined;
-    state.active_session = active;
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = "session-test",
-    };
-
-    const Worker = struct {
-        ctx: *AcpContext,
-        snapshot: session_usage.Snapshot,
-        started: std.atomic.Value(bool) = .init(false),
-        done: std.atomic.Value(bool) = .init(false),
-        failure: ?anyerror = null,
-
-        fn run(self: *@This()) void {
-            self.started.store(true, .seq_cst);
-            persistUsageCheckpoint(
-                @ptrCast(self.ctx),
-                self.snapshot,
-            ) catch |err| {
-                self.failure = err;
-            };
-            self.done.store(true, .seq_cst);
-        }
-    };
-    var worker = Worker{
-        .ctx = &ctx,
-        .snapshot = snapshot,
-    };
-    state.active_session.?.session_write_mutex.lockUncancelable(io_mod.getIo());
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
-    while (!worker.started.load(.seq_cst)) std.Thread.yield() catch {};
-    for (0..100) |_| std.Thread.yield() catch {};
-    const blocked_at_boundary = !worker.done.load(.seq_cst);
-    state.active_session.?.session_write_mutex.unlock(io_mod.getIo());
-    thread.join();
-
-    try std.testing.expect(blocked_at_boundary);
-    try std.testing.expect(worker.done.load(.seq_cst));
-    try std.testing.expectEqual(
-        error.SessionPersistenceUnavailable,
-        worker.failure.?,
-    );
-}
-
-test "ACP usage checkpoints maintain the profile recovery marker" {
-    const alloc = std.testing.allocator;
-    const PublicationSink = struct {
-        fn publish(_: *anyopaque, _: session_usage.usage_report.ProfileEvent) !void {}
-    };
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(io_mod.getIo(), "workspace", .default_dir);
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    const workspace = try io_mod.dirRealpathAlloc(
-        alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer alloc.free(workspace);
-
-    var store = try session_store.Store.initFromHome(alloc, home, workspace);
-    var store_owned = true;
-    defer if (store_owned) store.deinit(alloc);
-    const history = try alloc.alloc(types.HistoryTurn, 0);
-    var history_owned = true;
-    defer if (history_owned) alloc.free(history);
-    var initial = session_codec.DurableSessionState{
-        .id = try alloc.dupe(u8, "acp-usage-recovery"),
-        .origin_workspace_root = try alloc.dupe(u8, workspace),
-        .workspace_root = try alloc.dupe(u8, workspace),
-        .created_at_ms = 1000,
-        .updated_at_ms = 1000,
-        .conversation_language = session_runtime.ConversationLanguage.default(),
-        .preferences = .{
-            .model = try alloc.dupe(u8, "provider/model"),
-            .effort = types.ReasoningEffort.literal("high"),
-            .fast_mode = false,
-        },
-        .history = history,
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    };
-    history_owned = false;
-    defer initial.deinit(alloc);
-    var writable = try store.startWritableSession(alloc, initial);
-    var writable_owned = true;
-    defer if (writable_owned) writable.deinit(alloc);
-
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    const sequence = try usage.reserveInvocation();
-    try usage.finishObservedInvocation(
-        alloc,
-        sequence,
-        1,
-        .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-    var pending = try usage.snapshot(alloc);
-    defer pending.deinit(alloc);
-
-    var active: server.ActiveSessionState = undefined;
-    active.session_id = writable.active_id;
-    active.store = store;
-    active.writable = writable;
-    active.session_write_mutex = .init;
-    var state: server.ServerState = undefined;
-    state.active_session = active;
-    store_owned = false;
-    writable_owned = false;
-    defer {
-        if (state.active_session) |*session| {
-            if (session.writable) |*active_writable| {
-                active_writable.deinit(alloc);
-            }
-            if (session.store) |*active_store| active_store.deinit(alloc);
-            state.active_session = null;
-        }
-    }
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = writable.active_id,
-    };
-
-    try persistUsageCheckpoint(@ptrCast(&ctx), pending);
-    var marked = try store.listUsageRecoverySessions(alloc);
-    defer {
-        for (marked.items) |*entry| entry.deinit(alloc);
-        marked.deinit(alloc);
-    }
-    try std.testing.expectEqual(@as(usize, 1), marked.items.len);
-    try std.testing.expectEqualStrings(writable.active_id, marked.items[0].id);
-    var recovered = try usage_recovery.collectFromHome(alloc, home);
-    defer recovered.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), recovered.pending.len);
-    try std.testing.expectEqualStrings(
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        recovered.pending[0].id,
-    );
-
-    var publication_context: u8 = 0;
-    usage.configurePublicationSink(.{
-        .context = &publication_context,
-        .allocator = alloc,
-        .publish = PublicationSink.publish,
-    });
-    try usage.applyGeneration(alloc, .{
-        .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        .created_at_ms = 1000,
-        .model = "provider/model",
-        .total_cost = 0.25,
-        .input_tokens = 10,
-        .output_tokens = 2,
-        .cache_read_tokens = 1,
-        .cache_write_tokens = 0,
-        .reasoning_tokens = 1,
-        .billable_web_search_calls = 0,
-    });
-    var settled = try usage.snapshot(alloc);
-    defer settled.deinit(alloc);
-    try persistUsageCheckpoint(@ptrCast(&ctx), settled);
-
-    var cleared = try store.listUsageRecoverySessions(alloc);
-    defer {
-        for (cleared.items) |*entry| entry.deinit(alloc);
-        cleared.deinit(alloc);
-    }
-    try std.testing.expectEqual(@as(usize, 0), cleared.items.len);
-    var after_settlement = try usage_recovery.collectFromHome(alloc, home);
-    defer after_settlement.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), after_settlement.facts.len);
-    try std.testing.expectEqual(@as(usize, 0), after_settlement.pending.len);
-}
-
-test "parsePromptInput extracts text blocks" {
-    const alloc = std.testing.allocator;
-    const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"Hello world\"}]}";
-    var result = try parsePromptInput(alloc, params);
-    defer result.deinit(alloc);
-    try std.testing.expectEqualStrings("Hello world", result.text);
-}
-
-test "parsePromptInput handles multiple text blocks" {
-    const alloc = std.testing.allocator;
-    const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"Hello\"},{\"type\":\"text\",\"text\":\"World\"}]}";
-    var result = try parsePromptInput(alloc, params);
-    defer result.deinit(alloc);
-    try std.testing.expectEqualStrings("Hello\nWorld", result.text);
-}
-
-test "parsePromptInput returns empty for missing prompt" {
-    const alloc = std.testing.allocator;
-    var result = try parsePromptInput(alloc, "{\"sessionId\":\"s1\"}");
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), result.text.len);
-}
-
-test "parsePromptInput handles empty prompt array" {
-    const alloc = std.testing.allocator;
-    var result = try parsePromptInput(alloc, "{\"sessionId\":\"s1\",\"prompt\":[]}");
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), result.text.len);
-}
-
-test "parsePromptInput accepts explicit recovery continuation metadata" {
-    const alloc = std.testing.allocator;
-    const params =
-        "{\"sessionId\":\"s1\",\"prompt\":[],\"_meta\":{\"fx\":{\"continueRecovery\":true}}}";
-    var result = try parsePromptInput(alloc, params);
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), result.text.len);
-    try std.testing.expect(result.continue_recovery);
-}
-
-test "parsePromptInput accepts image blocks as owned pending images" {
-    const alloc = std.testing.allocator;
-    const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"Only text\"},{\"type\":\"image\",\"data\":\"aGVsbG8=\",\"mimeType\":\"image/png\"}]}";
-    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 7);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqualStrings("Only text\n[Image #7]", parsed.text);
-    try std.testing.expectEqual(@as(usize, 1), parsed.pending_images.len);
-    try std.testing.expectEqual(@as(usize, 7), parsed.pending_images[0].id);
-    try std.testing.expectEqualStrings("hello", parsed.pending_images[0].bytes);
-    try std.testing.expectEqualStrings("image/png", parsed.pending_images[0].media_type);
-}
-
-test "captureImagesInline retains validated bytes on the attachment" {
-    const alloc = std.testing.allocator;
-    const png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR42mNkAAAAAgAB4iG8MwAAAABJRU5ErkJggg==";
-    const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"describe\"},{\"type\":\"image\",\"data\":\"" ++ png_b64 ++ "\",\"mimeType\":\"image/png\"}]}";
-    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 4);
-    defer parsed.deinit(alloc);
-
-    try parsed.captureImagesInline(alloc);
-    try std.testing.expectEqual(@as(usize, 1), parsed.images.len);
-    const image = parsed.images[0];
-    try std.testing.expectEqual(@as(usize, 4), image.id);
-    try std.testing.expectEqualStrings("image/png", image.media_type);
-    try std.testing.expect(image.inline_data != null);
-    try std.testing.expect(image.snapshot_path == null);
-    var verified = try image_attachments.loadVerifiedSnapshot(alloc, image, .{});
-    defer verified.deinit(alloc);
-    const expected = try alloc.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(png_b64));
-    defer alloc.free(expected);
-    try std.base64.standard.Decoder.decode(expected, png_b64);
-    try std.testing.expectEqualStrings(expected, verified.bytes);
-
-    parsed.retainImageSnapshots();
-}
-
-test "captureImagesInline rejects a declared media type that contradicts the bytes" {
-    const alloc = std.testing.allocator;
-    const png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR42mNkAAAAAgAB4iG8MwAAAABJRU5ErkJggg==";
-    const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"data\":\"" ++ png_b64 ++ "\",\"mimeType\":\"image/jpeg\"}]}";
-    var parsed = try parsePromptInput(alloc, params);
-    defer parsed.deinit(alloc);
-    try std.testing.expectError(error.ImageSnapshotMediaTypeMismatch, parsed.captureImagesInline(alloc));
-    try std.testing.expectEqual(@as(usize, 0), parsed.images.len);
-}
-
-test "parsePromptInput rejects malformed base64 image data" {
-    const alloc = std.testing.allocator;
-    const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"data\":\"not-base64\",\"mimeType\":\"image/png\"}]}";
-    try std.testing.expectError(error.InvalidPromptImage, parsePromptInput(alloc, params));
-}
-
-test "parsePromptInput rejects empty image data" {
-    const alloc = std.testing.allocator;
-    const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"data\":\"\",\"mimeType\":\"image/png\"}]}";
-    try std.testing.expectError(error.InvalidPromptImage, parsePromptInput(alloc, params));
-}
-
-test "parsePromptInput preserves resource text and accepts only local absolute file targets" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "Fx Project/src");
-    var file = try tmp.dir.createFile(std.testing.io, "Fx Project/src/main.zig", .{});
-    file.close(std.testing.io);
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const expected_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "Fx Project/src/main.zig");
-    defer alloc.free(expected_path);
-    const local_uri = try std.fmt.allocPrint(alloc, "file://{s}/Fx%20Project/src/main.zig", .{root});
-    defer alloc.free(local_uri);
-    const remote_uri = "https://example.test/reference.txt";
-    const params = try std.fmt.allocPrint(
-        alloc,
-        "{{\"sessionId\":\"s1\",\"prompt\":[" ++
-            "{{\"type\":\"resource\",\"resource\":{{\"uri\":\"{s}\",\"text\":\"local body\"}}}}," ++
-            "{{\"type\":\"resource\",\"resource\":{{\"uri\":\"{s}\",\"text\":\"remote body\"}}}}]}}",
-        .{ local_uri, remote_uri },
-    );
-    defer alloc.free(params);
-
-    var parsed = try parsePromptInput(alloc, params);
-    defer parsed.deinit(alloc);
-
-    const expected_text = try std.fmt.allocPrint(
-        alloc,
-        "File: {s}\nlocal body\nFile: {s}\nremote body",
-        .{ local_uri, remote_uri },
-    );
-    defer alloc.free(expected_text);
-    try std.testing.expectEqualStrings(
-        expected_text,
-        parsed.text,
-    );
-    try std.testing.expectEqual(@as(usize, 1), parsed.targets.len);
-    try std.testing.expectEqual(context_contract.TargetKind.file, parsed.targets[0].kind);
-    try std.testing.expectEqualStrings(expected_path, parsed.targets[0].path);
-    try std.testing.expectEqual(@as(usize, 1), parsed.omissions.len);
-    try std.testing.expectEqualStrings(remote_uri, parsed.omissions[0].source);
-    try std.testing.expectEqual(context_contract.OmissionReason.unsafe_target, parsed.omissions[0].reason);
-}
-
-test "parsePromptInput rejects unsafe file URI targeting without losing embedded text" {
-    const alloc = std.testing.allocator;
-    const uris = [_][]const u8{
-        "file://remote.example/tmp/file.txt",
-        "file:relative.txt",
-        "file:///tmp/../secret.txt",
-        "file:///tmp/%00secret.txt",
-        "file:///tmp/file.txt?revision=1",
-        "file:///tmp/file.txt#fragment",
-    };
-
-    for (uris) |uri| {
-        const params = try std.fmt.allocPrint(
-            alloc,
-            "{{\"sessionId\":\"s1\",\"prompt\":[{{\"type\":\"resource\",\"resource\":{{\"uri\":\"{s}\",\"text\":\"embedded text\"}}}}]}}",
-            .{uri},
-        );
-        defer alloc.free(params);
-
-        var parsed = try parsePromptInput(alloc, params);
-        defer parsed.deinit(alloc);
-
-        try std.testing.expect(std.mem.endsWith(u8, parsed.text, "embedded text"));
-        try std.testing.expectEqual(@as(usize, 0), parsed.targets.len);
-        try std.testing.expectEqual(@as(usize, 1), parsed.omissions.len);
-        try std.testing.expectEqualStrings(uri, parsed.omissions[0].source);
-        try std.testing.expectEqual(context_contract.OmissionReason.unsafe_target, parsed.omissions[0].reason);
-    }
-}
-
-test "parsePromptInput bounds remote resource omissions with a stable summary" {
-    const alloc = std.testing.allocator;
-    var params: std.Io.Writer.Allocating = .init(alloc);
-    defer params.deinit();
-    try params.writer.writeAll("{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"hello\"}");
-    for (0..128) |index| {
-        try params.writer.print(
-            ",{{\"type\":\"resource\",\"resource\":{{\"uri\":\"https://example.test/resource/{d}\"}}}}",
-            .{index},
-        );
-    }
-    try params.writer.writeAll("]}");
-
-    var parsed = try parsePromptInput(alloc, params.written());
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqual(context_contract.Limits.project_omission_records, parsed.omissions.len);
-    try std.testing.expectEqualStrings("https://example.test/resource/0", parsed.omissions[0].source);
-    try std.testing.expect(std.mem.find(u8, parsed.omissions[parsed.omissions.len - 1].source, "/31") != null);
-    const summary = parsed.omission_summary orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(usize, 96), summary.omitted_count);
-    try std.testing.expectEqual(@as(usize, 96), summary.reason_counts[@intFromEnum(context_contract.OmissionReason.unsafe_target)]);
-    const zero_digest = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
-    try std.testing.expect(!std.mem.eql(u8, &summary.digest, &zero_digest));
-}
-
-test "localFileTargetPath canonicalizes a local symlink target" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var file = try tmp.dir.createFile(std.testing.io, "real.txt", .{});
-    file.close(std.testing.io);
-    try createSymlinkOrSkip(tmp.dir, "real.txt", "alias.txt");
-
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const alias_path = try std.fs.path.join(alloc, &.{ root, "alias.txt" });
-    defer alloc.free(alias_path);
-    const expected = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "real.txt");
-    defer alloc.free(expected);
-    const uri = try std.fmt.allocPrint(alloc, "file://{s}", .{alias_path});
-    defer alloc.free(uri);
-
-    const actual = (try localFileTargetPath(alloc, uri)) orelse
-        return error.TestExpectedEqual;
-    defer alloc.free(actual);
-    try std.testing.expectEqualStrings(expected, actual);
-}
-
-test "parsePromptInput releases partial resource state across allocation failures" {
-    const backing = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var file = try tmp.dir.createFile(std.testing.io, "local.txt", .{});
-    file.close(std.testing.io);
-    const local_path = try io_mod.dirRealpathAlloc(backing, tmp.dir, "local.txt");
-    defer backing.free(local_path);
-    const params = try std.fmt.allocPrint(
-        backing,
-        "{{\"sessionId\":\"s1\",\"prompt\":[" ++
-            "{{\"type\":\"resource\",\"resource\":{{\"uri\":\"file://{s}\",\"text\":\"local body\"}}}}," ++
-            "{{\"type\":\"resource\",\"resource\":{{\"uri\":\"https://example.test/reference.txt\",\"text\":\"remote body\"}}}}]}}",
-        .{local_path},
-    );
-    defer backing.free(params);
-
-    var probe = std.testing.FailingAllocator.init(backing, .{});
-    var parsed = try parsePromptInput(probe.allocator(), params);
-    parsed.deinit(probe.allocator());
-    try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
-
-    for (0..probe.alloc_index) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
-        if (parsePromptInput(failing.allocator(), params)) |input| {
-            var owned = input;
-            owned.deinit(failing.allocator());
-        } else |err| switch (err) {
-            error.OutOfMemory => {},
-            else => return err,
-        }
-        try std.testing.expect(failing.has_induced_failure);
-        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
-    }
-}
-
-test "mapToolKind maps surviving tools" {
-    try std.testing.expectEqual(acp_types.ToolCallKind.read, mapToolKind("glob_files"));
-    try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("skill"));
-    try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("install_skill"));
-}
-
-test "ACP permission arguments are validated and reserialized before emission" {
-    const alloc = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    try writeValidatedToolArguments(alloc, &out.writer, " { \"path\" : \"README.md\" } ");
-    try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", out.written());
-
-    var malformed: std.Io.Writer.Allocating = .init(alloc);
-    defer malformed.deinit();
-    try std.testing.expectError(
-        error.InvalidToolArgumentsJson,
-        writeValidatedToolArguments(alloc, &malformed.writer, "{\"path\":}"),
-    );
-    try std.testing.expectEqual(@as(usize, 0), malformed.written().len);
-}
-
-test "acp exposes web_search progress updates" {
-    const alloc = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    try writeWebSearchProgressUpdate(alloc, &out.writer, "call_search", .{ .results_received = .{
-        .query = "current news",
-        .result_count = 4,
-    } });
-
-    try std.testing.expect(std.mem.find(u8, out.written(), "\"toolCallId\":\"call_search\"") != null);
-    try std.testing.expect(std.mem.find(u8, out.written(), "\"status\":\"in_progress\"") != null);
-    try std.testing.expect(std.mem.find(u8, out.written(), "Found 4 results for current news") != null);
-    try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("web_search"));
-}
-
-test "ACP tool notifications preserve UTF-8 for clipped and unsafe output" {
-    const alloc = std.testing.allocator;
-    var model_output: [202]u8 = undefined;
-    @memset(model_output[0..199], 'x');
-    model_output[199] = 0xc3;
-    model_output[200] = 0xa9;
-    model_output[201] = 'z';
-
-    const preview = toolUpdateContentText(.{
-        .status = .failure,
-        .model_output = model_output[0..],
-    });
-    try std.testing.expectEqual(@as(usize, 199), preview.len);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(preview));
-
-    const unsafe_preview = toolUpdateContentText(.{
-        .status = .success,
-        .model_output = "command output: \xff",
-    });
-    try std.testing.expectEqualStrings(
-        "binary or non-utf8 tool output omitted",
-        unsafe_preview,
-    );
-    try std.testing.expect(std.unicode.utf8ValidateSlice(unsafe_preview));
-
-    for ([_][]const u8{ preview, unsafe_preview }, 0..) |content, index| {
-        var update: std.Io.Writer.Allocating = .init(alloc);
-        defer update.deinit();
-        try acp_types.writeToolCallUpdate(
-            &update.writer,
-            if (index == 0) "call_clipped" else "call_unsafe",
-            if (index == 0) .failed else .completed,
-            content,
-        );
-
-        var params: std.Io.Writer.Allocating = .init(alloc);
-        defer params.deinit();
-        try acp_types.writeSessionUpdate(
-            &params.writer,
-            "session_1",
-            update.written(),
-        );
-
-        var notification: std.Io.Writer.Allocating = .init(alloc);
-        defer notification.deinit();
-        try notification.writer.writeAll(
-            "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":",
-        );
-        try notification.writer.writeAll(params.written());
-        try notification.writer.writeByte('}');
-
-        try std.testing.expect(std.unicode.utf8ValidateSlice(notification.written()));
-        var parsed = try std.json.parseFromSlice(
-            std.json.Value,
-            alloc,
-            notification.written(),
-            .{},
-        );
-        defer parsed.deinit();
-    }
-}
-
-test "ACP message IDs rotate when the logical message kind resumes" {
-    const alloc = std.testing.allocator;
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = "session_1",
-    };
-
-    var first: acp_types.MessageIdBuffer = undefined;
-    @memcpy(&first, ctx.operationalMessageId());
-    var second: acp_types.MessageIdBuffer = undefined;
-    @memcpy(&second, ctx.assistantMessageId());
-    var third: acp_types.MessageIdBuffer = undefined;
-    @memcpy(&third, ctx.operationalMessageId());
-
-    try std.testing.expect(!std.mem.eql(u8, &first, &second));
-    try std.testing.expect(!std.mem.eql(u8, &second, &third));
-    try std.testing.expect(!std.mem.eql(u8, &first, &third));
-}
-
-test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicates and writer failure" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const alloc = arena_state.allocator();
-    const source_spans = [_][]const u8{
-        "# Heading\n\n- **bold** item\n",
-        "| A | B |\n| - | - |\n| 1 | 2 |\n",
-        "```zig\nconst x = 1;\n```\n",
-    };
-    const rendered_spans = [_][]const u8{
-        "Heading\n\nbold item\n",
-        "A  B\n1  2\n",
-        "\xe2\x94\x82 const x = 1;\n",
-    };
-    const expected_spans = [_][]const u8{
-        source_spans[0],
-        source_spans[1],
-        source_spans[2],
-        "status\n[docs](https://example.com)\n",
-        "Response interrupted. Restarting.\n",
-        "Replacement response.",
-    };
-    const operational_span =
-        "\x1b[1mstatus\x1b[22m\n" ++
-        "\x1b]8;id=fx-1;https://example.com\x1b\\docs\x1b]8;;\x1b\\\n";
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var capture = try tmp.dir.createFile(
-        io_mod.getIo(),
-        "acp-stream.jsonl",
-        .{ .read = true },
-    );
-    defer capture.close(io_mod.getIo());
-    {
-        var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-        defer state.deinit();
-        state.writer = .{ .stdout = capture };
-        var ctx = AcpContext{
-            .alloc = alloc,
-            .state = &state,
-            .session_id = "session_1",
-        };
-        const deps = agentRuntimeDeps(&ctx);
-
-        for (source_spans, rendered_spans) |source, rendered| {
-            try deps.push_text(deps.ctx, .{ .assistant_source = source });
-            try deps.push_text(deps.ctx, .{ .assistant_rendered = rendered });
-        }
-        try deps.push_text(deps.ctx, .{ .assistant_source = "" });
-        try deps.push_text(deps.ctx, .{ .operational = operational_span });
-        try deps.push_text(deps.ctx, .{ .assistant_restarted = "Response interrupted. Restarting.\n" });
-        const interrupted_message_id = ctx.message_id;
-        try deps.push_text(deps.ctx, .assistant_started);
-        try deps.push_text(deps.ctx, .{ .assistant_source = "Replacement response." });
-        try std.testing.expect(!std.mem.eql(u8, &interrupted_message_id, &ctx.message_id));
-        try capture.sync(io_mod.getIo());
-    }
-
-    var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-stream.jsonl", .{});
-    defer captured_file.close(io_mod.getIo());
-    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 64 * 1024);
-    defer alloc.free(captured);
-
-    var notifications = std.mem.splitScalar(u8, captured, '\n');
-    var notification_count: usize = 0;
-    while (notifications.next()) |line| {
-        if (line.len == 0) continue;
-
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
-        defer parsed.deinit();
-
-        try std.testing.expectEqualStrings("session/update", parsed.value.object.get("method").?.string);
-        const params = parsed.value.object.get("params").?.object;
-        try std.testing.expectEqualStrings("session_1", params.get("sessionId").?.string);
-        const update = params.get("update").?.object;
-        try std.testing.expectEqualStrings("agent_message_chunk", update.get("sessionUpdate").?.string);
-        const content = update.get("content").?.object;
-        try std.testing.expectEqualStrings("text", content.get("type").?.string);
-        try std.testing.expectEqualStrings(expected_spans[notification_count], content.get("text").?.string);
-        try std.testing.expect(std.mem.find(u8, content.get("text").?.string, "\x1b") == null);
-
-        notification_count += 1;
-    }
-    try std.testing.expectEqual(expected_spans.len, notification_count);
-
-    var failed_output = try tmp.dir.createFile(io_mod.getIo(), "acp-stream-failure.jsonl", .{});
-    failed_output.close(io_mod.getIo());
-    var failed_state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer failed_state.deinit();
-    failed_state.writer = .{ .stdout = failed_output };
-    var failed_ctx = AcpContext{
-        .alloc = alloc,
-        .state = &failed_state,
-        .session_id = "session_1",
-    };
-
-    var writer_failed = false;
-    failed_ctx.sendAgentText(failed_ctx.assistantMessageId(), "writer failure probe") catch {
-        writer_failed = true;
-    };
-    try std.testing.expect(writer_failed);
-
-    const failed_deps = agentRuntimeDeps(&failed_ctx);
-    try failed_deps.push_text(failed_deps.ctx, .{ .assistant_source = "writer failure remains suppressed" });
-}
-
-test "ACP auth failure emits a valid detail-free JSON-RPC notification" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-auth-failure.jsonl", .{ .read = true });
-    defer capture.close(io_mod.getIo());
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    state.writer = .{ .stdout = capture };
-    state.active_session.?.credential_source = .vercel_oidc_token;
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = "session_1",
-    };
-    try std.testing.expectEqual(
-        types.CredentialSource.vercel_oidc_token,
-        ctx.toolContext().credential_source.?,
-    );
-
-    const deps = agentRuntimeDeps(&ctx);
-    try deps.push_http_error(
-        deps.ctx,
-        .unauthorized,
-        "provider rejected access-token-secret",
-        state.active_session.?.credential_source,
-    );
-    try capture.sync(io_mod.getIo());
-
-    var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-auth-failure.jsonl", .{});
-    defer captured_file.close(io_mod.getIo());
-    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 16 * 1024);
-    defer alloc.free(captured);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, captured, .{});
-    defer parsed.deinit();
-
-    try std.testing.expectEqualStrings("2.0", parsed.value.object.get("jsonrpc").?.string);
-    try std.testing.expectEqualStrings("session/update", parsed.value.object.get("method").?.string);
-    const update = parsed.value.object.get("params").?.object.get("update").?.object;
-    const content = update.get("content").?.object;
-    try std.testing.expectEqualStrings(
-        "VERCEL_OIDC_TOKEN authentication failed · HTTP 401",
-        content.get("text").?.string,
-    );
-    try std.testing.expect(std.mem.find(u8, captured, "access-token-secret") == null);
-    try std.testing.expect(std.mem.find(u8, captured, "provider rejected") == null);
-    try std.testing.expect(std.mem.find(u8, captured, "\x1b") == null);
-}
-
-test "ACP tool updates preserve typed permission failures without truncation" {
-    const alloc = std.testing.allocator;
-    const payload = try tool_result_errors.toolPermissionDeniedJson(alloc, "run_command", .permission_required);
-    defer alloc.free(payload);
-
-    const output_text = toolUpdateContentText(.{
-        .status = .failure,
-        .model_output = payload,
-    });
-
-    try std.testing.expectEqualStrings(payload, output_text);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, output_text, .{});
-    defer parsed.deinit();
-    const error_obj = parsed.value.object.get("error").?.object;
-    try std.testing.expectEqualStrings("tool_permission_denied", error_obj.get("type").?.string);
-    try std.testing.expectEqualStrings("run_command", error_obj.get("tool_name").?.string);
-    try std.testing.expectEqualStrings("permission_required", error_obj.get("reason").?.string);
-    try std.testing.expect(error_obj.get("denied").?.bool);
-}
-
-test "ACP plan mode validates registered tools against mode policy" {
-    const alloc = std.testing.allocator;
-    var state = try initTestAcpState(alloc, "/tmp/fx-acp-plan-mode", .ask);
-    defer state.deinit();
-    state.active_session.?.mode = "plan";
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = state.active_session.?.session_id,
-    };
-
-    const allowed = try validateToolCall(&ctx, alloc, .{
-        .id = "call_read",
-        .name = "read_file",
-        .arguments_json = "{\"path\":\"README.md\"}",
-    });
-    switch (allowed) {
-        .valid => {},
-        else => return error.TestExpectedEqual,
-    }
-
-    const denied = try validateToolCall(&ctx, alloc, .{
-        .id = "call_write",
-        .name = "write_file",
-        .arguments_json = "{}",
-    });
-    switch (denied) {
-        .failure => |body| {
-            defer alloc.free(body);
-            try std.testing.expect(std.mem.find(u8, body, "\"tool_name\":\"write_file\"") != null);
-            try std.testing.expect(std.mem.find(u8, body, "Plan mode only allows read-only workspace inspection tools.") != null);
-        },
-        else => return error.TestExpectedEqual,
-    }
+fn testResolveChatUrl(_: ?*anyopaque, fallback: []const u8) []const u8 {
+    return if (fallback.len == 0) test_openrouter.chat_url_provider.resolve_fn() else fallback;
 }
 
 const AcpContextRegistryFixture = struct {
@@ -3876,7 +2370,7 @@ const test_acp_modes = [_]mode_registry.ModeSpec{
     .{
         .id = "plan",
         .name = "Plan",
-        .permission_mode = .ask,
+        .permission_mode = .yolo,
         .tool_policy = .read_only,
         .tool_policy_denial_message = "Plan mode only allows read-only workspace inspection tools.",
     },
@@ -3898,8 +2392,8 @@ fn testServerConfig() server.Config {
         .gateway_retry_count = 0,
         .gateway_chat_url = "http://127.0.0.1",
         .gateway_models_path = "/models",
-        .gateway_provider = test_builtin_gateway.provider,
-        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
+        .gateway_provider = .{ .chat_url = .{ .context = @constCast(&test_openrouter), .resolve_fn = testResolveChatUrl } },
+        .provider_set = provider_set.openrouter_only(test_openrouter.provider_bundle),
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{
             .system_prompt = "test",
@@ -3935,9 +2429,9 @@ fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: Permissi
         .writer = jsonrpc.Writer.init(),
         .workspace_root = owned_workspace,
         .api_key = api_key,
-        .credential_source = .ai_gateway_api_key,
+        .credential_source = .openrouter_api_key,
         .web_search_runtime = @import("../core/tooling/web_search_runtime.zig").Runtime.init(.{
-            .provider = cfg.provider_set.gateway.fx_search.?,
+            .provider = cfg.provider_set.openrouter.fx_search.?,
         }),
         .active_session = .{
             .session_id = session_id,
@@ -3945,7 +2439,7 @@ fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: Permissi
             .mode = "normal",
             .workspace_root = owned_workspace,
             .api_key = api_key,
-            .credential_source = .ai_gateway_api_key,
+            .credential_source = .openrouter_api_key,
             .agent_step_limit = 4,
             .max_tool_result_bytes = 1024 * 1024,
             .fast_mode = false,
@@ -3958,381 +2452,6 @@ fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: Permissi
             .pending_prompt_id = null,
         },
     };
-}
-
-test "stripAnsiAlloc returns the original slice for clean text and strips escapes" {
-    const alloc = std.testing.allocator;
-    const clean = "plain **markdown** text\n";
-    const untouched = try stripAnsiAlloc(alloc, clean);
-    try std.testing.expect(untouched.ptr == clean.ptr);
-
-    const stripped = try stripAnsiAlloc(alloc, "\x1b[31mred\x1b[0m and \x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
-    defer alloc.free(stripped);
-    try std.testing.expectEqualStrings("red and [link](https://example.com)", stripped);
-    try std.testing.expect(std.mem.find(u8, stripped, "\x1b") == null);
-}
-
-test "stripAnsiAlloc converts OSC-8 hyperlinks with params and BEL terminators" {
-    const alloc = std.testing.allocator;
-    const with_params = try stripAnsiAlloc(alloc, "\x1b]8;id=fx-1;https://ziglang.org/download/\x1b\\Zig downloads\x1b]8;;\x1b\\ ready");
-    defer alloc.free(with_params);
-    try std.testing.expectEqualStrings("[Zig downloads](https://ziglang.org/download/) ready", with_params);
-
-    const bel_terminated = try stripAnsiAlloc(alloc, "\x1b]8;;https://example.com\x07docs\x1b]8;;\x07");
-    defer alloc.free(bel_terminated);
-    try std.testing.expectEqualStrings("[docs](https://example.com)", bel_terminated);
-
-    const unterminated = try stripAnsiAlloc(alloc, "\x1b]8;;https://example.com\x1b\\split chunk");
-    defer alloc.free(unterminated);
-    try std.testing.expectEqualStrings("[split chunk](https://example.com)", unterminated);
-}
-
-test "ACP pending tool_call updates keep provider ids stable and dedupe" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const alloc = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-tool-call.jsonl", .{ .read = true });
-    defer capture.close(io_mod.getIo());
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    state.writer = .{ .stdout = capture };
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = "session_1",
-    };
-    defer ctx.deinitPublishedToolCalls();
-
-    const call = ToolCall{
-        .id = "provider_call_7",
-        .name = "shell",
-        .arguments_json = "{\"action\":\"run\",\"command\":\"ls\",\"api_key\":\"secret-value\"}",
-    };
-    const first = try ctx.sendToolCallPending(alloc, call);
-    const second = try ctx.sendToolCallPending(alloc, call);
-    try std.testing.expectEqualStrings("provider_call_7", first);
-    try std.testing.expect(first.ptr == second.ptr);
-    _ = try ctx.sendToolCallPending(alloc, .{
-        .id = "malformed_call",
-        .name = "read_file",
-        .arguments_json = "{",
-        .argument_integrity = .malformed_json,
-    });
-    try capture.sync(io_mod.getIo());
-
-    var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-tool-call.jsonl", .{});
-    defer captured_file.close(io_mod.getIo());
-    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 64 * 1024);
-    var lines = std.mem.splitScalar(u8, captured, '\n');
-    var pending_count: usize = 0;
-    var malformed_count: usize = 0;
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
-        defer parsed.deinit();
-        const update = parsed.value.object.get("params").?.object.get("update").?.object;
-        try std.testing.expectEqualStrings("tool_call", update.get("sessionUpdate").?.string);
-        const call_id = update.get("toolCallId").?.string;
-        if (std.mem.eql(u8, call_id, "provider_call_7")) {
-            try std.testing.expectEqualStrings("shell", update.get("name").?.string);
-            const raw_input = update.get("rawInput").?.object;
-            try std.testing.expectEqualStrings("run", raw_input.get("action").?.string);
-            try std.testing.expectEqualStrings("ls", raw_input.get("command").?.string);
-            try std.testing.expectEqualStrings("[REDACTED]", raw_input.get("api_key").?.string);
-            pending_count += 1;
-        } else if (std.mem.eql(u8, call_id, "malformed_call")) {
-            try std.testing.expect(update.get("rawInput") == null);
-            malformed_count += 1;
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 1), pending_count);
-    try std.testing.expectEqual(@as(usize, 1), malformed_count);
-}
-
-test "ACP provider search lifecycle publishes only public terminal updates" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const alloc = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-provider-search.jsonl", .{ .read = true });
-    defer capture.close(io_mod.getIo());
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    state.writer = .{ .stdout = capture };
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = "session_1",
-    };
-    defer ctx.deinitPublishedToolCalls();
-
-    try pushToolLifecycle(&ctx, .{ .provisional = .{
-        .id = .{ .turn_id = 1, .call_id = "provider_search_1" },
-        .tool_name = "exa_search",
-        .activity_kind = .read,
-    } });
-    const completed = types.ToolLifecycleEvent{ .terminal = .{
-        .id = .{ .turn_id = 1, .call_id = "provider_search_1" },
-        .outcome = .{ .kind = .completed, .summary = "Searched web" },
-    } };
-    try pushToolLifecycle(&ctx, completed);
-    try pushToolLifecycle(&ctx, completed);
-    try pushToolLifecycle(&ctx, .{ .provisional = .{
-        .id = .{ .turn_id = 1, .call_id = "provider_search_2" },
-        .tool_name = "perplexity_search",
-        .activity_kind = .read,
-    } });
-    const failed = types.ToolLifecycleEvent{ .terminal = .{
-        .id = .{ .turn_id = 1, .call_id = "provider_search_2" },
-        .outcome = .{ .kind = .failed, .summary = "perplexity_search failed: invalid JSON arguments" },
-    } };
-    try pushToolLifecycle(&ctx, failed);
-    try pushToolLifecycle(&ctx, failed);
-    try pushToolLifecycle(&ctx, .{ .provisional = .{
-        .id = .{ .turn_id = 1, .call_id = "provider_search_3" },
-        .tool_name = "parallel_search",
-        .activity_kind = .read,
-    } });
-    try pushToolLifecycle(&ctx, .{ .terminal = .{
-        .id = .{ .turn_id = 1, .call_id = "provider_search_3" },
-        .outcome = .{ .kind = .cancelled, .summary = "Cancelled parallel_search" },
-    } });
-    try pushToolLifecycle(&ctx, .{ .provisional = .{
-        .id = .{ .turn_id = 1, .call_id = "provider_search_4" },
-        .tool_name = "exa_search",
-        .activity_kind = .read,
-    } });
-    try pushToolLifecycle(&ctx, .{ .terminal = .{
-        .id = .{ .turn_id = 1, .call_id = "provider_search_4" },
-        .outcome = .{ .kind = .deferred, .summary = "Deferred exa_search" },
-    } });
-    try pushToolLifecycle(&ctx, .{ .terminal = .{
-        .id = .{ .turn_id = 1, .call_id = "unknown_provider_search" },
-        .outcome = .{ .kind = .failed, .summary = "exa_search failed" },
-    } });
-    try pushToolLifecycle(&ctx, .{ .authoritative_started = .{
-        .id = .{ .turn_id = 1, .call_id = "read_1" },
-        .reconciles_provisional_call_id = null,
-        .tool_name = "read_file",
-        .activity_kind = .read,
-        .arguments_json = "{\"path\":\"README.md\"}",
-    } });
-    try pushToolLifecycle(&ctx, .{ .terminal = .{
-        .id = .{ .turn_id = 1, .call_id = "read_1" },
-        .outcome = .{ .kind = .completed, .summary = "Read README.md" },
-    } });
-    try capture.sync(io_mod.getIo());
-
-    var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-provider-search.jsonl", .{});
-    defer captured_file.close(io_mod.getIo());
-    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 64 * 1024);
-    var lines = std.mem.splitScalar(u8, captured, '\n');
-    var provider_pending: usize = 0;
-    var provider_completed: usize = 0;
-    var provider_failed: usize = 0;
-    var read_pending: usize = 0;
-    var read_completed: usize = 0;
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        try std.testing.expect(std.mem.find(u8, line, "exa_search") == null);
-        try std.testing.expect(std.mem.find(u8, line, "perplexity_search") == null);
-        try std.testing.expect(std.mem.find(u8, line, "parallel_search") == null);
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
-        defer parsed.deinit();
-        const update = parsed.value.object.get("params").?.object.get("update").?.object;
-        const call_id = update.get("toolCallId").?.string;
-        const session_update = update.get("sessionUpdate").?.string;
-        if (std.mem.eql(u8, call_id, "provider_search_1")) {
-            if (std.mem.eql(u8, session_update, "tool_call")) {
-                provider_pending += 1;
-                try std.testing.expectEqualStrings("web_search", update.get("name").?.string);
-                try std.testing.expectEqualStrings("Searching web", update.get("title").?.string);
-                try std.testing.expectEqualStrings("search", update.get("kind").?.string);
-                try std.testing.expectEqual(@as(usize, 0), update.get("rawInput").?.object.count());
-            } else if (std.mem.eql(u8, session_update, "tool_call_update")) {
-                provider_completed += 1;
-                try std.testing.expectEqualStrings("completed", update.get("status").?.string);
-                try std.testing.expectEqualStrings(
-                    "Web search completed",
-                    update.get("content").?.array.items[0].object.get("content").?.object.get("text").?.string,
-                );
-            }
-        } else if (std.mem.eql(u8, call_id, "provider_search_2") or
-            std.mem.eql(u8, call_id, "provider_search_3"))
-        {
-            if (std.mem.eql(u8, session_update, "tool_call")) {
-                provider_pending += 1;
-            } else if (std.mem.eql(u8, session_update, "tool_call_update")) {
-                provider_failed += 1;
-                try std.testing.expectEqualStrings("failed", update.get("status").?.string);
-                try std.testing.expectEqualStrings(
-                    "Web search failed",
-                    update.get("content").?.array.items[0].object.get("content").?.object.get("text").?.string,
-                );
-            }
-        } else if (std.mem.eql(u8, call_id, "provider_search_4")) {
-            try std.testing.expectEqualStrings("tool_call", session_update);
-            provider_pending += 1;
-        } else if (std.mem.eql(u8, call_id, "read_1")) {
-            if (std.mem.eql(u8, session_update, "tool_call")) read_pending += 1;
-            if (std.mem.eql(u8, session_update, "tool_call_update")) read_completed += 1;
-        } else {
-            return error.TestUnexpectedToolCallId;
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 4), provider_pending);
-    try std.testing.expectEqual(@as(usize, 1), provider_completed);
-    try std.testing.expectEqual(@as(usize, 2), provider_failed);
-    try std.testing.expectEqual(@as(usize, 1), read_pending);
-    try std.testing.expectEqual(@as(usize, 0), read_completed);
-}
-
-test "ACP propagateGrant stores deduped runtime session grants" {
-    const alloc = std.testing.allocator;
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = "session_1",
-    };
-
-    try retainAcpGrant(&ctx, "run_command", "git status*");
-    try retainAcpGrant(&ctx, "run_command", "git status*");
-    try retainAcpGrant(&ctx, "write_file", "/tmp/workspace/**");
-
-    const session = &state.active_session.?;
-    try std.testing.expectEqual(@as(usize, 2), session.session_grants.len);
-    try std.testing.expectEqualStrings("run_command", session.session_grants[0].tool_name);
-    try std.testing.expectEqualStrings("git status*", session.session_grants[0].target_path);
-    try std.testing.expectEqualStrings("write_file", session.session_grants[1].tool_name);
-
-    const tool_ctx = ctx.toolContext();
-    try std.testing.expectEqual(session.session_grants.len, tool_ctx.permission_grants.len);
-    try std.testing.expect(tool_ctx.permission_grants.ptr == session.session_grants.ptr);
-}
-
-test "ACP refreshes typed registry context and propagates enabled gathering errors" {
-    const alloc = std.testing.allocator;
-    AcpContextRegistryFixture.reset();
-
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-
-    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
-    try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
-    var contribution = state.context_snapshot.contribution orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("test.acp_context", contribution.provider_id);
-    try std.testing.expectEqualStrings("ACP registry context 1", contribution.content);
-
-    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
-    try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
-    contribution = state.context_snapshot.contribution orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("ACP registry context 2", contribution.content);
-
-    state.context_enabled = false;
-    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
-    try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
-    try std.testing.expect(state.context_snapshot.contribution == null);
-
-    state.context_enabled = true;
-    AcpContextRegistryFixture.gather_error = error.WriteFailed;
-    try std.testing.expectError(
-        error.WriteFailed,
-        refreshProjectContext(&state, alloc, &.{}, &.{}, null),
-    );
-    try std.testing.expectEqual(@as(usize, 3), AcpContextRegistryFixture.gather_calls);
-    try std.testing.expect(state.context_snapshot.contribution == null);
-}
-
-test "ACP prompt propagates context provider errors before pending prompt state" {
-    const alloc = std.testing.allocator;
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    var msg = jsonrpc.Message{
-        .id = .{ .integer = 7 },
-        .method = "session/prompt",
-        .params_raw = "{\"sessionId\":\"session_1\",\"prompt\":[{\"type\":\"text\",\"text\":\"hello\"}]}",
-    };
-    const errors = [_]context_contract.ProviderError{
-        error.OutOfMemory,
-        error.NoSpaceLeft,
-        error.WriteFailed,
-    };
-
-    for (errors) |expected_error| {
-        AcpContextRegistryFixture.reset();
-        AcpContextRegistryFixture.gather_error = expected_error;
-        try std.testing.expectError(
-            expected_error,
-            handlePrompt(&state, alloc, &msg, "code", .ask),
-        );
-        try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
-        try std.testing.expect(state.active_session.?.pending_prompt_id == null);
-        try std.testing.expect(state.context_snapshot.contribution == null);
-    }
-}
-
-test "ACP registry callbacks preserve snapshot bytes before transient context" {
-    const alloc = std.testing.allocator;
-    AcpContextRegistryFixture.reset();
-
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
-
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = state.active_session.?.session_id,
-        .captured_permission_mode = .auto,
-    };
-    state.active_session.?.permission_mode = .ask;
-    const deps = agentRuntimeDeps(&ctx);
-    try std.testing.expect(deps.context_enabled);
-    try std.testing.expectEqualStrings(
-        "test.acp_context",
-        deps.context_registry.?.defaultProvider().id,
-    );
-    try std.testing.expect(deps.request_prepared_file_mutation_permission != null);
-    try std.testing.expect(deps.prepare_parent_turn_context == null);
-    try std.testing.expect(deps.acknowledge_parent_turn_context == null);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var messages: std.ArrayList(ChatMessage) = .empty;
-    defer messages.deinit(arena);
-    try messages.append(arena, .{ .role = .system, .content = "base system" });
-
-    try deps.append_static_context.?(deps.ctx, arena, null, &messages);
-    try deps.append_runtime_context(deps.ctx, arena, &messages);
-
-    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
-    try std.testing.expectEqualStrings("base system", messages.items[0].content.?);
-    try std.testing.expectEqualStrings("ACP registry context 1", messages.items[1].content.?);
-    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "<mcp_servers>") != null);
-    try std.testing.expectEqualStrings("ACP registry transient", messages.items[3].content.?);
-    try std.testing.expectEqualStrings("ACP registry context 1", AcpContextRegistryFixture.static_context.?);
-    try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.transient_calls);
-    try std.testing.expectEqual(
-        PermissionMode.auto,
-        AcpContextRegistryFixture.transient_permission_mode orelse return error.TestExpectedEqual,
-    );
-
-    const tool_context = ctx.toolContext();
-    try std.testing.expectEqual(PermissionMode.auto, tool_context.permission_mode);
-    try std.testing.expectEqualStrings("test.acp_context", tool_context.context_registry.defaultProvider().id);
-
-    state.context_enabled = false;
-    try std.testing.expectEqualStrings("", ctx.modelVisibleProjectContext());
-    try std.testing.expect(!ctx.toolContext().context_enabled);
-    try std.testing.expect(!agentRuntimeDeps(&ctx).context_enabled);
 }
 
 fn testPermissionRuleSet(alloc: Allocator, permission: []const u8, pattern: []const u8, action: types.PermissionAction) !types.PermissionRuleSet {
@@ -4361,536 +2480,4 @@ fn createSymlinkOrSkip(dir: std.Io.Dir, target_path: []const u8, link_path: []co
         }
         return err;
     };
-}
-
-test "ACP deps validate malformed registered calls" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
-
-    const deps = agentRuntimeDeps(&ctx);
-    try deps.finalize_turn(deps.ctx, 8, .completed, null);
-    const validate = deps.validate_tool_call orelse return error.TestExpectedEqual;
-    const result = try validate(deps.ctx, arena, .{
-        .id = "fetch",
-        .name = "web_fetch",
-        .arguments_json = "{\"url\":1}",
-    });
-    try std.testing.expectEqualStrings("web_fetch field \"url\" must be a string", result.failure);
-}
-
-test "ACP finalization maps failed turns and provider length" {
-    const cases = [_]struct {
-        outcome: types.TurnPresentationOutcome,
-        disposition: ?types.ProviderCompletionDisposition,
-        expected: acp_types.StopReason,
-    }{
-        .{ .outcome = .completed, .disposition = .length_limited, .expected = .max_output_tokens },
-        .{ .outcome = .failed, .disposition = .length_limited, .expected = .max_output_tokens },
-        .{ .outcome = .failed, .disposition = null, .expected = .refused },
-    };
-
-    for (cases) |case| {
-        const alloc = std.testing.allocator;
-        var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-        defer state.deinit();
-        var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
-        const deps = agentRuntimeDeps(&ctx);
-
-        try deps.finalize_turn(deps.ctx, 8, case.outcome, case.disposition);
-
-        try std.testing.expectEqual(case.expected, ctx.stop_reason);
-    }
-}
-
-test "ACP deps reject malformed native web_search calls" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
-
-    const deps = agentRuntimeDeps(&ctx);
-    const validate = deps.validate_tool_call orelse return error.TestExpectedEqual;
-    const result = try validate(deps.ctx, arena, .{
-        .id = "search",
-        .name = "web_search",
-        .arguments_json = "{\"query\":\"x\"}",
-    });
-    try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", result.failure);
-}
-
-test "ACP prompt projection configures web search then blocks native execution" {
-    const alloc = std.testing.allocator;
-    const web_search_contract = @import("../core/tooling/web_search_contract.zig");
-    const web_search_runtime = @import("../core/tooling/web_search_runtime.zig");
-    const ProviderState = struct {
-        calls: usize = 0,
-    };
-    const FailingWebSearchProvider = struct {
-        fn execute(
-            raw_ctx: ?*anyopaque,
-            _: Allocator,
-            _: web_search_runtime.Inputs,
-            _: web_search_contract.ProviderRequest,
-            _: ?web_search_contract.ProgressFn,
-            _: ?*anyopaque,
-        ) anyerror!web_search_contract.ProviderResponse {
-            const state: *ProviderState = @ptrCast(@alignCast(raw_ctx orelse return error.TestWebSearchProvider));
-            state.calls += 1;
-            return error.TestWebSearchProvider;
-        }
-    };
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-web-runtime-timing.jsonl", .{});
-    defer capture.close(io_mod.getIo());
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    state.writer = .{ .stdout = capture };
-    var ctx = AcpContext{ .alloc = arena, .state = &state, .session_id = "session_1" };
-    var provider_state = ProviderState{};
-    var provider = state.web_search_runtime.provider orelse return error.TestExpectedEqual;
-    provider.context = @ptrCast(&provider_state);
-    provider.execute_fn = FailingWebSearchProvider.execute;
-    state.web_search_runtime = web_search_runtime.Runtime.init(.{
-        .provider = provider,
-    });
-
-    state.web_search_runtime.configure(.{
-        .api_key = "stale-key",
-        .worker_model = "stale-model",
-        .gateway_retry_count = 99,
-        .gateway_chat_url = "https://stale.invalid/chat",
-    });
-
-    var messages: std.ArrayList(ChatMessage) = .empty;
-    defer messages.deinit(arena);
-    const deps = agentRuntimeDeps(&ctx);
-    const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
-    try append_static(deps.ctx, arena, null, &messages);
-    try deps.append_runtime_context(deps.ctx, arena, &messages);
-
-    try std.testing.expectEqualStrings("stale-key", state.web_search_runtime.api_key);
-
-    const validate = deps.validate_tool_call orelse return error.TestExpectedEqual;
-    const validation = try validate(deps.ctx, arena, .{
-        .id = "search",
-        .name = "web_search",
-        .arguments_json = "{\"query\":\"x\"}",
-    });
-    const session = state.active_session orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", validation.failure);
-    try std.testing.expectEqualStrings(session.api_key, state.web_search_runtime.api_key);
-    try std.testing.expectEqualStrings(session.model, state.web_search_runtime.worker_model);
-    try std.testing.expectEqual(state.cfg.gateway_retry_count, state.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
-
-    const execute = deps.execute_tool_call;
-    const execution = try execute(deps.ctx, .{
-        .call_allocator = arena,
-        .result_allocator = arena,
-        .call = .{
-            .id = "search-execute",
-            .name = "web_search",
-            .arguments_json = "{\"query\":\"current Zig release\"}",
-        },
-        .authority = .ordinary,
-        .session_grants = &.{},
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = session.max_tool_result_bytes,
-    });
-    try std.testing.expectEqualStrings(session.api_key, state.web_search_runtime.api_key);
-    try std.testing.expectEqualStrings(session.model, state.web_search_runtime.worker_model);
-    try std.testing.expectEqual(state.cfg.gateway_retry_count, state.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
-    try std.testing.expectEqual(.failure, execution.status);
-    try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
-}
-
-test "ACP ChatGPT route removes Gateway-backed auxiliary capabilities" {
-    const alloc = std.testing.allocator;
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .auto);
-    defer state.deinit();
-    state.active_session.?.credential_source = .chatgpt_subscription;
-    state.active_session.?.provider = .codex;
-    state.active_session.?.api_key = "chatgpt-secret";
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
-
-    const tool_ctx = ctx.toolContext();
-    try std.testing.expect(tool_ctx.web_search_backend == null);
-    try std.testing.expect(tool_ctx.permission_reviewer_provider == null);
-    try std.testing.expect(!tool_ctx.auto_classifier.enabled());
-}
-
-test "ACP default user commands require configured authority or review" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
-
-    const direct = (try requestToolPermissionOutcome(&ctx, arena, .{
-        .id = "direct",
-        .name = "shell",
-        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\"}",
-    }, .ask, &.{}, &.{}));
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, direct.decision);
-    try std.testing.expect(direct.execution_authority == null);
-
-    const blocked = (try requestToolPermissionOutcome(&ctx, arena, .{
-        .id = "blocked",
-        .name = "shell",
-        .arguments_json = "{\"action\":\"run\",\"command\":\"touch blocked.txt\"}",
-    }, .ask, &.{}, &.{}));
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, blocked.decision);
-    try std.testing.expect(blocked.execution_authority == null);
-
-    state.active_session.?.permission_rules = try testPermissionRuleSet(alloc, "bash", "touch *", .allow);
-    const configured = (try requestToolPermissionOutcome(&ctx, arena, .{
-        .id = "configured",
-        .name = "shell",
-        .arguments_json = "{\"action\":\"run\",\"command\":\"touch configured.txt\"}",
-    }, .ask, &.{}, &.{}));
-    switch ((configured.execution_authority orelse return error.TestExpectedEqual).run_command) {
-        .direct_only => return error.TestExpectedShellAllowed,
-        .shell_allowed => |authority| try std.testing.expectEqual(command_admission.ShellAuthorizationSource.configured_rule, authority.source),
-    }
-
-    state.active_session.?.permission_rules.deinit(alloc);
-    state.active_session.?.permission_rules = .{};
-    const automatic = (try requestToolPermissionOutcome(&ctx, arena, .{
-        .id = "automatic",
-        .name = "shell",
-        .arguments_json = "{\"action\":\"run\",\"command\":\"touch automatic.txt\"}",
-    }, .auto, &.{}, &.{}));
-    try std.testing.expectEqual(ToolPermissionDecision.deny, automatic.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, automatic.denial_reason.?);
-    try std.testing.expect(automatic.execution_authority == null);
-}
-
-test "ACP auto mode uses automatic review clear and caution without prompting" {
-    const FakeClassifier = struct {
-        calls: usize = 0,
-        decision: permission_auto_classifier.Decision = .clear,
-        root_text: []const u8 = "",
-
-        fn classify(
-            raw_ctx: *anyopaque,
-            alloc: Allocator,
-            request: permission_auto_classifier.ReviewRequest,
-        ) anyerror!permission_auto_classifier.ParseOutcome {
-            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
-            self.calls += 1;
-            self.root_text = request.review_turn.trusted_root_context;
-            return .{ .valid = .{
-                .risk = if (self.decision == .clear) .low else .high,
-                .decision = self.decision,
-                .rationale = try alloc.dupe(u8, "test reviewer rationale"),
-            } };
-        }
-    };
-
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    var fake = FakeClassifier{ .decision = .clear };
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = "session_1",
-        .auto_classifier = permission_auto_classifier.Classifier.withOverride(
-            @ptrCast(&fake),
-            FakeClassifier.classify,
-        ),
-    };
-
-    const direct_call: ToolCall = .{
-        .id = "direct",
-        .name = "shell",
-        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\"}",
-    };
-    var direct_review = TestReviewTurn.init("Inspect the workspace.", direct_call);
-    const direct = try requestToolPermissionOutcomeWithRequest(&ctx, arena, direct_call, direct_review.context(), .auto, &.{}, null, null, &.{}, null);
-    try std.testing.expectEqual(
-        command_admission.ShellAuthorizationSource.auto_classifier,
-        direct.execution_authority.?.run_command.shell_allowed.source,
-    );
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-
-    const accepted_call: ToolCall = .{
-        .id = "accepted",
-        .name = "shell",
-        .arguments_json = "{\"action\":\"run\",\"command\":\"touch accepted.txt\"}",
-    };
-    var accepted_review = TestReviewTurn.init("Create accepted.txt.", accepted_call);
-    const accepted = try requestToolPermissionOutcomeWithRequest(&ctx, arena, accepted_call, accepted_review.context(), .auto, &.{}, null, null, &.{}, null);
-    switch ((accepted.execution_authority orelse return error.TestExpectedEqual).run_command) {
-        .direct_only => return error.TestExpectedShellAllowed,
-        .shell_allowed => |authority| try std.testing.expectEqual(
-            command_admission.ShellAuthorizationSource.auto_classifier,
-            authority.source,
-        ),
-    }
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
-    try std.testing.expectEqualStrings(
-        "Create accepted.txt.",
-        fake.root_text,
-    );
-
-    fake.decision = .caution;
-    const blocked_call: ToolCall = .{
-        .id = "check",
-        .name = "shell",
-        .arguments_json = "{\"action\":\"run\",\"command\":\"touch check.txt\"}",
-    };
-    var blocked_review = TestReviewTurn.init("Check whether this is allowed.", blocked_call);
-    const blocked = try requestToolPermissionOutcomeWithRequest(&ctx, arena, blocked_call, blocked_review.context(), .auto, &.{}, null, null, &.{}, null);
-    try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_caution, blocked.denial_reason.?);
-    try std.testing.expect(blocked.execution_authority == null);
-    try std.testing.expectEqual(@as(usize, 3), fake.calls);
-    const blocked_classifier = blocked.auto_review_result orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(permission_auto_classifier.Decision.caution, blocked_classifier.decision);
-    try std.testing.expectEqualStrings("test reviewer rationale", blocked_classifier.rationale);
-}
-
-test "ACP auto mode automatic review clears or cautions prepared external file mutation" {
-    const FakeClassifier = struct {
-        calls: usize = 0,
-        decision: permission_auto_classifier.Decision = .clear,
-        root_text: []const u8 = "",
-        saw_file_mutation_context: bool = false,
-
-        fn classify(
-            raw_ctx: *anyopaque,
-            alloc: Allocator,
-            request: permission_auto_classifier.ReviewRequest,
-        ) anyerror!permission_auto_classifier.ParseOutcome {
-            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
-            self.calls += 1;
-            self.root_text = request.review_turn.trusted_root_context;
-            self.saw_file_mutation_context = std.meta.activeTag(request.action) == .file_mutation;
-            return .{ .valid = .{
-                .risk = if (self.decision == .clear) .low else .high,
-                .decision = self.decision,
-                .rationale = try alloc.dupe(u8, "test reviewer rationale"),
-            } };
-        }
-    };
-
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try tmp.dir.createDirPath(io_mod.getIo(), "external");
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
-    defer alloc.free(external);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var state = try initTestAcpState(alloc, workspace, .auto);
-    defer state.deinit();
-    var fake = FakeClassifier{ .decision = .clear };
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = "session_1",
-        .auto_classifier = permission_auto_classifier.Classifier.withOverride(
-            @ptrCast(&fake),
-            FakeClassifier.classify,
-        ),
-    };
-
-    const target_path = try std.fs.path.join(arena, &.{ external, "desktop-test.txt" });
-    const arguments_json = try std.fmt.allocPrint(
-        arena,
-        "{{\"path\":\"{s}\",\"content\":\"hello\\n\"}}",
-        .{target_path},
-    );
-    const accepted_call: ToolCall = .{
-        .id = "external-write",
-        .name = "write_file",
-        .arguments_json = arguments_json,
-    };
-    var accepted_review = TestReviewTurn.init("Create desktop-test.txt with hello.", accepted_call);
-    const accepted = try requestToolPermissionOutcomeWithRequest(&ctx, arena, accepted_call, accepted_review.context(), .auto, &.{}, null, null, &.{}, null);
-
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
-    try std.testing.expect(!fake.saw_file_mutation_context);
-    try std.testing.expectEqualStrings("", fake.root_text);
-    try std.testing.expectEqual(ToolPermissionDecision.once, accepted.decision);
-    const authorization = switch (accepted.execution_authority orelse return error.TestExpectedEqual) {
-        .file_mutation => |authorization| authorization,
-        else => return error.TestExpectedEqual,
-    };
-    try std.testing.expect(authorization.prepared != null);
-    try std.testing.expectEqualStrings(target_path, authorization.input.path());
-
-    {
-        var existing = try tmp.dir.createFile(
-            io_mod.getIo(),
-            "external/desktop-test.txt",
-            .{ .truncate = true },
-        );
-        defer existing.close(io_mod.getIo());
-        try existing.writeStreamingAll(io_mod.getIo(), "existing\n");
-    }
-    fake.decision = .caution;
-    const blocked_call: ToolCall = .{
-        .id = "external-write-check",
-        .name = "write_file",
-        .arguments_json = arguments_json,
-    };
-    var blocked_review = TestReviewTurn.init("Create desktop-test.txt with hello.", blocked_call);
-    const blocked = try requestToolPermissionOutcomeWithRequest(&ctx, arena, blocked_call, blocked_review.context(), .auto, &.{}, null, null, &.{}, null);
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_caution, blocked.denial_reason.?);
-    try std.testing.expect(blocked.execution_authority == null);
-    const blocked_classifier = blocked.auto_review_result orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(permission_auto_classifier.Decision.caution, blocked_classifier.decision);
-    try std.testing.expectEqualStrings("test reviewer rationale", blocked_classifier.rationale);
-}
-
-test "ACP admits default-safe web fetch without a rule" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .auto);
-    defer state.deinit();
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
-
-    const call: ToolCall = .{
-        .id = "fetch",
-        .name = "web_fetch",
-        .arguments_json = "{\"url\":\"https://example.com/docs\"}",
-    };
-    const default_outcome = try requestToolPermissionOutcome(&ctx, arena, call, .auto, &.{}, &.{});
-    try std.testing.expectEqual(ToolPermissionDecision.once, default_outcome.decision);
-    try std.testing.expect(default_outcome.execution_authority != null);
-
-    state.active_session.?.permission_rules = try testPermissionRuleSet(alloc, "web_fetch", "domain:example.com", .ask);
-    const asked_outcome = try requestToolPermissionOutcome(&ctx, arena, call, .auto, &.{}, &.{});
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, asked_outcome.decision);
-
-    state.active_session.?.permission_rules.deinit(alloc);
-    state.active_session.?.permission_rules = try testPermissionRuleSet(alloc, "web_fetch", "domain:example.com", .deny);
-    const denied_outcome = try requestToolPermissionOutcome(&ctx, arena, call, .auto, &.{}, &.{});
-    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, denied_outcome.decision);
-    state.active_session.?.permission_rules.deinit(alloc);
-    state.active_session.?.permission_rules = .{};
-}
-
-test "ACP admits default-safe web_search before execution" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .auto);
-    defer state.deinit();
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
-
-    const decision = (try requestToolPermissionOutcome(&ctx, arena, .{
-        .id = "search",
-        .name = "web_search",
-        .arguments_json = "{\"query\":\"current news\"}",
-    }, .auto, &.{}, &.{})).decision;
-
-    try std.testing.expectEqual(ToolPermissionDecision.once, decision);
-}
-
-test "ACP admits default-safe web_fetch before execution" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .auto);
-    defer state.deinit();
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
-
-    const decision = (try requestToolPermissionOutcome(&ctx, arena, .{
-        .id = "fetch",
-        .name = "web_fetch",
-        .arguments_json = "{\"url\":\"https://example.com/docs\"}",
-    }, .auto, &.{}, &.{})).decision;
-
-    try std.testing.expectEqual(ToolPermissionDecision.once, decision);
-}
-
-test "ACP full advertisement includes direct provider search with explicit permission" {
-    var rules = [_]types.PermissionRule{
-        .{ .permission = @constCast("web_search"), .pattern = @constCast("*"), .action = .allow },
-    };
-    var projection = try tool_projection_mod.buildModelToolProjectionForSet(std.testing.allocator, builtin_tools.advertisement_set, .{
-        .permission_rules = .{ .rules = &rules },
-    });
-    defer projection.deinit(std.testing.allocator);
-    try std.testing.expect(tool_projection_mod.containsName(projection.advertised_names, "web_search"));
-    try std.testing.expectEqualStrings(builtin_tools.web_search.description, projection.custom_guidance);
-}
-
-test "ACP prompt agent config carries request options from active session" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-
-    var state = try initTestAcpState(alloc, workspace, .auto);
-    defer state.deinit();
-    state.gateway_team = try alloc.dupe(u8, "team_123");
-    state.context_limits.project_instruction_file_bytes = .{
-        .value = .{ .bytes = 17 },
-        .source = .command_line,
-    };
-    state.active_session.?.fast_mode = true;
-    state.active_session.?.effort = types.ReasoningEffort.literal("high");
-
-    const session = &state.active_session.?;
-    const config = buildAgentConfig(&state, session, .{
-        .advertised_tool_names = &.{"read_file"},
-        .advertised_functions = &.{builtin_tools.read_file.model_schema},
-        .custom_tool_guidance = "acp custom tool guidance",
-    }, true);
-
-    try std.testing.expect(config.fast_mode);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), config.effort);
-    try std.testing.expectEqual(@as(usize, 17), config.context_limits.project_instruction_file_bytes.effectiveBytes());
-    try std.testing.expectEqual(config_runtime.context_limits.Source.command_line, config.context_limits.project_instruction_file_bytes.source);
-    try std.testing.expect(tool_projection_mod.containsName(config.advertised_tool_names, "read_file"));
-    try std.testing.expectEqualStrings("acp custom tool guidance", config.custom_tool_guidance);
-    try std.testing.expectEqualStrings("ACP test model overlay", config.model_prompt_overlay.?);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
-    const tool_ctx = ctx.toolContext();
-    try std.testing.expect(!tool_ctx.web_search_runtime_ready);
-    try std.testing.expect(tool_ctx.web_search_backend != null);
-    try std.testing.expect(state.web_search_runtime.provider.?.execute_fn == state.cfg.provider_set.gateway.fx_search.?.execute_fn);
-    try std.testing.expect(state.web_search_runtime.provider.?.preferred_backends_fn == state.cfg.provider_set.gateway.fx_search.?.preferred_backends_fn);
-    try std.testing.expect(tool_ctx.web_fetch_runtime.? == &state.web_fetch_runtime);
-    try std.testing.expectEqualStrings("team_123", tool_ctx.gateway_team.?);
-    try std.testing.expectEqualStrings("team_123", state.web_search_runtime.gateway_team.?);
-    try std.testing.expectEqualStrings(session.model, state.web_search_runtime.worker_model);
-    try std.testing.expectEqual(state.cfg.gateway_retry_count, state.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
-    try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
 }

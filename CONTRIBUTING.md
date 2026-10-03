@@ -24,7 +24,7 @@ Requirements:
 
 * interactive terminal for manual shell testing
 
-* a model connection for model-backed flows. [Custom model connections](README.md#custom-model-connections) support local and remote endpoints. Vercel OAuth via `fx login`, macOS Keychain API keys via `fx setup`, `AI_GATEWAY_API_KEY`, and `VERCEL_OIDC_TOKEN` are also supported
+* a model connection for model-backed flows. [Custom model connections](README.md#custom-model-connections) support local and remote endpoints, including OpenRouter and local servers such as Ollama. Set `OPENROUTER_API_KEY` in your environment or save a key with `fx setup`
 
 Common commands:
 
@@ -79,13 +79,13 @@ If an AI coding agent writes any of your contribution's prose, including the PR 
 
 * `src/main.zig`: composition root only
 
-* `src/core/`: contracts, runtimes, config, sessions, permissions, MCP, skills
+* `src/core/`: contracts, runtimes, config, sessions, permissions, skills
 
 * `src/tools/`: built-in tool implementations
 
 * `src/ui/`: terminal rendering, event loop, input, transcript
 
-* `src/gateway/`: AI Gateway client transport
+* `src/gateway/`: OpenRouter and OpenAI Chat Completions client transport
 
 * `.fx/skills/`: optional fx-native workspace-level skill root
 
@@ -164,7 +164,7 @@ The interactive agent can also install skills via the `install_skill` tool when 
 `src/core/slack/install.zig` owns workspace bot installation, local credential
 persistence, and explicit refresh. The web bridge contract is fixed to
 `https://fx.sh/api/slack/install/config`, `/api/slack/install`, and
-`/api/slack/oauth/callback`. Employee MCP authentication is separate.
+`/api/slack/oauth/callback`.
 
 Build with `zig build`, then run `cd tests/e2e && bun test slack-install.test.ts`.
 The fixture exercises the freshly built binary and real loopback sockets without
@@ -179,195 +179,6 @@ the same computer as the listener.
 This E2E owner is verification-only in the PGSO corpus because it covers a rare
 workspace setup operation and security boundaries. Live Slack authorization and
 message attribution are not deterministic tests.
-
-## MCP
-
-Native fx connections use MCP v1 initialization by default over stdio,
-Streamable HTTP, and deprecated `2024-11-05` HTTP+SSE. Servers using the newer
-`2026-07-28` discovery lifecycle opt in with
-`FX_MCP_PROTOCOL_VERSION=2026-07-28` in their configured `environment` map.
-The SDK's host-owned client controls its own protocol negotiation. Native
-sessions load trusted MCP configuration from the profile:
-
-* `~/.fx/mcp.json`
-
-They also read Claude-compatible workspace configuration from:
-
-* `<workspace>/.mcp.json`
-
-Project `.fx.json` does not define runnable MCP commands, URLs, env, or secrets.
-The profile file reads top-level `mcp` and accepts `mcpServers` as a
-compatibility alias; `mcp` wins when both exist, and every write uses `mcp`.
-Suspicious server-like unsupported keys produce a bounded warning and block
-profile mutation instead of being overwritten. The workspace file reads only
-top-level `mcpServers`, accepts `command` plus `args`, and is opened as a
-bounded no-follow regular file. Profile entries win native name collisions;
-ACP request entries win ACP name collisions without deduplicating the request
-array. Workspace entries are always optional and never load stored credentials.
-Approved workspace `command`, `args`, `env`, and HTTP header values expand
-`${VAR}` and `${VAR:-default}` from the fx process environment. Pending and
-rejected entries do not read environment values. Missing required variables
-leave an approved server unloaded and appear in the `/mcp` and `/mcp list`
-menu without exposing values.
-
-Interactive sessions keep pending workspace servers disconnected and request
-project trust before any project-defined process or network effect. Pending
-resource, prompt, completion, and authentication commands require explicit
-`/mcp trust approve <name>` and a retry. Rejected servers remain disconnected.
-Choices live only in profile `settings.json` under the canonical workspace key,
-using `enabledMcpjsonServers`, `disabledMcpjsonServers`, and
-`enableAllProjectMcpServers`. Repository files cannot persist their own
-approval. `fx ask` and ACP skip pending workspace servers. Noninteractive users
-approve them first with `fx mcp trust approve <name>`; rejected servers remain
-disabled.
-
-The core feature surface is Tools, Resources and Resource Templates, Prompts,
-Completion, pagination, cache-aware discovery, subscriptions, progress,
-cancellation, and form or URL elicitation. Keep modern and legacy protocol
-behavior in their existing version-scoped modules.
-
-fx bounds schema size and structure before publication. It accepts schemas
-without `$schema`, the canonical JSON Schema 2020-12 declaration, and the
-canonical Draft 7 declaration used by legacy SDKs; other declared dialects are
-rejected. fx does not resolve network references or evaluate semantic schema
-assertions. Servers validate their tool arguments and results.
-
-The interactive surface supports:
-
-* `/mcp`
-
-* `/mcp list` (opens the same server menu)
-
-* `/mcp resource list <server>`
-
-* `/mcp resource templates <server>`
-
-* `/mcp resource read <server> <uri>`
-
-* `/mcp resource complete <server> <uri-template> <variable> [value]`
-
-* `/mcp prompt list <server>`
-
-* `/mcp prompt get <server> <name> [arguments-json]`
-
-* `/mcp prompt complete <server> <name> <argument> [value]`
-
-* `/mcp add <name> <command> [args...]`
-
-* `/mcp add --transport http <name> <url>`
-
-* `/mcp remove <name>`
-
-* `/mcp reload`
-
-* `/mcp auth <name> --open`
-
-* `/mcp logout <name>`
-
-* `/mcp trust approve <name>`
-
-* `/mcp trust reject <name>`
-
-* `/mcp trust approve-all`
-
-* `/mcp trust reset`
-
-* `/mcp path`
-
-The noninteractive MCP surface supports:
-
-* `fx mcp add <name> <command> [args...]`
-
-* `fx mcp add --transport http <name> <url>`
-
-* `fx mcp auth <name>`
-
-* `fx mcp list`
-
-* `fx mcp logout <name>`
-
-* `fx mcp path`
-
-* `fx mcp remove <name>`
-
-* `fx mcp trust approve <name>`
-
-* `fx mcp trust reject <name>`
-
-* `fx mcp trust approve-all`
-
-* `fx mcp trust reset`
-
-The local form saves a stdio command. The HTTP form saves a remote Streamable
-HTTP endpoint. List reads effective profile and workspace configuration plus
-stored authentication state without connecting servers. Path prints the profile
-configuration path. Remove uses the same locked canonical profile writer as
-add. Trust updates the canonical workspace entry in profile settings. Auth and
-logout run the existing remote credential lifecycle. None of these commands
-constructs the TUI or contacts the Gateway.
-
-The default MCP startup timeout is 30 seconds and remains overridable per
-server with `startup_timeout_ms`. Exact direct `docker run` stdio commands
-without `--cidfile` receive a private cidfile so fx can remove the container
-after shutdown or startup failure. An explicit cidfile remains user-owned.
-
-When a stdio server closes its connection before answering `initialize`, for
-example because its process exited, the reported failure names the exit code
-or signal and includes a bounded, terminal-safe excerpt of the server's stderr
-with secrets masked. A startup timeout names the limit that ran out, plus an
-earlier launch's exit when there was one, and names the `startup_timeout_ms`
-key when that setting set the limit. When a server writes a stdout line that
-is not an MCP message, such as a banner, the failure quotes the start of that
-line. A startup restart runs only when it could change the outcome: a server
-that closed its connection at every offered protocol version is not
-restarted, and neither is one whose startup deadline has already passed. A
-server that fx stopped because of invalid output still gets its restart. The
-model sees the same reason when it searches a named server that is down, or
-when a tool call finds its server stopped and the relaunch fails.
-
-MongoDB Atlas Managed MCP configuration service accounts use the OAuth
-client-credentials grant. fx does not implement that grant directly. Use
-MongoDB's `mongodb-atlas-mcp-remote` stdio wrapper with inherited
-`MDB_MCP_API_CLIENT_ID` and `MDB_MCP_API_CLIENT_SECRET` environment variables.
-The Atlas App Connection browser flow is user-delegated access and must not be
-treated as equivalent to configuration service-account credentials.
-
-Remote authentication supports configured bearer tokens and OAuth credential
-discovery, persistence, refresh, scope challenges, and logout. Credential and
-private-cache identity changes invalidate prior private state. macOS persists
-OAuth credentials in Keychain and migrates the private profile credential file
-only after verified publication. If the user account has no default Keychain,
-macOS falls back to the same `0600` credential file used on other platforms
-under the `0700` profile directory. `FX_DISABLE_KEYCHAIN=1` selects that portable
-backend explicitly for deterministic tests and local troubleshooting.
-
-Servers are optional by default. Required startup failures block the first TUI
-or `fx ask` model request; optional failures publish a reduced, degraded
-capability set. Terminal `fx ask` completes admitted MCP discovery before its
-first model request. JSON and other headless asks start required servers first
-and defer optional servers until the turn performs an MCP operation or delegates
-MCP capability to a child. Server-filtered searches, selected tools, and feature
-operations activate only their target; a broad search activates the broader
-catalog. Each server owns its startup and recovery progress. Connection deadlines
-cover discovery, fallback, and restarts together. Interactive authentication and
-logout change only the affected connection. `/mcp` and `/mcp list` open the same
-bounded, secret-free menu, which refreshes its live health snapshot while open.
-Noninteractive `fx mcp list` renders the health snapshot to stdout.
-
-Search and explicit selection share bounded schema publication. Definitions are
-checked against their runtime, connection, catalog, and credential generations
-before execution. Tool argument JSON must be bounded and object-shaped; semantic
-schema assertions belong to the server. Image results use the shared tool-result,
-provider, and versioned history paths. Saved native images use managed result
-artifacts that `read_tool_result` can load without repeating the original tool.
-
-`/mcp reload` evaluates a replacement before publication, so invalid config or
-a required-server failure leaves the prior runtime callable.
-
-ACP-provided servers are isolated to their owning ACP session. One-off and
-persistent subagents receive an immutable, permission-filtered view of the
-parent or ACP session's admitted MCP tools, resources, prompts, and completion
-capability. Missing, revoked, stale, or closed authority fails before transport.
 
 ## Permissions and Auto Mode
 
@@ -478,7 +289,7 @@ Releases are triggered automatically when the version in `src/main.zig` changes 
 2. Merge to `main`
 3. The release workflow checks if `vX.Y.Z` tag exists; if not, it builds four platform binaries, creates the git tag, and publishes a GitHub Release with the binaries attached
 
-The install script and `fx upgrade` fetch binaries from `releases.fx.sh`, backed by the public Vercel Blob CDN. No authentication or external CLI tools are required. The release workflow also publishes binaries to the CDN and updates `latest.txt` automatically.
+The install script and `fx upgrade` fetch binaries from the public release CDN. No authentication or external CLI tools are required. The release workflow also publishes binaries to the CDN and updates `latest.txt` automatically.
 
 After CI passes for a push to `main`, the dev release workflow publishes commit-addressed binaries and then updates `dev.json`. Dogfooders opt in with `fx upgrade --channel dev`; the choice is stored in their user settings and applies to manual upgrades, automatic upgrades, and the `ctrl+g` handoff. `fx upgrade --channel stable` returns to tagged releases. Dev publishing does not create tags or GitHub Releases.
 
@@ -498,68 +309,6 @@ same PGSO payload for comparison. Intel retains 4 KiB signatures. Download the
 workflow artifacts for matched signed-binary performance checks; notarization
 and smoke checks alone do not establish performance equivalence. Normal release
 runs keep the existing signing default.
-
-To compare the retained signatures on an isolated runner, run **Actions >
-Benchmarks** with `signed_run` set to the successful main validation run ID.
-This mode downloads already-notarized binaries and does not access Apple
-credentials. It records two alternating startup cohorts, an identical-control
-status calibration, and a separate native image-flow memory screen. Review the
-retained measurements before changing release signing defaults; successful
-measurement is not performance approval.
-
-## Benchmarks
-
-Startup latency benchmarks run automatically on every PR and push to `main` via `.github/workflows/bench.yml`.
-
-The workflow builds a ReleaseSafe binary, then uses [hyperfine](https://github.com/sharkdp/hyperfine) to measure wall-clock time for six paths:
-
-| Command                | Budget | What it measures                                   |
-| ---------------------- | ------ | -------------------------------------------------- |
-| `fx` (startup)         | 2ms    | Binary launch through CLI dispatch (no TTY needed) |
-| `fx help`              | 2ms    | Minimal startup, pure text output                  |
-| `fx status --json`     | 2ms    | Config read + JSON serialization                   |
-| `fx background --json` | 2ms    | Background record read                             |
-| `fx doctor --json`     | 2ms    | System checks, subprocess spawns                   |
-| `fx sessions --json`   | 2ms    | Session directory read                             |
-
-On PRs the check **fails** if any command exceeds its budget.
-
-The table is the authoritative Linux CI contract. Non-Linux local runs report
-raw means for comparison but do not assign a substitute product budget because
-the host process and dynamic-loader floor can independently exceed 2ms. The
-process baseline is diagnostic only and is never subtracted.
-
-The startup benchmark uses `FX_BENCH=1`, which runs through CLI dispatch and exits before TTY initialization.
-
-To run locally:
-
-```bash
-brew install hyperfine             # macOS (one-time)
-./benchmarks/startup.sh            # full run (100 iterations, builds ReleaseSafe)
-./benchmarks/startup.sh --quick    # quick run (20 iterations)
-```
-
-CI uses `--runs 100` with a reduced warmup and skips the build step because the
-workflow builds ReleaseSafe first. Results are written to
-`benchmarks/results/` (gitignored).
-
-The libfx runtime job measures cold startup, warm prompts, host-tool calls,
-stream throughput, and Agent cleanup. Its direct Pi comparison uses an external
-Zig HTTP server, Pi 0.84.4, and three alternating 100-sample rounds. On Bun,
-native libfx must match or beat Pi p50 and stay within 0.25 ms of Pi p95.
-The Node comparison is report-only because Node's bundled fetch client and
-Pi's dispatcher have different warm-request overhead. Both runtimes still
-require valid measurements, 300 samples, and exactly one inference request per
-prompt. Native/Wasm latency, host-tool, and resource gates remain blocking.
-Live model latency and bulk-stream throughput remain informational.
-
-```sh
-zig build-exe benchmarks/libfx/fake-inference-server.zig -O ReleaseSafe -femit-bin=/tmp/libfx-bench-server
-node benchmarks/libfx/bench-competitive.mjs --server /tmp/libfx-bench-server --pi-root /tmp/libfx-pi --out benchmarks/results/libfx
-```
-
-Build the SDK artifacts and install the pinned Pi package first, as shown in
-`.github/workflows/bench.yml`. Raw per-prompt samples remain in the output directory.
 
 ## Before Marking a PR Ready
 

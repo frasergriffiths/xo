@@ -16,8 +16,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const statusline_identity = @import("../workspace/statusline_identity.zig");
 const shared_io = @import("../shared/io.zig");
-const mcp_runtime = @import("../mcp/mcp_runtime.zig");
-const mcp_health = @import("../mcp/health.zig");
+
 const permissions = @import("../permissions/permissions.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -33,12 +32,6 @@ const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 
 const Allocator = std.mem.Allocator;
 
-const SessionAssemblyMcpServer = struct {
-    name: []const u8,
-    connection: []const u8,
-    tools: ?usize,
-};
-
 const SessionAssemblyFacts = struct {
     provider: []const u8,
     model: []const u8,
@@ -46,11 +39,9 @@ const SessionAssemblyFacts = struct {
     system_prompt_bytes: ?usize,
     tool_names: []const []const u8,
     skill_count: usize,
-    mcp_servers: []const SessionAssemblyMcpServer,
 };
 
 const session_tool_name_preview_max = 8;
-const session_mcp_server_preview_max = 10;
 
 /// Pure formatter for the full-only session assembly record. Facts in,
 /// bounded body text out; no I/O, no app state.
@@ -81,30 +72,9 @@ fn writeSessionAssemblyBody(
     }
     try writer.writeByte('\n');
     try writer.print("skills: {d} in catalog\n", .{facts.skill_count});
-    if (facts.mcp_servers.len == 0) {
-        try writer.writeAll("mcp: none");
-        return;
-    }
-    try writer.print("mcp: {d} server{s}: ", .{
-        facts.mcp_servers.len,
-        if (facts.mcp_servers.len == 1) "" else "s",
-    });
-    const shown = @min(facts.mcp_servers.len, session_mcp_server_preview_max);
-    for (facts.mcp_servers[0..shown], 0..) |server, index| {
-        if (index > 0) try writer.writeAll(", ");
-        try writer.writeAll(server.name);
-        try writer.writeAll(" (");
-        try writer.writeAll(server.connection);
-        if (server.tools) |tools| try writer.print(", {d} tools", .{tools});
-        try writer.writeAll(")");
-    }
-    if (facts.mcp_servers.len > shown) {
-        try writer.print(", +{d} more", .{facts.mcp_servers.len - shown});
-    }
 }
 
 pub const CapabilityProviders = struct {
-    load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     skill_root_policy: skill_contract.RootPolicy,
     terminal_title: host.TerminalTitle,
 };
@@ -137,7 +107,7 @@ fn BootstrapDeps(comptime App: type) type {
         bootstrap_interactive_app: BootstrapInteractiveAppFn,
         configure_session_preferences: ConfigureSessionPreferencesFn,
         initialize_persistence: InitializePersistenceFn,
-        load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+
         load_skills: LoadSkillsFn,
         skill_root_policy: skill_contract.RootPolicy,
         welcome_message: WelcomeMessageFn,
@@ -184,7 +154,7 @@ pub fn Runtime(comptime App: type) type {
                 .bootstrap_interactive_app = bootstrapInteractiveAppDefault,
                 .configure_session_preferences = configureSessionPreferencesDefault,
                 .initialize_persistence = initializePersistenceDefault,
-                .load_mcp_runtime = capability_providers.load_mcp_runtime,
+
                 .load_skills = app_runtime_setup.loadSkills,
                 .skill_root_policy = capability_providers.skill_root_policy,
                 .welcome_message = welcomeMessageDefault,
@@ -258,39 +228,9 @@ pub fn Runtime(comptime App: type) type {
 
         /// Writes one full-only record describing what this session assembled:
         /// provider/model/effort, system prompt size, advertised tools, skill
-        /// catalog size, and MCP server states. Live-session only; resume does
+        /// catalog size. Live-session only; resume does
         /// not replay it, matching other full-only startup detail.
         fn writeSessionAssemblyNotice(app: *App, provider_label: []const u8) !void {
-            var mcp_servers: std.ArrayList(SessionAssemblyMcpServer) = .empty;
-            // Names are duped: the health snapshot is released with its lease
-            // at the end of the acquire block, before the body is rendered.
-            defer {
-                for (mcp_servers.items) |server| app.alloc.free(server.name);
-                mcp_servers.deinit(app.alloc);
-            }
-            if (comptime @hasDecl(App, "acquireMcpRuntime")) {
-                if (app.acquireMcpRuntime()) |lease_value| {
-                    var lease = lease_value;
-                    defer lease.deinit();
-                    const captured_at_ms: u64 = @intCast(@max(shared_io.milliTimestamp(), 0));
-                    var snapshot: ?mcp_health.Snapshot = lease.runtime.snapshotHealth(app.alloc, captured_at_ms) catch |err| blk: {
-                        debug_trace.logf("bootstrap", "session assembly mcp snapshot failed err={s}", .{@errorName(err)});
-                        break :blk null;
-                    };
-                    defer if (snapshot) |*value| value.deinit(app.alloc);
-                    if (snapshot) |*value| {
-                        for (value.servers) |server| {
-                            const name = try app.alloc.dupe(u8, server.configured_name);
-                            errdefer app.alloc.free(name);
-                            try mcp_servers.append(app.alloc, .{
-                                .name = name,
-                                .connection = @tagName(server.connection),
-                                .tools = server.counts.tools,
-                            });
-                        }
-                    }
-                }
-            }
             const system_prompt_bytes: ?usize = if (comptime @hasDecl(App, "promptPolicy"))
                 app.promptPolicy().system_prompt.len
             else
@@ -312,7 +252,6 @@ pub fn Runtime(comptime App: type) type {
                 .system_prompt_bytes = system_prompt_bytes,
                 .tool_names = tool_names,
                 .skill_count = app.skills.items.len,
-                .mcp_servers = mcp_servers.items,
             });
             try app.shell.appendFullDetailRecord(app.alloc, .{
                 .topic = "session",
@@ -373,7 +312,6 @@ pub fn Runtime(comptime App: type) type {
             }
             app.auth.recordStartupStatus(
                 startup.stored_key_status,
-                startup.fx_login_status,
                 startup.credential_load_failure,
                 startup.credential_onboarding_skipped,
             );
@@ -381,14 +319,17 @@ pub fn Runtime(comptime App: type) type {
                 app.auth.refreshSourceInventory(app.alloc) catch |err| {
                     debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
                 };
-            } else if (comptime @hasDecl(@TypeOf(app.auth), "refreshChatGptSourceInventory")) {
-                app.auth.refreshChatGptSourceInventory(app.alloc) catch |err| {
-                    debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
-                };
             }
             const startup_auth_view = app.auth.view();
             if (startup_auth_view.active_source == null and !startup_auth_view.onboarding_skipped) {
-                app.auth.openOnboardingPicker(app.alloc);
+                // One command supplies the only credential fx accepts. Startup
+                // names it once rather than opening a picker over the transcript.
+                app.auth.noteCredentialGuidanceShown();
+                app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = credentials.missing_interactive_credential_message,
+                }, true) catch {};
             }
             if (comptime @hasField(App, "terminal_input_runtime") and @hasField(App, "terminal")) {
                 // Own theme protocol bytes even under FX_THEME; probing stays gated.
@@ -427,6 +368,9 @@ pub fn Runtime(comptime App: type) type {
                 app.provider_selection.model_requests_blocked = startup.model_requests_blocked;
                 app.provider_selection.definitions = startup.configured_providers;
                 startup.configured_providers = .{};
+                if (startup.openai_compatible_base_url.len > 0) {
+                    try app.provider_selection.setOpenAiCompatibleBaseUrl(startup.openai_compatible_base_url);
+                }
                 app.provider_selection.adoptOwned(startup.provider, &selected_model);
             } else {
                 try provider_runtime.replaceModel(app, selected_model);
@@ -495,16 +439,6 @@ pub fn Runtime(comptime App: type) type {
                 app,
                 app.requested_resume != null,
             );
-            const profile_mcp = try deps.load_mcp_runtime(
-                app.alloc,
-                app.workspace_root,
-                .{ .form = true, .url = true },
-            );
-            if (comptime @hasDecl(App, "installInitialMcpRuntime")) {
-                app.installInitialMcpRuntime(profile_mcp);
-            } else {
-                app.mcp_runtime = profile_mcp;
-            }
 
             var loaded = try deps.load_skills(
                 std.heap.c_allocator,
@@ -534,9 +468,7 @@ pub fn Runtime(comptime App: type) type {
                     },
                 );
                 try app.writeTranscriptClassified(welcome_message, true, .welcome);
-                if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
-                    try app.presentProjectMcpPrompt();
-                }
+
                 // Fresh sessions only: on resume the transcript must stay
                 // empty until the deferred session load replays history.
                 try writeSessionAssemblyNotice(app, startup.provider.label());
@@ -562,7 +494,7 @@ pub fn Runtime(comptime App: type) type {
                 const auth_view = app.auth.view();
                 const load_error: ?anyerror = if (startup.credential_load_failure) |failure|
                     failure.err
-                else if (auth_view.stored_key_status == .unavailable or auth_view.fx_login_status == .unavailable)
+                else if (auth_view.stored_key_status == .unavailable)
                     error.CredentialStorageUnavailable
                 else
                     null;
@@ -729,7 +661,7 @@ const test_workspace_skill_roots = [_]skill_contract.RootSpec{
 };
 
 const test_global_skill_roots = [_]skill_contract.RootSpec{
-    .{ .source = .global_codex, .path = ".codex/skills" },
+    .{ .source = .global_openrouter, .path = ".openrouter/skills" },
 };
 
 const TestApp = struct {
@@ -757,7 +689,7 @@ const TestApp = struct {
     statusline_session: bool = false,
     workspace_identity: statusline_identity.Runtime = .{},
     requested_resume: ?u8 = null,
-    mcp_runtime: ?*mcp_runtime.McpRuntime = null,
+
     skills: skill_runtime.Runtime = .{},
     transcript: std.ArrayList(u8) = .empty,
     transcript_recorded: bool = false,
@@ -779,11 +711,7 @@ const TestApp = struct {
         self.selected_model.deinit(self.alloc);
         self.permission_engine.deinit(self.alloc);
         self.worker.deinit(std.heap.c_allocator);
-        if (self.mcp_runtime) |runtime| {
-            runtime.deinit();
-            self.alloc.destroy(runtime);
-            self.mcp_runtime = null;
-        }
+
         self.skills.deinit(std.heap.c_allocator);
         self.input_runtime.deinit(self.alloc);
         self.terminal_input_runtime.deinit(self.alloc);
@@ -831,7 +759,7 @@ fn testDeps() BootstrapDeps(TestApp) {
         .bootstrap_interactive_app = bootstrapInteractiveAppForTest,
         .configure_session_preferences = configureSessionPreferencesForTest,
         .initialize_persistence = initializePersistenceForTest,
-        .load_mcp_runtime = loadMcpRuntimeForTest,
+
         .load_skills = loadSkillsForTest,
         .skill_root_policy = .{
             .workspace_roots = &test_workspace_skill_roots,
@@ -889,8 +817,7 @@ fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
         errdefer alloc.free(credential_team);
         state.credential = .{
             .token = credential_token,
-            .source = .ai_gateway_api_key,
-            .team_id = credential_team,
+            .source = .openrouter_api_key,
         };
     }
     state.stored_key_status = .not_found;
@@ -900,7 +827,7 @@ fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
     state.configured_model = try alloc.dupe(u8, "configured-model");
     errdefer alloc.free(state.configured_model);
     state.model_source = .process_override;
-    state.permission_mode = .auto;
+    state.permission_mode = .yolo;
     state.context_enabled = false;
     state.fast_mode = true;
     state.fast_mode_model_bound = true;
@@ -924,11 +851,6 @@ fn initializePersistenceForTest(
 ) !void {
     _ = app;
     active_capture.?.initialize_required = required;
-}
-
-fn loadMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
-    active_capture.?.recordEvent("load_mcp");
-    return null;
 }
 
 fn loadSkillsForTest(
@@ -1066,348 +988,3 @@ fn runBootstrapWithOverridesForTest(app: *TestApp, capture: *TestCapture, overri
 }
 
 fn resizeHandlerForTest(_: std.posix.SIG) callconv(.c) void {}
-
-test "app_bootstrap_runtime applies interactive launch flag overrides" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(alloc);
-    var app = TestApp.init(alloc);
-    defer app.deinit();
-
-    try runBootstrapWithOverridesForTest(&app, &capture, .{
-        .model = "launch-model",
-        .effort = types.ReasoningEffort.literal("low"),
-        .fast = true,
-    });
-
-    try std.testing.expectEqualStrings("launch-model", capture.runtimeModel());
-    try std.testing.expectEqualStrings("launch-model", app.selected_model.items);
-    try std.testing.expect(app.fast_mode);
-    try std.testing.expect(app.effort.eql(types.ReasoningEffort.literal("low")));
-    // Stored preferences keep the configured values; the flags stay per-launch.
-    try std.testing.expect(capture.configured_effort.eql(types.ReasoningEffort.literal("high")));
-    try std.testing.expect(!capture.configured_fast_mode);
-    // --fast binds to the launch model so the footer indicator reflects it.
-    try std.testing.expect(capture.configured_fast_mode_model_bound);
-    try std.testing.expectEqualStrings("configured-model", capture.configuredModel());
-    // The process overrides carry the flag values so a resume re-applies them.
-    try std.testing.expect(capture.effort_process_override.?.eql(types.ReasoningEffort.literal("low")));
-    try std.testing.expectEqual(@as(?bool, true), capture.fast_process_override);
-    try std.testing.expectEqual(@as(?model_provider.ProviderId, null), capture.provider_process_override);
-}
-
-test "app_bootstrap_runtime applies provider routing launch overrides" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(alloc);
-    var app = TestApp.init(alloc);
-    defer app.deinit();
-
-    const order = [_][]const u8{ "azure", "anthropic" };
-    try runBootstrapWithOverridesForTest(&app, &capture, .{
-        .provider_order = &order,
-        .provider_strict = true,
-    });
-
-    const settings = app.worker.agent_turn_settings;
-    try std.testing.expectEqual(@as(usize, 2), settings.provider_order.len);
-    try std.testing.expectEqualStrings("azure", settings.provider_order[0]);
-    try std.testing.expectEqualStrings("anthropic", settings.provider_order[1]);
-    try std.testing.expect(settings.provider_strict);
-}
-
-test "app_bootstrap_runtime launch provider override marks the provider for resume" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(alloc);
-    var app = TestApp.init(alloc);
-    defer app.deinit();
-
-    try runBootstrapWithOverridesForTest(&app, &capture, .{
-        .provider = .grok,
-    });
-
-    try std.testing.expectEqual(
-        @as(?model_provider.ProviderId, .grok),
-        capture.provider_process_override,
-    );
-}
-
-test "app_bootstrap_runtime model override drops compiled-default fast mode" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(alloc);
-    var app = TestApp.init(alloc);
-    defer app.deinit();
-
-    try runBootstrapWithOverridesForTest(&app, &capture, .{
-        .model = "other-model",
-    });
-
-    try std.testing.expectEqualStrings("other-model", capture.runtimeModel());
-    try std.testing.expectEqualStrings("other-model", app.selected_model.items);
-    try std.testing.expect(!app.fast_mode);
-    try std.testing.expect(!capture.configured_fast_mode);
-    try std.testing.expect(capture.configured_effort.eql(types.ReasoningEffort.literal("high")));
-    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), capture.effort_process_override);
-    try std.testing.expectEqual(@as(?bool, null), capture.fast_process_override);
-}
-
-test "app_bootstrap_runtime transfers startup state and starts a fresh session" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(alloc);
-    var app = TestApp.init(alloc);
-    defer app.deinit();
-
-    try runBootstrapForTest(&app, &capture);
-
-    try std.testing.expectEqual(@as(usize, 1), capture.bootstrap_calls);
-    try std.testing.expectEqual(@as(u16, 4), capture.footer_rows);
-    try std.testing.expectEqualStrings("default-model", capture.default_model);
-    try std.testing.expectEqual(@as(usize, 24), capture.default_agent_step_limit);
-    try std.testing.expectEqualStrings(TestApp.app_version, capture.fx_version);
-    try std.testing.expectEqualStrings(
-        "configured-model",
-        capture.configuredModel(),
-    );
-    try std.testing.expectEqual(
-        config_runtime.ModelSource.process_override,
-        capture.configured_model_source,
-    );
-    try std.testing.expectEqualStrings("model-x", capture.runtimeModel());
-    try std.testing.expectEqual(
-        types.ReasoningEffort.literal("high"),
-        capture.configured_effort,
-    );
-    try std.testing.expect(capture.configured_fast_mode);
-    try std.testing.expect(capture.configured_fast_mode_model_bound);
-    try std.testing.expectEqual(
-        update_target.Channel.dev,
-        app.upgrader.channel(),
-    );
-    try std.testing.expect(!capture.initialize_required);
-    try std.testing.expectEqualStrings("/workspace", capture.load_skills_workspace);
-    try std.testing.expectEqual(@as(usize, 1), capture.load_skills_workspace_root_count);
-    try std.testing.expectEqual(@as(usize, 1), capture.load_skills_global_root_count);
-    const events = capture.eventSlice();
-    try std.testing.expectEqual(@as(usize, 6), events.len);
-    try std.testing.expectEqualStrings("load_mcp", events[0]);
-    try std.testing.expectEqualStrings("load_skills", events[1]);
-    try std.testing.expectEqualStrings("welcome", events[2]);
-    try std.testing.expectEqualStrings("begin_fresh", events[3]);
-    try std.testing.expectEqualStrings("enable_stores", events[4]);
-    try std.testing.expectEqualStrings("title", events[5]);
-    try std.testing.expectEqual(@as(usize, 1), capture.begin_calls);
-    try std.testing.expectEqual(@as(usize, 1), capture.enable_calls);
-    try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", capture.titleText());
-
-    try std.testing.expectEqualStrings("/workspace", app.workspace_root);
-    try std.testing.expectEqualStrings("api-key", app.auth.apiKey().?);
-    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, app.auth.credentialSource().?);
-    try std.testing.expectEqualStrings("team_123", app.auth.gatewayTeam().?);
-    const auth_view = app.auth.view();
-    try std.testing.expectEqual(credentials.StoredKeyReadStatus.not_found, auth_view.stored_key_status);
-    try std.testing.expect(auth_view.onboarding_skipped);
-    try std.testing.expectEqualStrings("model-x", app.selected_model.items);
-    try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);
-    try std.testing.expectEqual(@as(usize, 19), app.agent_step_limit);
-    try std.testing.expectEqual(@as(usize, 131072), app.worker.agent_turn_settings.max_tool_result_bytes);
-    try std.testing.expectEqual(types.ToolChoice.none, app.worker.agent_turn_settings.first_call_tool_choice);
-    try std.testing.expect(app.worker.agent_turn_settings.fast_mode);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.worker.agent_turn_settings.effort);
-    try std.testing.expect(!app.context_enabled);
-    try std.testing.expect(app.fast_mode);
-    try std.testing.expect(!app.auto_upgrade_enabled);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
-    try std.testing.expect(app.workspace_identity.enabled);
-    try std.testing.expectEqualStrings("/skills", app.skills.dir);
-    try std.testing.expectEqualStrings("welcome\n", app.transcript.items);
-    try std.testing.expect(app.transcript_recorded);
-    try std.testing.expect(app.shell.render_requests.hasReason(.first_frame));
-    try std.testing.expect(app.begin_fresh_called);
-}
-
-test "app_bootstrap_runtime opens onboarding before first frame without a credential" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(alloc);
-    capture.startup_with_credential = false;
-    capture.onboarding_skipped = false;
-    var app = TestApp.init(alloc);
-    defer app.deinit();
-
-    try runBootstrapForTest(&app, &capture);
-
-    const picker = app.auth.pickerView();
-    try std.testing.expect(picker.active);
-    try std.testing.expect(picker.include_skip);
-    try std.testing.expectEqual(auth_runtime.PickerStage.root, picker.stage);
-    try std.testing.expect(app.shell.render_requests.hasReason(.first_frame));
-}
-
-test "app_bootstrap_runtime defers requested session loading until after bootstrap" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(alloc);
-    var app = TestApp.init(alloc);
-    app.requested_resume = 1;
-    defer app.deinit();
-
-    try runBootstrapForTest(&app, &capture);
-
-    try std.testing.expect(capture.initialize_required);
-    try std.testing.expectEqual(@as(usize, 0), capture.begin_calls);
-    try std.testing.expectEqual(@as(usize, 0), capture.enable_calls);
-    try std.testing.expectEqualStrings("", capture.titleText());
-    try std.testing.expect(app.shell.render_requests.hasReason(.first_frame));
-    try std.testing.expectEqual(@as(?u8, 1), app.requested_resume);
-    try std.testing.expect(!app.begin_fresh_called);
-    try std.testing.expectEqualStrings("", app.transcript.items);
-    try std.testing.expect(!app.transcript_recorded);
-    const events = capture.eventSlice();
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "load_mcp", "load_skills" },
-        events,
-    );
-}
-
-test "app_bootstrap_runtime renders startup notices without a resume cache" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(alloc);
-    capture.emit_skill_diagnostic = true;
-    var app = TestApp.init(alloc);
-    app.requested_resume = 1;
-    defer app.deinit();
-
-    try runBootstrapForTest(&app, &capture);
-
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{
-            "load_mcp",
-            "load_skills",
-            "welcome",
-            "welcome",
-        },
-        capture.eventSlice(),
-    );
-}
-
-test "app_bootstrap_runtime deinitializes app after bootstrap dependency failure" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(alloc);
-    capture.bootstrap_error = error.LayoutFailed;
-    capture.bootstrap_init_backing_before_error = true;
-    var app = TestApp.init(alloc);
-
-    try std.testing.expectError(error.LayoutFailed, runBootstrapForTest(&app, &capture));
-    try std.testing.expectEqual(@as(usize, 1), app.deinit_calls);
-}
-
-test "app_bootstrap_runtime propagates skill discovery allocation failure" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(alloc);
-    capture.load_skills_error = error.OutOfMemory;
-    var app = TestApp.init(alloc);
-
-    try std.testing.expectError(error.OutOfMemory, runBootstrapForTest(&app, &capture));
-    try std.testing.expectEqual(@as(usize, 1), app.deinit_calls);
-}
-
-test "app_bootstrap_runtime reports a bounded skill discovery warning" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(alloc);
-    capture.emit_skill_diagnostic = true;
-    var app = TestApp.init(alloc);
-    defer app.deinit();
-
-    try runBootstrapForTest(&app, &capture);
-
-    try std.testing.expectEqual(@as(usize, 1), app.skills.diagnostics.len);
-    try std.testing.expect(capture.early_notice_palette_initialized);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "* skills: 1 discovery issue; some skills may be missing (ctrl+o to view)\n") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "* skills: skill discovery warning:") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "hostile&#x0a;path/body-sentinel") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "metadata is invalid (missing_name)") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, " [full-only]\n") != null);
-}
-
-test "app_bootstrap_runtime collapses config diagnostics into one neutral summary" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(alloc);
-    capture.emit_config_diagnostics = true;
-    var app = TestApp.init(alloc);
-    defer app.deinit();
-
-    try runBootstrapForTest(&app, &capture);
-
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "* config: 2 configuration issues (ctrl+o to view)\n") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "user: malformed_settings\nproject: settings_too_large [full-only]\n") != null);
-}
-
-test "writeSessionAssemblyBody renders bounded facts" {
-    const alloc = std.testing.allocator;
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
-    const tool_names = [_][]const u8{ "read_file", "edit_file", "run_command" };
-    const mcp_servers = [_]SessionAssemblyMcpServer{
-        .{ .name = "linear", .connection = "ready", .tools = 12 },
-        .{ .name = "slack", .connection = "connecting", .tools = null },
-    };
-    try writeSessionAssemblyBody(&body.writer, .{
-        .provider = "gateway",
-        .model = "kimi-k3",
-        .effort = "high",
-        .system_prompt_bytes = 12345,
-        .tool_names = &tool_names,
-        .skill_count = 7,
-        .mcp_servers = &mcp_servers,
-    });
-    try std.testing.expectEqualStrings(
-        "provider: gateway · model: kimi-k3 · effort: high\n" ++
-            "system prompt: ready · 12345 bytes\n" ++
-            "tools: 3 advertised (read_file, edit_file, run_command)\n" ++
-            "skills: 7 in catalog\n" ++
-            "mcp: 2 servers: linear (ready, 12 tools), slack (connecting)",
-        body.written(),
-    );
-}
-
-test "writeSessionAssemblyBody caps long tool and server lists" {
-    const alloc = std.testing.allocator;
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
-    var tool_names: [12][]const u8 = undefined;
-    for (&tool_names, 0..) |*name, index| {
-        name.* = try std.fmt.allocPrint(alloc, "tool_{d}", .{index});
-    }
-    defer for (&tool_names) |*name| alloc.free(name.*);
-    try writeSessionAssemblyBody(&body.writer, .{
-        .provider = "gateway",
-        .model = "m",
-        .effort = "auto",
-        .system_prompt_bytes = null,
-        .tool_names = &tool_names,
-        .skill_count = 0,
-        .mcp_servers = &.{},
-    });
-    try std.testing.expect(std.mem.find(u8, body.written(), "system prompt") == null);
-    try std.testing.expect(std.mem.find(u8, body.written(), "+4 more") != null);
-    try std.testing.expect(std.mem.find(u8, body.written(), "mcp: none") != null);
-}
-
-test "app_bootstrap_runtime records a full-only session assembly record" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(alloc);
-    var app = TestApp.init(alloc);
-    defer app.deinit();
-
-    try runBootstrapForTest(&app, &capture);
-
-    // The record lives in the full-detail side list, not the transcript.
-    try std.testing.expectEqualStrings("welcome\n", app.transcript.items);
-    try std.testing.expectEqual(@as(usize, 1), app.shell.full_detail_records.items.len);
-    const record = app.shell.full_detail_records.items[0].notice;
-    try std.testing.expectEqualStrings("session", record.topic);
-    try std.testing.expectEqual(types.NoticeTone.neutral, record.tone);
-    try std.testing.expectEqual(types.NoticeVisibility.full_only, record.visibility);
-    try std.testing.expect(std.mem.find(u8, record.body, "provider:") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "model: model-x") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "skills: 0 in catalog") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "mcp: none") != null);
-}

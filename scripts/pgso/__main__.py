@@ -27,12 +27,8 @@ from scripts.pgso.pipeline import (
 from scripts.pgso.qualify import (
     EvidenceRecorder,
     REQUIRED_EVIDENCE,
-    build_profile_linked_benchmarks,
-    measure_heavy_workloads,
     measure_startup,
     measurement_payload,
-    profile_linked_benchmark_evidence,
-    relink_profile_linked_benchmarks,
     require_measurements_passed,
 )
 from scripts.pgso.runner import cancellation_guard, run_checked
@@ -421,11 +417,6 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
 
         stage = "profile-use"
         recorder.stage(stage, "running")
-        linked_benchmarks = build_profile_linked_benchmarks(
-            toolchain,
-            REPO_ROOT,
-            paths,
-        )
         emit_bitcode(
             toolchain,
             spec,
@@ -434,11 +425,6 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
         )
         apply_profile(toolchain, paths, bitcode_sha256)
         link_candidate(toolchain, paths)
-        linked_benchmarks = relink_profile_linked_benchmarks(
-            toolchain,
-            paths,
-            linked_benchmarks,
-        )
         candidate = verify_candidate(
             toolchain,
             paths,
@@ -470,20 +456,12 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
                 (paths.logs / "candidate-layout.json").read_text(encoding="utf-8")
             ),
         }
-        supplement_evidence = profile_linked_benchmark_evidence(
-            linked_benchmarks,
-            paths.profile_use_ir.read_text(
-                encoding="utf-8",
-                errors="replace",
-            ),
-        )
         profile = {
             "path": str(paths.merged_profile),
             "sha256": sha256_file(paths.merged_profile),
             "size_bytes": paths.merged_profile.stat().st_size,
             "merged_raw_profiles": merged_raw_profiles,
             "summary": _profile_summary(toolchain, paths),
-            "supplements": supplement_evidence,
         }
         recorder.stage(
             stage,
@@ -532,27 +510,6 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
             {"startup": measurement_payload(startup_results)},
         )
         require_measurements_passed("startup", startup_results)
-
-        stage = "heavy-workloads"
-        recorder.stage(stage, "running")
-        heavy_results = measure_heavy_workloads(
-            toolchain=None,
-            repo_root=REPO_ROOT,
-            output_dir=paths.root / "measurements" / "heavy",
-            samples=arguments.samples,
-            timeout_s=arguments.timeout_seconds,
-            prebuilt_pairs={
-                selector: linked.pair
-                for selector, linked in linked_benchmarks.items()
-            },
-            hyperfine_binary=hyperfine,
-        )
-        recorder.stage(
-            stage,
-            "passed",
-            {"heavy_workloads": measurement_payload(heavy_results)},
-        )
-        require_measurements_passed("heavy workload", heavy_results)
 
         recorder.complete()
         return recorder.path

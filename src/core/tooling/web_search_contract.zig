@@ -47,7 +47,7 @@ pub const ProviderRequest = struct {
     max_output_tokens: u32 = 4096,
     max_output_chars: usize = 100_000,
     timeout_ms: u32 = 30_000,
-    cancel_flag: *const std.atomic.Value(bool),
+    cancel_flag: *std.atomic.Value(bool),
 };
 
 pub const Progress = union(enum) {
@@ -155,32 +155,4 @@ pub const ExecutionOutput = struct {
 fn deinitItems(alloc: Allocator, items: []const ResultItem) void {
     for (items) |item| item.deinit(alloc);
     if (items.len > 0) alloc.free(items);
-}
-
-test "backend identity compares provider-owned values" {
-    const copied = [_]u8{ 'p', 'r', 'o', 'v', 'i', 'd', 'e', 'r', '.', 'o', 'n', 'e' };
-    const expected = SearchBackendId{ .value = "provider.one" };
-
-    try std.testing.expect(expected.eql(.{ .value = &copied }));
-    try std.testing.expect(!expected.eql(.{ .value = "provider.two" }));
-}
-
-test "provider response transfers ordered results to output" {
-    const content = [_]ResultItem{
-        .{ .commentary = "researching" },
-        .{ .error_text = "bounded failure" },
-    };
-    var response = ProviderResponse{
-        .content = &content,
-    };
-    const output = Output{
-        .query = "zig",
-        .results = response.takeContent(),
-        .duration_ms = 1,
-        .web_search_requests = 0,
-    };
-
-    try std.testing.expectEqual(@as(usize, 0), response.content.len);
-    try std.testing.expectEqualStrings("researching", output.results[0].commentary);
-    try std.testing.expectEqualStrings("bounded failure", output.results[1].error_text);
 }

@@ -9,10 +9,11 @@ const context_contract = @import("core/workspace/context_contract.zig");
 const host = @import("core/hosts/host.zig");
 const io_mod = @import("core/shared/io.zig");
 const fetch_state = @import("napi_fetch_state.zig");
-const streamable_http = @import("core/mcp/streamable_http.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
-const oauth_transport = @import("core/auth/oauth_transport.zig");
-const builtin_gateway = @import("builtins/gateway.zig");
+const codec = @import("gateway/chat_completions_protocol.zig");
+const model_provider = @import("core/config/model_provider.zig");
+const streams = @import("core/agent/stream_provider.zig");
+const openrouter = @import("gateway/openrouter.zig");
 const builtin_modes = @import("builtins/modes.zig");
 
 const c = @cImport({
@@ -514,24 +515,23 @@ const Runtime = struct {
 
     fn run(self: *Runtime) void {
         const provider = gateway_provider.Provider{
-            .oauth_transport = oauth_transport.unavailable_provider,
-            .chat_url = builtin_gateway.provider.chat_url,
+            .chat_url = openrouter.chat_url,
         };
-        const providers = provider_set.gateway_only(.{
-            .presentation = builtin_gateway.provider_bundle.presentation,
-            .auth_strategy = .vercel,
-            .fallback_model_capabilities_fn = builtin_gateway.provider_bundle.fallback_model_capabilities_fn,
+        const providers = provider_set.openrouter_only(.{
+            .presentation = openrouter.provider_bundle.presentation,
+            .auth_strategy = .api_key,
+            .fallback_model_capabilities_fn = openrouter.fallbackModelCapabilities,
             .agent_stream = host_stream_provider.provider(&self.stream_context),
             .model_catalog = @import("gateway/host_model_catalog.zig").provider(&self.stream_context.transport),
         });
         acp_server.runWithTransport(
             self.alloc,
             .{
-                .default_model = builtin_gateway.default_model,
+                .default_model = openrouter.default_model,
                 .default_agent_step_limit = agent_steps.default_max_agent_steps,
                 .gateway_retry_count = 0,
                 .gateway_chat_url = self.gateway_chat_url,
-                .gateway_models_path = builtin_gateway.models_path,
+                .gateway_models_path = openrouter.models_path,
                 .gateway_provider = provider,
                 .provider_set = providers,
                 .secret_store = host.unavailable_secret_store,
@@ -552,7 +552,6 @@ const Runtime = struct {
                 .fast_override = self.fast,
                 .home_override = self.home,
                 .workspace_root_override = self.workspace_root,
-                .allow_acp_mcp = false,
                 .allow_native_tools = false,
                 .minimal_kernel = true,
             },
@@ -795,12 +794,12 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidGatewayUrl,
-    }) orelse (alloc.dupe(u8, builtin_gateway.default_chat_url) catch return error.OutOfMemory);
+    }) orelse (alloc.dupe(u8, openrouter.chat_url) catch return error.OutOfMemory);
     errdefer alloc.free(gateway_chat_url);
-    streamable_http.validateEndpoint(gateway_chat_url) catch return error.InvalidGatewayUrl;
-    if (!std.mem.eql(u8, gateway_chat_url, builtin_gateway.default_chat_url)) {
+    {
         const uri = std.Uri.parse(gateway_chat_url) catch return error.InvalidGatewayUrl;
-        if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.InvalidGatewayUrl;
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and
+            !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.InvalidGatewayUrl;
     }
 
     const runtime = alloc.create(Runtime) catch return error.OutOfMemory;
@@ -821,7 +820,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
     };
     runtime.fetch.ready = &runtime.ready;
     runtime.output.ready = &runtime.ready;
-    runtime.stream_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, .{ .fixed = runtime.gateway_chat_url }, .{
+    runtime.stream_context = host_stream_provider.initContext(buildAgentRequest, .{ .fixed = runtime.gateway_chat_url }, .{
         .context = &runtime.fetch,
         .open_fn = FetchBridge.open,
         .status_fn = FetchBridge.statusFn,
@@ -831,6 +830,21 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
     runtime.thread = std.Thread.spawn(.{}, Runtime.run, .{runtime}) catch return error.ThreadFailed;
     return runtime;
 }
+
+/// Serializes an agent request exactly as the OpenRouter transport does, so the
+/// host-proxied stream speaks the same wire format as the native transport.
+fn buildAgentRequest(alloc: std.mem.Allocator, request: streams.RequestData) ![]u8 {
+    return codec.build_request(alloc, request, .{
+        .tool_choice_mode = openrouter.definition.tool_choice_mode,
+        .provider = &openrouter_identity,
+        .upstream_routing = .{
+            .order = request.provider_options.provider_order,
+            .allow_fallback = !request.provider_options.provider_strict,
+        },
+    });
+}
+
+const openrouter_identity: model_provider.ProviderId = .openrouter;
 
 fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
     return switch (err) {

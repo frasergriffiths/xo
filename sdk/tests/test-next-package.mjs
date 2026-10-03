@@ -79,7 +79,7 @@ async function exercise(server, stage) {
   const unauthorized = await fetch(`${server.url}/api/fx`);
   assert.equal(unauthorized.status, 401);
   for (const backend of ["native", "auto"]) {
-    for (const scenario of ["host", "mcp", "error", "cancel", "resume"]) {
+    for (const scenario of ["host", "error", "cancel", "resume"]) {
       const response = await fetch(`${server.url}/api/fx?backend=${backend}&scenario=${scenario}`, {
         headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(60_000),
       });
@@ -89,7 +89,6 @@ async function exercise(server, stage) {
       assert.equal(result.probe.backend, "native");
       assert.equal(result.toolCalls, 1);
       assert.ok(result.checkpointBytes > 48);
-      if (scenario === "mcp") assert.equal(result.closedMcp, true);
       results.push({ stage, backend, scenario, status: response.status, ...result });
       console.log(`${stage}/${backend}/${scenario} passed`);
     }

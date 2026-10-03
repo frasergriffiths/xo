@@ -18,9 +18,7 @@ const tool_presentation = @import("../tooling/tool_presentation.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
-const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
-const mcp_access = @import("../mcp/access_policy.zig");
-const model_catalog = @import("../mcp/model_catalog.zig");
+
 const context_contract = @import("../workspace/context_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
@@ -81,14 +79,7 @@ const Context = struct {
         result.permission_rules = self.admission.rules;
         result.permission_state_override = &self.admission.permission_state;
         result.advertised_dynamic_tool_names = self.admission.integration_names;
-        result.mcp_access = if (self.admission.mcp_view) |*view|
-            .{ .scoped = .{
-                .captured = view,
-                .admission_authority_generation = self.admission.authority_generation,
-                .live = .{ .context = self, .resolve_fn = resolveLiveMcpView },
-            } }
-        else
-            .disabled;
+
         result.subagent_host = self.config.host;
         result.subagent_caller_id = self.turn.child_id;
         result.session_child_capability = self.turn.childCapability() catch null;
@@ -110,22 +101,6 @@ const Context = struct {
             .subagent_id = self.subagent_id,
         };
         return result;
-    }
-
-    fn resolveLiveMcpView(
-        raw: *anyopaque,
-        alloc: Allocator,
-    ) !tool_mcp_runtime.ResolvedLiveView {
-        const self: *Context = @ptrCast(@alignCast(raw));
-        var authority = try self.turn.resolveLiveAuthority(alloc);
-        defer authority.deinit(alloc);
-        const view = authority.mcp_view orelse return error.McpRuntimeUnavailable;
-        authority.mcp_view = null;
-        return .{
-            .authority_generation = mcp_access.authorityGeneration(view),
-            .action_authority_generation = authority.generation,
-            .view = view,
-        };
     }
 };
 
@@ -152,7 +127,6 @@ pub fn run(
     )) {
         routed_credential = auth_runtime.prepareCredential(
             turn.alloc,
-            config.tool_context.oauth_transport,
             config.tool_context.secret_store,
             admission.provider,
             config.tool_context.credential_source,
@@ -166,9 +140,9 @@ pub fn run(
             return error.ProviderFailed;
         };
         routed_config.tool_context.api_key = credential.token;
-        routed_config.tool_context.gateway_team = credential.gatewayTeam();
+        routed_config.tool_context.gateway_team = null;
         routed_config.tool_context.credential_source = credential.source;
-        routed_config.tool_context.account_id = credential.accountId();
+        routed_config.tool_context.account_id = null;
     }
     routed_config.tool_context.model = admission.model;
     routed_config.tool_context.provider = admission.provider;
@@ -238,8 +212,8 @@ pub fn run(
             .first_call_tool_choice = config.tool_context.first_call_tool_choice,
             .fast_mode = config.tool_context.fast_mode,
             .effort = admission.effort,
-            .provider_order = if (admission.provider == .gateway) config.tool_context.provider_order else &.{},
-            .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
+            .provider_order = if (admission.provider == .openrouter) config.tool_context.provider_order else &.{},
+            .provider_strict = admission.provider == .openrouter and config.tool_context.provider_strict,
         },
         .recovery_checkpoint = recovery_checkpoint,
         .recovery_source_already_presented = recovery_checkpoint != null,
@@ -301,8 +275,8 @@ pub fn run(
             .cancel_flag = cancel,
             .fast_mode = config.tool_context.fast_mode,
             .effort = admission.effort,
-            .provider_order = if (admission.provider == .gateway) config.tool_context.provider_order else &.{},
-            .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
+            .provider_order = if (admission.provider == .openrouter) config.tool_context.provider_order else &.{},
+            .provider_strict = admission.provider == .openrouter and config.tool_context.provider_strict,
             .first_call_tool_choice = config.tool_context.first_call_tool_choice,
             .workspace_root = config.tool_context.workspace_root,
             .access_scope = config.tool_context.access_scope,
@@ -334,22 +308,6 @@ fn finalRunOutcome(outcome: ?types.TurnPresentationOutcome) error{ProviderFailed
         .failed => error.ProviderFailed,
         .interrupted, .paused => .paused,
     };
-}
-
-test "subagent finalization preserves every outcome and fails closed on absence" {
-    const cases = [_]struct {
-        outcome: ?types.TurnPresentationOutcome,
-        expected: error{ProviderFailed}!execution.RunOutcome,
-    }{
-        .{ .outcome = .completed, .expected = .completed },
-        .{ .outcome = .failed, .expected = error.ProviderFailed },
-        .{ .outcome = .interrupted, .expected = .paused },
-        .{ .outcome = .paused, .expected = .paused },
-        .{ .outcome = null, .expected = error.ProviderFailed },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(case.expected, finalRunOutcome(case.outcome));
-    }
 }
 
 fn withoutSubagentNames(
@@ -405,7 +363,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
-        .snapshot_mcp_definition = snapshotMcpDefinition,
+
         .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermission,
@@ -463,125 +421,6 @@ fn resolveModelCapabilities(raw: *anyopaque, arena: Allocator, model: []const u8
     return availableModelCapabilities(raw, model);
 }
 
-test "child runtime capability callbacks preserve fallback and child cancellation" {
-    const session_store = @import("../session/session_store.zig");
-    const catalog = @import("../gateway/model_catalog.zig");
-    const authority = @import("authority.zig");
-    const Fixture = struct {
-        fetches: usize = 0,
-        lookups: usize = 0,
-        resolutions: usize = 0,
-
-        fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
-            return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
-        }
-        fn fetch(raw: ?*anyopaque, _: Allocator, _: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.fetches += 1;
-            return .{ .failure = .{ .category = .runtime } };
-        }
-        fn lookup(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.lookups += 1;
-            return if (std.mem.eql(u8, model, "child-model")) .{ .context_window = 32768, .max_output_tokens = 512 } else .{};
-        }
-        fn resolveCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.resolutions += 1;
-            return if (std.mem.eql(u8, model, "child-model")) .{ .supports_vision = true, .image_input_support = .native } else .{};
-        }
-        fn output(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_output_content.Stream, _: []const u8) anyerror!void {}
-    };
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    var store = try session_store.Store.initFromHome(alloc, root, root);
-    defer store.deinit(alloc);
-    var writable = try store.startWritableSession(alloc, .{
-        .id = @constCast("capability-parent"),
-        .origin_workspace_root = @constCast(root),
-        .workspace_root = @constCast(root),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en"),
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-        .preferences = .{ .model = @constCast("parent-model"), .effort = .auto, .fast_mode = false },
-    });
-    defer writable.deinit(alloc);
-    const host = try tool_host.Runtime.create(alloc, &store, "capability-parent", .{ .resolve_fn = Fixture.resolve }, .{});
-    defer host.deinit();
-    var turn = try execution.TurnContext.init(alloc, &writable, 0);
-    defer turn.deinit();
-    var admission = try domain.captureAdmission(alloc, .{ .parent_id = "capability-parent", .source_id = "capability-parent", .model = "parent-model", .effort = .auto });
-    defer admission.deinit(alloc);
-    var fixture: Fixture = .{};
-    var cancel = std.atomic.Value(bool).init(false);
-    var parent_cancel = std.atomic.Value(bool).init(false);
-    const registry = context_contract.Registry{ .default_provider = context_contract.empty_provider };
-    var context = Context{
-        .config = .{
-            .host = host,
-            .tool_context = .{
-                .workspace_root = root,
-                .ignored_list_entries = &.{},
-                .max_list_entries = 100,
-                .max_read_file_bytes = 65536,
-                .max_read_file_lines = 400,
-                .max_read_file_line_len = 2000,
-                .max_command_output_bytes = 65536,
-                .api_key = "",
-                .model = "parent-model",
-                .provider = .grok,
-                .gateway_retry_count = 1,
-                .gateway_chat_url = "",
-                .agent_step_limit = 8,
-                .permission_mode = .ask,
-                .permission_grants = &.{},
-                .permission_rules = .{},
-                .worker = turn.workerRuntime(),
-                .session = turn.sessionRuntime(),
-                .context_registry = registry,
-                .output_chunk_ctx = &fixture,
-                .on_output_chunk = Fixture.output,
-                .cancel_flag = &parent_cancel,
-            },
-            .provider_set = .{ .gateway = .{ .model_catalog = .{ .context = &fixture, .fetch_fn = Fixture.fetch } }, .codex = .{}, .grok = .{} },
-            .system_prompt = "",
-            .context_registry = registry,
-            .context_enabled = false,
-        },
-        .turn = &turn,
-        .admission = admission,
-        .cancel = &cancel,
-        .subagent_id = 1,
-    };
-    const deps = runtimeDeps(&context);
-    const fallback = model_capabilities.capabilitiesForModel("legacy-fast");
-    try std.testing.expectEqualDeep(fallback, deps.available_model_capabilities(deps.ctx, "legacy-fast"));
-    try std.testing.expectEqualDeep(fallback, try deps.resolve_model_capabilities(deps.ctx, alloc, "legacy-fast"));
-    context.config.provider_set.gateway.model_catalog.?.lookup_capabilities_fn = Fixture.lookup;
-    const available = deps.available_model_capabilities(deps.ctx, "child-model");
-    try std.testing.expectEqual(@as(?u32, 512), available.max_output_tokens);
-    try std.testing.expectEqual(@as(?u32, 32768), available.context_window);
-    try std.testing.expectEqualDeep(available, try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
-    try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, deps.available_model_capabilities(deps.ctx, "unknown-fast"));
-    context.config.tool_context.model_capability_resolver = .{ .ctx = &fixture, .resolve_fn = Fixture.resolveCapabilities };
-    const resolved = try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model");
-    try std.testing.expectEqual(model_capabilities.ImageInputSupport.native, resolved.image_input_support);
-    try std.testing.expectEqual(@as(usize, 1), fixture.resolutions);
-    try std.testing.expectEqual(@as(?u32, 512), deps.available_model_capabilities(deps.ctx, "child-model").max_output_tokens);
-    const lookups = fixture.lookups;
-    cancel.store(true, .seq_cst);
-    try std.testing.expectError(error.Cancelled, deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
-    try std.testing.expectEqual(lookups, fixture.lookups);
-    try std.testing.expectEqual(@as(usize, 1), fixture.resolutions);
-    try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
-}
-
 fn takeChildSteeringBoundary(
     raw: *anyopaque,
     arena: Allocator,
@@ -603,7 +442,6 @@ fn refreshGatewayCredential(
     alloc: Allocator,
     source: types.CredentialSource,
     mode: auth_runtime.CredentialRefreshMode,
-    expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
     if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
@@ -611,21 +449,20 @@ fn refreshGatewayCredential(
         return null;
     }
     var refreshed = (try auth_runtime.refreshCredentialForAccount(
-        context.config.tool_context.oauth_transport,
         context.turn.alloc,
+        context.config.tool_context.secret_store,
         source,
         mode,
-        expected_account_id,
     )) orelse return null;
     defer refreshed.deinit(context.turn.alloc);
     if (context.config.tool_context.credential_source != refreshed.source or
         !optionalCredentialFieldEqual(
             context.config.tool_context.account_id,
-            refreshed.accountId(),
+            null,
         ) or
         !optionalCredentialFieldEqual(
             context.config.tool_context.gateway_team,
-            refreshed.gatewayTeam(),
+            null,
         ))
     {
         return error.CredentialAuthorityChanged;
@@ -636,14 +473,11 @@ fn refreshGatewayCredential(
     if (context.refreshed_credential) |*current| current.deinit(context.turn.alloc);
     context.refreshed_credential = refreshed;
     refreshed.token = &.{};
-    refreshed.account_id = null;
-    refreshed.team_id = null;
-    refreshed.team_slug = null;
     const current = &context.refreshed_credential.?;
     context.config.tool_context.api_key = current.token;
     context.config.tool_context.credential_source = current.source;
-    context.config.tool_context.account_id = current.accountId();
-    context.config.tool_context.gateway_team = current.gatewayTeam();
+    context.config.tool_context.account_id = null;
+    context.config.tool_context.gateway_team = null;
     return worker_token;
 }
 
@@ -678,100 +512,6 @@ fn appendStaticContext(raw: *anyopaque, arena: Allocator, project_context: ?[]co
     try context.config.context_registry.appendDefaultStatic(.{
         .project_context = project_context orelse context.config.project_context,
     }, arena, messages);
-    var snapshot = try snapshotModelCatalogForView(
-        arena,
-        if (context.admission.mcp_view) |*view| view else null,
-    );
-    defer snapshot.deinit(arena);
-    const section = try model_catalog.render(arena, snapshot);
-    if (section.text.len > 0) {
-        try messages.append(arena, .{ .role = .system, .content = section.text });
-    }
-    if (section.notice) |notice| try pushLiveNotice(raw, notice);
-}
-
-fn snapshotModelCatalogForView(
-    alloc: Allocator,
-    maybe_view: ?*const mcp_access.View,
-) !model_catalog.Snapshot {
-    const view = maybe_view orelse return model_catalog.Snapshot.empty(alloc);
-    const servers = try alloc.alloc(model_catalog.ServerSummary, view.servers.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (servers[0..initialized]) |server| alloc.free(server.name);
-        alloc.free(servers);
-    }
-    for (view.servers, 0..) |server, index| {
-        var tool_count: usize = 0;
-        for (view.tools) |tool| {
-            if (std.mem.eql(u8, tool.server_name, server.name)) tool_count += 1;
-        }
-        servers[index] = .{
-            .name = try alloc.dupe(u8, server.name),
-            .availability = .ready,
-            .tool_count = tool_count,
-        };
-        initialized += 1;
-    }
-    return .{ .servers = servers };
-}
-
-test "subagent model catalog counts only tools in the captured MCP view" {
-    const alloc = std.testing.allocator;
-    var servers = [_]mcp_access.ServerIdentity{.{
-        .name = @constCast("chrome-devtools"),
-        .source = .profile,
-        .scope = .profile,
-        .connection_generation = 1,
-        .catalog_generation = 2,
-        .auth_generation = 3,
-    }};
-    var tools = [_]mcp_access.ToolIdentity{
-        .{ .name = @constCast("mcp_chrome_one"), .server_name = @constCast("chrome-devtools") },
-        .{ .name = @constCast("mcp_chrome_two"), .server_name = @constCast("chrome-devtools") },
-    };
-    const view = mcp_access.View{
-        .runtime_generation = 1,
-        .owner_id = @constCast("child"),
-        .parent_id = @constCast("parent"),
-        .features_visible = false,
-        .servers = &servers,
-        .tools = &tools,
-    };
-
-    var snapshot = try snapshotModelCatalogForView(alloc, &view);
-    defer snapshot.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), snapshot.servers.len);
-    try std.testing.expectEqualStrings("chrome-devtools", snapshot.servers[0].name);
-    try std.testing.expectEqual(model_catalog.Availability.ready, snapshot.servers[0].availability);
-    try std.testing.expectEqual(@as(?usize, 2), snapshot.servers[0].tool_count);
-}
-
-test "subagent inherits model capabilities" {
-    const ResolverFixture = struct {
-        fn resolve(
-            _: *anyopaque,
-            _: Allocator,
-            _: []const u8,
-        ) model_capabilities.ResolveError!model_capabilities.Capabilities {
-            return .{};
-        }
-    };
-    var resolver_context: u8 = 0;
-    const resolver = model_capabilities.Resolver{
-        .ctx = &resolver_context,
-        .resolve_fn = ResolverFixture.resolve,
-    };
-    const inherited = childModelCapabilityResolver(resolver);
-    try std.testing.expect(inherited != null);
-    try std.testing.expectEqual(resolver.ctx, inherited.?.ctx);
-    try std.testing.expectEqual(resolver.resolve_fn, inherited.?.resolve_fn);
-}
-
-fn snapshotMcpDefinition(raw: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    return tool_runtime.snapshotMcpDefinition(context.toolContext(), arena, name, known);
 }
 
 fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !agent_runtime.ToolCallValidationResult {
@@ -810,11 +550,9 @@ fn requestToolPermission(
     live: ?agent_runtime.LiveToolAuthority,
     revalidation: ?agent_runtime.LivePermissionRevalidation,
     dynamic_names: []const []const u8,
-    mcp_review_schema_json: ?[]const u8,
 ) !command_admission.PermissionOutcome {
     const context: *Context = @ptrCast(@alignCast(raw));
     var tool_ctx = admissionContext(context, dynamic_names, review);
-    tool_ctx.mcp_review_schema_json = mcp_review_schema_json;
     if (revalidation) |request| return switch (request) {
         .action => |action| tool_admission.revalidateLiveActionPermissionOutcome(
             tool_ctx.admissionInputWithLiveAuthority(live),

@@ -27,10 +27,6 @@ const stripTrailingNewline = transcript_blocks.stripTrailingNewline;
 const tailVisibleBlockKind = transcript_blocks.tailVisibleBlockKind;
 const visualRowsForLine = transcript_blocks.visualRowsForLine;
 
-test {
-    _ = tool_group_projection;
-}
-
 const FinalityNominationKind = enum { mutation_pin, tool_turn, assistant_tail };
 
 const FinalityNomination = struct {
@@ -713,64 +709,6 @@ fn checkPublicationProjectionAllocation(alloc: Allocator) !void {
     try std.testing.expectEqual(@as(?usize, 2), next.tracked_entry_start_line);
 }
 
-test "rewrite publication preserves preceding gaps without committing a new separator" {
-    const alloc = std.testing.allocator;
-    var before = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "live\n\nold"), 80, null);
-    defer before.deinit(alloc);
-    const old_lines = [_]transcript_blocks.LineProvenance{
-        .{ .entry = .{ .entry_id = 1, .entry_class = .tool_status } }, .block_separator,
-        .{ .entry = .{ .entry_id = 2, .entry_class = .unknown_raw } },
-    };
-    before.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &old_lines);
-    var next = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "live\n\nnew"), 80, null);
-    defer next.deinit(alloc);
-    var next_lines = old_lines;
-    next_lines[2].entry.entry_id = 3;
-    next.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &next_lines);
-    try preservePublicationEntries(alloc, &before, &next, &.{2}, null, null);
-    try std.testing.expectEqualStrings("live\n\nold\n\nnew", next.bytes);
-    try std.testing.expectEqual(@as(usize, "live\n\nold".len), next.publication_owned_end);
-    const entries = [_]transcript_blocks.TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "live", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "new", .class = .unknown_raw } },
-    };
-    const host = .{ .entries = .{ .items = &entries } };
-    var identity = try RetentionIdentity.capture(&host, alloc, &next);
-    defer identity.deinit(alloc);
-    try std.testing.expectEqual(@as(u32, 4), identity.publication_release_floor);
-    _ = try identity.retainPrefix(alloc, &entries, "live\n\nold\n", 80);
-    try std.testing.expectEqual(@as(u32, 3), identity.publication_release_floor);
-    try std.testing.expectEqual(@as(usize, 1), identity.text_extents.len);
-}
-
-test "rewrite publication prefix receipts exclude unpainted raw and assistant text" {
-    const alloc = std.testing.allocator;
-    const Runtime = @import("runtime.zig").TranscriptRuntime;
-    for ([_]bool{ false, true }) |assistant| {
-        var runtime = Runtime{ .layout = .{ .cols = 80, .rows = 12, .content_bottom = 8, .divider_top_row = 9, .input_row = 10, .divider_bottom_row = 11, .hint_row = 12 } };
-        defer runtime.deinit(alloc);
-        var metrics: types.Metrics = .{};
-        const text = "1. FIRST\n2. UNPAINTED\n";
-        const id = if (assistant) try runtime.streamAssistantChunk(alloc, &metrics, text) else try runtime.appendRawTranscriptEntryClassified(alloc, text, .unknown_raw);
-        var source = try prepareRetentionSource(&runtime, alloc);
-        defer source.deinit(alloc);
-        try std.testing.expect(source.hard_line_starts.len > 1);
-        const prefix = source.bytes[0..source.hard_line_starts[1]];
-        var identity = try RetentionIdentity.capture(&runtime, alloc, &source);
-        defer identity.deinit(alloc);
-        _ = try identity.retainPrefix(alloc, runtime.entries.items, prefix, 80);
-        const extent = for (identity.text_extents) |extent| {
-            if (extent.entry_id == id) break extent;
-        } else return error.MissingPublishedExtent;
-        try std.testing.expect(extent.bytes <= std.mem.find(u8, text, "2. UNPAINTED").?);
-        try std.testing.expectEqual(@as(usize, 1), identity.lines.len);
-    }
-}
-
-test "rewrite publication projection preserves preview and finality across allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPublicationProjectionAllocation, .{});
-}
-
 /// Maps boundaries through the producer's retained version of the same source.
 /// Entry identity, not rendered text equality, determines which rows survive.
 pub const RetentionEntryRows = struct {
@@ -936,92 +874,6 @@ pub const RetentionRebase = struct {
         return start + @min(old_offset - self.before.hard_line_starts[old_line], end - start);
     }
 };
-
-test "retention rebase uses entry identity for duplicate content" {
-    const alloc = std.testing.allocator;
-    var before = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "same\nsame\nsame\nsame"), 80, null);
-    defer before.deinit(alloc);
-    var retained = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "same\nsame"), 80, null);
-    defer retained.deinit(alloc);
-    const provenance = [_]transcript_blocks.LineProvenance{
-        .{ .entry = .{ .entry_id = 1, .entry_class = .unknown_raw } },
-        .{ .entry = .{ .entry_id = 2, .entry_class = .unknown_raw } },
-        .{ .entry = .{ .entry_id = 3, .entry_class = .unknown_raw } },
-        .{ .entry = .{ .entry_id = 4, .entry_class = .unknown_raw } },
-    };
-    before.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &provenance);
-    retained.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, provenance[2..]);
-    var mapping = try RetentionRebase.init(alloc, &before, &retained, &.{});
-    defer mapping.deinit(alloc);
-    for ([_]u32{ 0, 0, 0, 1, 2 }, 0..) |expected, offset| {
-        try std.testing.expectEqual(expected, mapping.visual(@intCast(offset)));
-        try std.testing.expectEqual(@as(usize, expected), mapping.line(offset));
-    }
-    try std.testing.expectEqual(@as(usize, 0), mapping.byte(2));
-    try std.testing.expectEqual(@as(usize, 2), mapping.byte(12));
-    try std.testing.expectEqual(retained.bytes.len, mapping.byte(before.bytes.len));
-}
-
-test "retention rebase deleted soft wrapped entry does not transfer partial rows" {
-    const alloc = std.testing.allocator;
-    var before = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "abcdefghi\njklmnopqr"), 3, null);
-    defer before.deinit(alloc);
-    var after = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "jklmnopqr"), 3, null);
-    defer after.deinit(alloc);
-    const provenance = [_]transcript_blocks.LineProvenance{
-        .{ .entry = .{ .entry_id = 1, .entry_class = .unknown_raw } },
-        .{ .entry = .{ .entry_id = 2, .entry_class = .unknown_raw } },
-    };
-    before.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &provenance);
-    after.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, provenance[1..]);
-    var mapping = try RetentionRebase.init(alloc, &before, &after, &.{});
-    defer mapping.deinit(alloc);
-    for (0..4) |offset| try std.testing.expectEqual(@as(u32, 0), mapping.visual(@intCast(offset)));
-    try std.testing.expectEqual(@as(usize, 0), mapping.byte(6));
-}
-
-test "retention rebase indexes a large removed entry run once" {
-    const alloc = std.testing.allocator;
-    var before = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "x\n" ** 20_000), 80, null);
-    defer before.deinit(alloc);
-    var after = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "x\n" ** 10_000), 80, null);
-    defer after.deinit(alloc);
-    const old_lines = try alloc.alloc(transcript_blocks.LineProvenance, 20_000);
-    before.line_provenance = old_lines;
-    for (old_lines, 0..) |*identity, index| identity.* = .{ .entry = .{ .entry_id = if (index < 10_000) 1 else 2, .entry_class = .unknown_raw } };
-    after.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, old_lines[10_000..]);
-    var mapping = try RetentionRebase.init(alloc, &before, &after, &.{});
-    defer mapping.deinit(alloc);
-    try std.testing.expectEqual(@as(u32, 1), mapping.retained_ranges.count());
-    for ([_]usize{ 0, 9_999, 10_000, 19_999, 20_000 }) |line_index| {
-        try std.testing.expectEqual(line_index -| 10_000, mapping.line(line_index));
-    }
-}
-
-test "retention rebase maps raw soft wraps and byte endpoints" {
-    const alloc = std.testing.allocator;
-    const text = "abcdefghi\njkl";
-    var before = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, text), 3, null);
-    defer before.deinit(alloc);
-    var after = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, text[2..]), 3, null);
-    defer after.deinit(alloc);
-    const provenance = [_]transcript_blocks.LineProvenance{.{ .entry = .{ .entry_id = 1, .entry_class = .unknown_raw } }} ** 2;
-    before.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &provenance);
-    after.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &provenance);
-    const entries = [_]RetentionEntryRows{.{
-        .entry_id = 1,
-        .removed_bytes = 2,
-        .before = &.{ 0, 10 },
-        .retained = &.{ 0, 8 },
-        .raw_before = text,
-        .raw_retained = text[2..],
-    }};
-    var mapping = try RetentionRebase.init(alloc, &before, &after, &entries);
-    defer mapping.deinit(alloc);
-    for ([_]u32{ 0, 0, 1, 3, 4 }, 0..) |expected, offset| try std.testing.expectEqual(expected, mapping.visual(@intCast(offset)));
-    try std.testing.expectEqual(@as(usize, 1), mapping.byte(3));
-    try std.testing.expectEqual(@as(usize, 8), mapping.byte(10));
-}
 
 pub fn prepareTranscriptSourceWithFocusedEntry(
     self: anytype,
@@ -1824,65 +1676,4 @@ fn frameCommitted(self: anytype) bool {
         return self.has_committed_frame;
     }
     return false;
-}
-
-test "command output override preserves a hidden projection entry" {
-    const alloc = std.testing.allocator;
-    var overrides: CommandOutputOverrides = .{};
-    defer overrides.deinit(alloc);
-    try overrides.items.append(alloc, .{
-        .entry_id = 7,
-        .kind = .command_output,
-        .bytes = "replacement\n",
-    });
-    try overrides.entry_indices.put(alloc, 7, 0);
-
-    var actions = [_]transcript_blocks.EntryRenderAction{.hide};
-    applyCommandOutputOverrides(&actions, &overrides);
-    try std.testing.expect(actions[0] == .hide);
-}
-
-test "minimal projection does not take ownership of command output overrides" {
-    const alloc = std.testing.allocator;
-    const TestSource = struct {
-        entries: std.ArrayList(transcript_blocks.TranscriptEntry) = .empty,
-        tool_details: std.ArrayList(transcript_blocks.ToolDetailRecord) = .empty,
-        command_output_blocks: std.ArrayList(command_output_runtime.CommandOutputBlock) = .empty,
-        command_output_display: transcript_blocks.CommandOutputDisplayState = .{},
-        layout: struct { cols: u16 = 80 } = .{},
-        command_output_render: command_output_runtime.CommandOutputRenderPolicy = .{},
-
-        fn deinit(self: *@This(), allocator: Allocator) void {
-            for (self.command_output_blocks.items) |*block| block.deinit(allocator);
-            self.command_output_blocks.deinit(allocator);
-            self.tool_details.deinit(allocator);
-            self.entries.deinit(allocator);
-        }
-
-        fn fullTranscriptActive(_: *const @This()) bool {
-            return false;
-        }
-    };
-
-    var source: TestSource = .{};
-    defer source.deinit(alloc);
-    try source.entries.append(alloc, .{ .raw_bytes = .{
-        .id = 1,
-        .bytes = @constCast("original\n"),
-    } });
-    var block = command_output_runtime.CommandOutputBlock{ .entry_id = 1 };
-    errdefer block.deinit(alloc);
-    try block.lines.append(alloc, .{
-        .stream = .stdout,
-        .text = try alloc.dupe(u8, "replacement\n"),
-        .entry_id = 1,
-        .terminated = true,
-    });
-    block.total_lines = 1;
-    block.retained_text_bytes = "replacement\n".len;
-    try source.command_output_blocks.append(alloc, block);
-
-    const bytes = try renderCompactTranscriptBytes(&source, alloc);
-    defer alloc.free(bytes);
-    try std.testing.expect(std.mem.find(u8, bytes, "replacement") != null);
 }

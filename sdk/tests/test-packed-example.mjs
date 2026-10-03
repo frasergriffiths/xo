@@ -33,9 +33,7 @@ if (process.argv[2] !== "--installed") {
   }
 } else {
   const { createFxAgent, createFxTerminal, getBackendInfo } = format === "cjs" ? createRequire(import.meta.url)("libfx") : await import("libfx");
-  const { createMcpAdapter } = await import("libfx/mcp");
   const { createSkillsAdapter } = await import("libfx/skills");
-  assert.equal(typeof createMcpAdapter, "function");
   assert.equal(typeof createSkillsAdapter, "function");
 
   for (const makeOptions of [

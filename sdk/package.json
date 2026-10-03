@@ -5,11 +5,11 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vercel-labs/fx.git",
+    "url": "git+https://github.com/frasergriffiths/xo.git",
     "directory": "sdk"
   },
-  "homepage": "https://github.com/vercel-labs/fx/tree/main/sdk#readme",
-  "bugs": "https://github.com/vercel-labs/fx/issues",
+  "homepage": "https://github.com/frasergriffiths/xo/tree/main/sdk#readme",
+  "bugs": "https://github.com/frasergriffiths/xo/issues",
   "scripts": {
     "test:node-wasm": "node tests/test-node-wasm.mjs",
     "test:node-napi": "node tests/test-node-napi.mjs",
@@ -30,7 +30,6 @@
     },
     "./browser": "./browser.js",
     "./wasm": "./fx-sdk.js",
-    "./mcp": "./mcp.js",
     "./skills": "./skills.js",
     "./skills/node": "./skills-node.js"
   },
@@ -41,7 +40,6 @@
     "fx-sdk.js",
     "wasm-module.js",
     "core-output.js",
-    "mcp.js",
     "skills.js",
     "skills-node.js",
     "fx-core.wasm",

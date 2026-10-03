@@ -13,9 +13,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Bundle = struct {
     pub const AuthStrategy = enum {
-        vercel,
-        chatgpt,
-        grok,
+        api_key,
     };
     pub const Capabilities = struct {
         gateway_prompt_caching: bool = false,
@@ -33,9 +31,11 @@ pub const Bundle = struct {
     agent_stream: ?stream_provider.Provider = null,
     cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
     model_catalog: ?model_catalog.Provider = null,
+    /// Confirms a candidate API key against this provider's own endpoint, so a
+    /// retargeted built-in validates against the address it will actually use.
+    api_key_validator: ?@import("../auth/api_key_validator.zig").Provider = null,
     permission_reviewer: ?auto_classifier.Provider = null,
     deferred_usage: ?generation_usage_provider.Provider = null,
-    credits: ?gateway_provider.CreditsProvider = null,
     fx_search: ?web_search_provider.Provider = null,
 
     pub fn agent_stream_or_unavailable(self: Bundle) stream_provider.Provider {
@@ -52,17 +52,34 @@ fn emptyModelCapabilities(_: []const u8) model_capabilities.Capabilities {
 }
 
 pub const Set = struct {
-    gateway: Bundle,
-    codex: Bundle,
-    grok: Bundle,
+    openrouter: Bundle,
+    /// The compiled Groq route. Groq does not support a `providers.groq`
+    /// retarget entry in the first cut, so its bundle is used as compiled.
+    groq: Bundle = .{},
+    /// The compiled route used when the OpenAI-compatible provider has no
+    /// configured endpoint definition yet.
+    openai_compatible: Bundle = .{},
+    /// Runtime definition for the OpenAI-compatible provider, built from
+    /// profile settings. Null means the user has not configured it.
+    openai_compatible_definition: ?*const @import("../config/configured_provider.zig").Definition = null,
+    /// Builds the OpenAI-compatible route against a configured definition.
+    openai_compatible_fn: ?*const fn (*const @import("../config/configured_provider.zig").Definition) Bundle = null,
     definitions: []const @import("../config/configured_provider.zig").Definition = &.{},
     configured_fn: ?*const fn (*const @import("../config/configured_provider.zig").Definition) Bundle = null,
+    /// Builds the built-in route against a user-supplied endpoint definition.
+    /// Without it a `providers.openrouter` entry is ignored and the compiled
+    /// default is used.
+    builtin_override_fn: ?*const fn (*const @import("../config/configured_provider.zig").Definition) Bundle = null,
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
-            .gateway => self.gateway,
-            .codex => self.codex,
-            .grok => self.grok,
+            .openrouter => self.openrouterBundle(),
+            .groq => self.groq,
+            .openai_compatible => blk: {
+                const definition = self.openai_compatible_definition orelse break :blk self.openai_compatible;
+                const factory = self.openai_compatible_fn orelse break :blk self.openai_compatible;
+                break :blk factory(definition);
+            },
             .configured => blk: {
                 const factory = self.configured_fn orelse break :blk .{};
                 const registry = @import("../config/configured_provider.zig").Registry{ .definitions = self.definitions };
@@ -72,106 +89,26 @@ pub const Set = struct {
         };
     }
 
+    /// A user `providers.openrouter` entry retargets the built-in endpoint
+    /// without changing anything else about its route.
+    fn openrouterBundle(self: Set) Bundle {
+        const factory = self.builtin_override_fn orelse return self.openrouter;
+        for (self.definitions) |*definition| {
+            if (!definition.is_builtin_override) continue;
+            return factory(definition);
+        }
+        return self.openrouter;
+    }
+
     pub fn deferredUsageProviders(self: Set) generation_usage_provider.Set {
         return .{
-            .gateway = self.gateway.deferred_usage,
-            .codex = self.codex.deferred_usage,
-            .grok = self.grok.deferred_usage,
+            .openrouter = self.select(.openrouter).deferred_usage,
+            .groq = self.select(.groq).deferred_usage,
+            .openai_compatible = self.select(.openai_compatible).deferred_usage,
         };
     }
 };
 
-pub fn gateway_only(gateway: Bundle) Set {
-    return .{
-        .gateway = gateway,
-        .codex = .{},
-        .grok = .{},
-    };
-}
-
-test "provider set selects each provider's complete route" {
-    var gateway_tag: u8 = 0;
-    var codex_tag: u8 = 0;
-    var grok_tag: u8 = 0;
-
-    const Fake = struct {
-        fn cli_catalog(
-            _: ?*anyopaque,
-            _: Allocator,
-            _: gateway_provider.CliModelCatalogInput,
-        ) gateway_provider.CliModelCatalogResult {
-            return .{ .failure = .{
-                .access = .init(.{ .public_only = .no_credential }),
-                .anonymous_fallback_used = false,
-                .failure = .{ .category = .runtime },
-            } };
-        }
-
-        fn model_catalog_fetch(
-            _: ?*anyopaque,
-            _: Allocator,
-            _: model_catalog.FetchInput,
-        ) Allocator.Error!model_catalog.ProviderResult {
-            return .{ .catalog = .empty };
-        }
-
-        fn review(
-            _: ?*anyopaque,
-            _: Allocator,
-            _: auto_classifier.ProviderInput,
-            _: auto_classifier.ReviewRequest,
-        ) anyerror!auto_classifier.ParseOutcome {
-            return .{ .invalid = .provider_failed };
-        }
-    };
-
-    const gateway = Bundle{
-        .capabilities = .{ .fx_search = true, .vision_fallback = true },
-        .presentation = provider_catalog.find(.gateway),
-        .auth_strategy = .vercel,
-        .agent_stream = stream_provider.Provider{
-            .context = &gateway_tag,
-            .stream_fn = stream_provider.unavailable_provider.stream_fn,
-        },
-        .cli_model_catalog = .{ .context = &gateway_tag, .fetch_fn = Fake.cli_catalog },
-        .model_catalog = .{ .context = &gateway_tag, .fetch_fn = Fake.model_catalog_fetch },
-        .permission_reviewer = .{ .context = &gateway_tag, .review_fn = Fake.review },
-        .deferred_usage = generation_usage_provider.unavailable_provider,
-    };
-    const codex = Bundle{
-        .agent_stream = stream_provider.Provider{
-            .context = &codex_tag,
-            .stream_fn = stream_provider.unavailable_provider.stream_fn,
-        },
-        .cli_model_catalog = .{ .context = &codex_tag, .fetch_fn = Fake.cli_catalog },
-        .model_catalog = .{ .context = &codex_tag, .fetch_fn = Fake.model_catalog_fetch },
-        .permission_reviewer = .{ .context = &codex_tag, .review_fn = Fake.review },
-    };
-    const grok = Bundle{
-        .agent_stream = stream_provider.Provider{
-            .context = &grok_tag,
-            .stream_fn = stream_provider.unavailable_provider.stream_fn,
-        },
-        .cli_model_catalog = .{ .context = &grok_tag, .fetch_fn = Fake.cli_catalog },
-        .model_catalog = .{ .context = &grok_tag, .fetch_fn = Fake.model_catalog_fetch },
-        .permission_reviewer = .{ .context = &grok_tag, .review_fn = Fake.review },
-    };
-    var providers = Set{ .gateway = gateway, .codex = codex, .grok = grok };
-
-    try std.testing.expect(providers.select(.gateway).agent_stream.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
-    try std.testing.expect(providers.select(.gateway).capabilities.fx_search);
-    try std.testing.expect(providers.select(.gateway).capabilities.vision_fallback);
-    try std.testing.expect(providers.select(.gateway).deferred_usage != null);
-    try std.testing.expectEqualStrings("vercel", providers.select(.gateway).presentation.?.slug);
-    try std.testing.expectEqual(Bundle.AuthStrategy.vercel, providers.select(.gateway).auth_strategy.?);
-    try std.testing.expect(!providers.select(.codex).capabilities.fx_search);
-    try std.testing.expect(providers.select(.codex).deferred_usage == null);
-    try std.testing.expect(providers.select(.gateway).cli_model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
-    try std.testing.expect(providers.select(.codex).model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
-    try std.testing.expect(providers.select(.grok).permission_reviewer.?.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
-    try std.testing.expect(providers.select(.codex).agent_stream_or_unavailable().context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
-
-    providers.codex.model_catalog = null;
-    try std.testing.expect(providers.select(.codex).model_catalog == null);
-    try std.testing.expect(providers.select(.gateway).model_catalog != null);
+pub fn openrouter_only(openrouter: Bundle) Set {
+    return .{ .openrouter = openrouter };
 }

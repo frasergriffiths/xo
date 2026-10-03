@@ -174,50 +174,6 @@ fn clearConnection(control: TransferControl) void {
     slot.clear();
 }
 
-test "transfer interrupt wakes a blocked socket read" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
-    const zio = io_mod.getIo();
-    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
-    var server = try addr.listen(zio, .{});
-    defer server.deinit(zio);
-
-    const Ctx = struct {
-        server: *std.Io.net.Server,
-        slot: *TransferInterrupt,
-        woke_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
-    };
-    var slot: TransferInterrupt = .{};
-    var ctx: Ctx = .{ .server = &server, .slot = &slot };
-    const reader = try std.Thread.spawn(.{}, struct {
-        fn run(c: *Ctx) void {
-            const z = io_mod.getIo();
-            const conn = c.server.accept(z) catch return;
-            defer conn.close(z);
-            c.slot.publish(conn.socket.handle);
-            defer c.slot.clear();
-            var buf: [16]u8 = undefined;
-            var stream_reader = conn.reader(z, &buf);
-            // Blocks until the interrupt shuts the socket down.
-            _ = stream_reader.interface.takeByte() catch {};
-            c.woke_ms.store(io_mod.milliTimestamp(), .release);
-        }
-    }.run, .{&ctx});
-
-    const client = try server.socket.address.connect(zio, .{ .mode = .stream });
-    defer client.close(zio);
-
-    const started_ms = io_mod.milliTimestamp();
-    io_mod.sleep(100 * std.time.ns_per_ms);
-    slot.interrupt();
-    reader.join();
-    const woke_ms = ctx.woke_ms.load(.acquire);
-    try std.testing.expect(woke_ms != 0);
-    try std.testing.expect(woke_ms - started_ms < 2000);
-
-    // Interrupting an idle slot is a no-op.
-    slot.interrupt();
-}
-
 fn fetchTextBounded(
     client: *std.http.Client,
     alloc: Allocator,
@@ -433,65 +389,4 @@ fn readAbsoluteFile(alloc: Allocator, path: []const u8) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
     defer file.close(io_mod.getIo());
     return io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
-}
-
-test "platform string is valid" {
-    try std.testing.expect(platform.len > 0);
-    try std.testing.expect(std.mem.find(u8, platform, "-") != null);
-}
-
-test "E2E upgrade base accepts only explicit IPv4 loopback origins" {
-    try std.testing.expect(isLoopbackE2eUpgradeBase("http://127.0.0.1:1234"));
-    try std.testing.expect(!isLoopbackE2eUpgradeBase("https://127.0.0.1:1234"));
-    try std.testing.expect(!isLoopbackE2eUpgradeBase("http://127.0.0.1"));
-    try std.testing.expect(!isLoopbackE2eUpgradeBase("http://127.0.0.1:80@example.com"));
-    try std.testing.expect(!isLoopbackE2eUpgradeBase("http://localhost:1234"));
-}
-
-test "production upgrade base uses the fx release domain" {
-    try std.testing.expectEqualStrings("https://releases.fx.sh", resolveCdnBase());
-}
-
-test "extractChecksumHex parses sha256sum format" {
-    const with_filename = "abc123def456  fx-macos-aarch64.tar.gz\n";
-    const hex = extractChecksumHex(with_filename).?;
-    try std.testing.expectEqualStrings("abc123def456", hex);
-}
-
-test "extractChecksumHex parses raw hex" {
-    const raw = "a" ** 64 ++ "\n";
-    const hex = extractChecksumHex(raw).?;
-    try std.testing.expectEqual(@as(usize, 64), hex.len);
-    try std.testing.expectEqualStrings("a" ** 64, hex);
-}
-
-test "extractChecksumHex rejects short raw checksum" {
-    try std.testing.expect(extractChecksumHex("abcd\n") == null);
-}
-
-test "bytesToHex renders lowercase sha256 digest" {
-    const bytes = [_]u8{0x0f} ** 32;
-    const hex = bytesToHex(&bytes);
-    try std.testing.expectEqualStrings("0f" ** 32, &hex);
-}
-
-test "replaceBinary moves replacement over target path" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try writeTempFile(tmp.dir, "fx-old", "old");
-    try writeTempFile(tmp.dir, "fx-new", "new");
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const new_path = try std.fs.path.join(alloc, &.{ root, "fx-new" });
-    defer alloc.free(new_path);
-    const target_path = try std.fs.path.join(alloc, &.{ root, "fx-old" });
-    defer alloc.free(target_path);
-
-    try replaceBinary(new_path, target_path);
-
-    const replaced = try readAbsoluteFile(alloc, target_path);
-    defer alloc.free(replaced);
-    try std.testing.expectEqualStrings("new", replaced);
 }

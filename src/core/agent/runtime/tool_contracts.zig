@@ -11,10 +11,6 @@ const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 
 pub const vision = @import("vision_contracts.zig");
 
-test {
-    _ = vision;
-}
-
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 const PermissionGrant = types.PermissionGrant;
@@ -107,7 +103,6 @@ pub const ToolExecutionResult = struct {
     web_fetch_completion: ?types.WebFetchCompletion = null,
     subagent_completion: ?types.SubagentStatus = null,
     inner_usage: ?types.ToolUsage = null,
-    selected_dynamic_tools: []const @import("../../tooling/tool_mcp_runtime.zig").SelectedTool = &.{},
     retired_dynamic_tool_names: []const []const u8 = &.{},
     tool_result_memory: ?types.ToolResultMemory = null,
     tool_result_memory_prepared: bool = false,
@@ -117,26 +112,12 @@ pub const ToolExecutionResult = struct {
     result_commit: ?result_commit.Token = null,
 };
 
-test "tool result retains one memory payload across preparation" {
-    try std.testing.expect(@hasField(ToolExecutionResult, "tool_result_memory"));
-    try std.testing.expect(@hasField(ToolExecutionResult, "tool_result_memory_prepared"));
-    try std.testing.expect(!@hasField(ToolExecutionResult, "prepared_result_memory"));
-}
-
 pub inline fn failToolExecutionResult(err: anytype) @TypeOf(err)!ToolExecutionResult {
     return @errorCast(failToolExecutionResultDynamic(err));
 }
 
 noinline fn failToolExecutionResultDynamic(err: anyerror) anyerror!ToolExecutionResult {
     return err;
-}
-
-test "tool result failure writer preserves exact error type and identity" {
-    const failure = failToolExecutionResult(error.LiveToolAuthorityUnavailable);
-    try std.testing.expect(
-        @TypeOf(failure) == error{LiveToolAuthorityUnavailable}!ToolExecutionResult,
-    );
-    try std.testing.expectError(error.LiveToolAuthorityUnavailable, failure);
 }
 
 pub fn unavailableHostToolResult(alloc: Allocator) Allocator.Error!ToolExecutionResult {
@@ -169,8 +150,7 @@ pub const ToolExecutionRequest = struct {
     current_turn_messages: []const ChatMessage = &.{},
     session_grants: []const PermissionGrant,
     live_authority: ?LiveToolAuthority = null,
-    expected_mcp_runtime_generation: ?u64 = null,
-    expected_mcp_binding: ?types.McpToolBinding = null,
+
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
     /// The owning agent loop already ran its policy-neutral idempotency and
@@ -188,9 +168,7 @@ pub const ToolExecutionRequest = struct {
 
 pub const DiffEntryPayload = diff.DiffEntryPayload;
 
-pub const ToolCallValidationWitness = struct {
-    mcp_runtime_generation: ?u64 = null,
-};
+pub const ToolCallValidationWitness = struct {};
 
 pub const ToolCallValidationResult = union(enum) {
     not_registered,

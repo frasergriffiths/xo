@@ -132,15 +132,14 @@ These cases have dedicated tests. Any lifecycle change must preserve all four.
 The native core is intentionally more restricted than the native `fx` CLI. Its ACP server configuration sets:
 
 - `allow_native_tools = false`;
-- `allow_acp_mcp = false`;
 - the background process provider to unavailable;
 - the secret store to unavailable;
 - file listing and reading limits to zero;
 - command output limits to zero.
 
-As a result, the model receives no native tool advertisement, cannot launch commands, cannot read workspace files through fx tools, cannot start ACP-provided MCP servers, and cannot access the native secret store. `home` and `workspaceRoot` still provide identity and session context to shared ACP code, but they do not grant a tool capability by themselves.
+As a result, the model receives no native tool advertisement, cannot launch commands, cannot read workspace files through fx tools, and cannot access the native secret store. `home` and `workspaceRoot` still provide identity and session context to shared ACP code, but they do not grant a tool capability by themselves.
 
-Agent creation does not fetch the model catalog unless the host sets a named reasoning `effort` or enables `fast`; those overrides are validated against the catalog at creation. When a prompt needs model capabilities or context capacity, the shared resolver obtains the catalog through the supplied host fetch and caches its metadata for that agent. Initial model-visible system context comes only from the host's explicit `instructions`, including text assembled by the MCP and skills adapters.
+Agent creation does not fetch the model catalog unless the host sets a named reasoning `effort` or enables `fast`; those overrides are validated against the catalog at creation. When a prompt needs model capabilities or context capacity, the shared resolver obtains the catalog through the supplied host fetch and caches its metadata for that agent. Initial model-visible system context comes only from the host's explicit `instructions`, including text assembled by the skills adapter.
 
 Host-stream requests do not opt into the Gateway extended-time header. Live paired testing showed that header caused a recurring multi-second pre-header tail for embedded requests. Session identity and affinity headers remain enabled. The shared JavaScript fetch edge retries a thrown host transport error at most once, before any response reaches the Agent. Cancellation prevents the retry, and a second failure keeps the existing rejection behavior.
 
@@ -291,7 +290,7 @@ the environment. The harness uses the local Vercel CLI login, or
 `LIBFX_VERCEL_TOKEN` when supplied; npm publication does not require a Vercel
 token in GitHub. The dedicated verification project uses Node.js 24 and the
 fixture's per-deployment request token. Platform deployment protection must
-allow those requests, including the fixture's HTTP MCP calls. The harness
+allow those requests. The harness
 retains redacted logs and results and removes its temporary deployment.
 
 ## Error model
@@ -326,7 +325,7 @@ The lane covers:
 - input backpressure and the process-wide runtime cap;
 - ambient fx trace isolation for stdout, stderr, and trace files;
 - repeated failed construction without file descriptor leakage;
-- blocked ACP MCP servers and absent native tool advertisement;
+- absent native tool advertisement;
 - same-environment concurrency and Node worker isolation;
 - finalization of abandoned handles and active worker termination;
 - ACP initialization, sessions, streaming, cancellation, and graceful shutdown;
@@ -339,7 +338,7 @@ When changing the transport or lifecycle, run the individual failing test direct
 For changes to this surface, verify that:
 
 1. The addon remains a narrow ACP transport rather than a second agent implementation.
-2. Native tools, ACP MCP, background processes, and secret-store access remain disabled unless a separately reviewed capability is introduced.
+2. Native tools, background processes, and secret-store access remain disabled unless a separately reviewed capability is introduced.
 3. Gateway validation remains enforced in both JavaScript and native code.
 4. Every allocation and runtime slot has cleanup on partial failure.
 5. Handles remain type-tagged, wrapped, finalizable, and safe after explicit destruction.

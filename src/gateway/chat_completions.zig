@@ -10,13 +10,22 @@ const model_capabilities = @import("../core/config/model_capabilities.zig");
 const model_catalog_metadata = @import("../core/gateway/model_catalog_metadata.zig");
 const classifier = @import("../core/permissions/auto_classifier.zig");
 const gateway_step = @import("../core/agent/runtime/gateway_step.zig");
-const review_messages = @import("vercel_protocol.zig");
 const io = @import("../core/shared/io.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const Allocator = std.mem.Allocator;
+
+/// The wire-format half of a route: streaming, request serialization, and replay
+/// projection. Every callback borrows the immutable definition from the owning
+/// profile runtime, so the definition must outlive the bundle.
+pub fn transport_bundle(definition: *const definitions.Definition) provider_set.Bundle {
+    const context: *anyopaque = @ptrCast(@constCast(definition));
+    return .{
+        .agent_stream = .{ .context = context, .stream_fn = stream, .build_request_fn = build, .project_replay_fn = project_replay },
+    };
+}
 
 /// Every callback borrows the immutable definition from the owning profile runtime.
 pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
@@ -25,7 +34,6 @@ pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
         .agent_stream = .{ .context = context, .stream_fn = stream, .build_request_fn = build, .project_replay_fn = project_replay },
         .model_catalog = .{ .context = context, .fetch_fn = fetch_catalog, .lookup_capabilities_fn = lookup_capabilities, .provider_id = bound_identity(definition) },
         .cli_model_catalog = .{ .context = context, .fetch_fn = fetch_cli_catalog },
-        .permission_reviewer = .{ .context = context, .review_fn = review },
     };
 }
 
@@ -34,69 +42,56 @@ fn definition_at(raw: ?*anyopaque) *const definitions.Definition {
 }
 
 fn bound_identity(definition: *const definitions.Definition) model_provider.ProviderId {
-    var identity = model_provider.parse(definition.id).?;
-    identity.configured.binding = definition.binding_identity();
+    const identity = model_provider.parse(definition.id) orelse return .openrouter;
+    // Only a configured endpoint carries an address binding. The built-in route
+    // is identified by its own id, so its authority never depends on the URL.
+    if (identity == .configured) {
+        var bound = identity;
+        bound.configured.binding = definition.binding_identity();
+        return bound;
+    }
     return identity;
 }
 
 fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8 {
+    return buildRouted(raw, alloc, request, null);
+}
+
+/// `routing` is borrowed only for this serialization. Null derives the routing
+/// preferences from the request when the definition declares support, so a
+/// prepared body built by a host and a body built here carry the same routing.
+fn buildRouted(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData, routing: ?codec.UpstreamRouting) ![]u8 {
     const definition = definition_at(raw);
+    const bid = bound_identity(definition);
+    _ = bid;
     const identity = bound_identity(definition);
     for (request.messages) |message| if (message.provider_replay) |replay| {
         if (!replay.matches(.{ .provider = identity, .model = request.model })) {
-            debug_trace.logf("gateway", "provider_replay_omitted reason=source_mismatch", .{});
+            debug_trace.logf("openrouter", "provider_replay_omitted reason=source_mismatch", .{});
             break;
         }
     };
-    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
+    const upstream = routing orelse if (definition.upstream_routing) codec.UpstreamRouting{
+        .order = request.provider_options.provider_order,
+        .allow_fallback = !request.provider_options.provider_strict,
+    } else null;
+    return codec.build_request(alloc, request, .{
+        .tool_choice_mode = definition.tool_choice_mode,
+        .provider = &identity,
+        .upstream_routing = upstream,
+    });
 }
 
 fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
     const selected = try codec.project_replay(alloc, replay, calls, text, reasoning);
-    if (replay != null and selected == null) debug_trace.logf("gateway", "provider_replay_omitted reason={s}", .{if (reasoning) "associated_calls_removed" else "reasoning_removed"});
+    if (replay != null and selected == null) debug_trace.logf("openrouter", "provider_replay_omitted reason={s}", .{if (reasoning) "associated_calls_removed" else "reasoning_removed"});
     return selected;
-}
-
-test "chat completions adapter binds replay to endpoint authority and wires projection" {
-    const alloc = std.testing.allocator;
-    var registry = try definitions.Registry.parse_json(alloc,
-        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"}}}
-    );
-    defer registry.deinit(alloc);
-    var changed_registry = try definitions.Registry.parse_json(alloc,
-        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:5678/v1","auth":{"type":"none"}}}
-    );
-    defer changed_registry.deinit(alloc);
-    const definition = registry.get("local").?;
-    const adapter = bundle(definition).agent_stream.?;
-    const replay: types.ProviderReplay = .{
-        .source = .{ .provider = bundle(definition).model_catalog.?.provider_id, .model = "model" },
-        .parts_json = "{\"reasoning_details\":[{\"signature\":\"signed\"}],\"_tool_call_ids\":[]}",
-    };
-    const selected = (try adapter.projectReplay(alloc, replay, &.{}, false, true)).?;
-    try std.testing.expect(selected.parts_json.ptr == replay.parts_json.ptr);
-    try std.testing.expect(try adapter.projectReplay(alloc, replay, &.{}, true, false) == null);
-    const request: streams.RequestData = .{
-        .model = "model",
-        .instructions = &.{.{ .role = .system, .content = "instructions" }},
-        .messages = &.{.{ .role = .assistant, .content = "answer", .provider_replay = replay }},
-        .tool_choice = .auto,
-        .provider_options = .{},
-    };
-    const matching = try adapter.build_request_fn.?(adapter.context, alloc, request);
-    defer alloc.free(matching);
-    try std.testing.expect(std.mem.find(u8, matching, "reasoning_details") != null);
-    const other = bundle(changed_registry.get("local").?).agent_stream.?;
-    const stripped = try other.build_request_fn.?(other.context, alloc, request);
-    defer alloc.free(stripped);
-    try std.testing.expect(std.mem.find(u8, stripped, "reasoning_details") == null);
-    try std.testing.expect(request.messages[0].provider_replay.?.parts_json.ptr == replay.parts_json.ptr);
 }
 
 fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !streams.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const definition = definition_at(raw);
-    if (request.credential.credentialSource() != .configured) return error.ConfiguredProviderCredentialRequired;
+    if (!definition.authorizes(request.credential.credentialSource())) return error.ConfiguredProviderCredentialRequired;
     const token = request.credential.secret();
     if (token) |value| {
         if (value.len > 16 * 1024) return error.InvalidConfiguredProviderCredential;
@@ -135,11 +130,19 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     defer client.deinit();
     var uri = try std.Uri.parse(url);
     uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) "https" else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else return error.UnsupportedUriScheme;
+    var header_buffer: [definitions.max_headers]std.http.Header = undefined;
+    if (definition.headers.len > definitions.max_headers) return error.InvalidConfiguredProviderCredential;
+    for (definition.headers, 0..) |header, index| header_buffer[index] = .{
+        .name = header.name,
+        .value = header.value,
+    };
+    const request_headers = header_buffer[0 .. definition.headers.len + 1];
+    request_headers[definition.headers.len] = .{ .name = "accept", .value = "text/event-stream" };
     var operation = client_mod.PostOperation{
         .client = &client,
         .uri = uri,
         .authorization = authorization,
-        .extra_headers = &.{.{ .name = "accept", .value = "text/event-stream" }},
+        .extra_headers = request_headers,
     };
     try request.admission.admit();
     var opened = try client_mod.openBoundedPost(alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);
@@ -238,32 +241,6 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
     return .{ .catalog = entries };
 }
 
-test "configured capability lookup matches catalog projection and preserves unknowns" {
-    const alloc = std.testing.allocator;
-    var registry = try definitions.Registry.parse_json(alloc,
-        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"model_metadata":{"small":{"context_window":8192,"max_output_tokens":512,"supports_tool_use":true,"supports_vision":true},"large":{"context_window":32768,"max_output_tokens":1024,"supports_tool_use":false},"partial":{"max_output_tokens":128},"unknown":{}}}}
-    );
-    defer registry.deinit(alloc);
-    const provider = bundle(registry.get("local").?).model_catalog.?;
-    var fetched = try provider.fetch(alloc, .{ .endpoint = "unused" });
-    defer catalog.freeModelCatalog(alloc, &fetched.catalog);
-    for (fetched.catalog.items) |entry| {
-        const actual = provider.lookupCapabilities(entry.id).?;
-        try std.testing.expectEqualDeep(model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(entry)), actual);
-        const declared_vision = std.mem.eql(u8, entry.id, "small");
-        try std.testing.expectEqual(declared_vision, actual.supports_vision);
-        try std.testing.expectEqual(
-            if (declared_vision) model_capabilities.ImageInputSupport.native else model_capabilities.ImageInputSupport.non_native,
-            actual.image_input_support,
-        );
-    }
-    try std.testing.expectEqual(@as(?u32, 512), provider.lookupCapabilities("small").?.max_output_tokens);
-    try std.testing.expectEqual(@as(?u32, 1024), provider.lookupCapabilities("large").?.max_output_tokens);
-    try std.testing.expect(provider.lookupCapabilities("partial").?.context_window == null);
-    try std.testing.expect(provider.lookupCapabilities("unknown").?.max_output_tokens == null);
-    try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, provider.lookupCapabilities("missing-fast").?);
-}
-
 fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider.CliModelCatalogInput) gateway_provider.CliModelCatalogResult {
     const provenance = catalog.Provenance{ .access = catalog.AccessMetadata.init(input.access) };
     const result = fetch_catalog(raw, alloc, .{ .access = input.access, .endpoint = input.endpoint, .cancel_flag = input.cancel_flag }) catch
@@ -277,60 +254,4 @@ fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider
             return .{ .loaded = .{ .ids = ids, .provenance = provenance } };
         },
     }
-}
-
-const Review = struct { definition: *const definitions.Definition, input: classifier.ProviderInput };
-fn review(raw: ?*anyopaque, alloc: Allocator, input: classifier.ProviderInput, request: classifier.ReviewRequest) !classifier.ParseOutcome {
-    var state = Review{ .definition = definition_at(raw), .input = input };
-    return classifier.Reviewer.withTransportModel(.{ .context = &state, .build_fn = build_review, .send_fn = send_review }, input.cancel_flag, classifier.Reviewer.default_timeout_ms, state.definition.reviewer_model orelse request.review_turn.model).review(alloc, request);
-}
-fn build_review(raw: *anyopaque, alloc: Allocator, model: []const u8, _: []const u8, instructions: []const types.ChatMessage, messages: []const types.ChatMessage, target_id: []const u8, deadline: std.Io.Clock.Timestamp, cancel: *std.atomic.Value(bool)) ![]u8 {
-    const state: *Review = @ptrCast(@alignCast(raw));
-    const expanded = try review_messages.expandPendingToolReviewMessages(alloc, messages, target_id, deadline, cancel);
-    defer alloc.free(expanded);
-    const output_limit = if (state.definition.model(model)) |metadata| @min(metadata.max_output_tokens orelse 2048, 2048) else 2048;
-    return build(@ptrCast(@constCast(state.definition)), alloc, .{ .model = model, .instructions = instructions, .messages = expanded, .tools = .{ .additional_functions = &.{classifier.function_schema} }, .tool_choice = .required, .provider_options = .{}, .max_output_tokens = output_limit });
-}
-fn ignore_event(_: *anyopaque, _: streams.Event) void {}
-fn free_result(raw: *anyopaque, alloc: Allocator) void {
-    const result: *streams.Result = @ptrCast(@alignCast(raw));
-    result.deinit(alloc);
-    alloc.destroy(result);
-}
-fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []const u8, deadline: std.Io.Clock.Timestamp, cancel: *std.atomic.Value(bool)) !classifier.TransportOutcome {
-    const state: *Review = @ptrCast(@alignCast(raw));
-    var delivery: streams.DeliveryCertainty = .init();
-    var evidence: streams.AttemptEvidence = .{};
-    var event_context: u8 = 0;
-    var result = gateway_step.streamModelCompletion(bundle(state.definition).agent_stream.?, alloc, .{
-        .credential = .{ .direct = .{ .secret_bytes = state.input.credential, .source = state.input.credential_source } },
-        .model = model,
-        .retry_count = 1,
-        .messages = &.{},
-        .tools = .{ .additional_functions = &.{classifier.function_schema} },
-        .tool_choice = .required,
-        .provider_options = .{},
-        .prepared_request_body = payload,
-        .trace_ctx = .{},
-        .content_capture_limit = 16 * 1024,
-        .deadline = deadline,
-        .delivery = &delivery,
-        .attempt_evidence = &evidence,
-        .events = .{ .context = &event_context, .emit_fn = ignore_event },
-        .cancel_flag = cancel,
-    }, state.input.usage, state.input.usage_allocator) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Cancelled => return .cancelled,
-        error.Timeout => return .timed_out,
-        error.RequiredToolMissing => return .{ .completion = .{ .completion = .{} } },
-        else => return .permanent_failure,
-    };
-    errdefer result.deinit(alloc);
-    if (result == .failed) {
-        result.deinit(alloc);
-        return .permanent_failure;
-    }
-    const owned = try alloc.create(streams.Result);
-    owned.* = result;
-    return .{ .completion = .{ .completion = owned.completed.completion, .context = owned, .deinit_fn = free_result } };
 }

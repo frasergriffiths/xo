@@ -10,9 +10,6 @@ const WasmSurface = enum {
 
 const PgsoArtifact = enum {
     fx,
-    file_index,
-    ui_activity,
-    approval_review,
 };
 
 const NapiSurface = enum {
@@ -58,8 +55,8 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .stack_check = false,
             .stack_protector = false,
-            .omit_frame_pointer = true,
-            .unwind_tables = .none,
+            .omit_frame_pointer = false,
+            .unwind_tables = .sync,
             .error_tracing = false,
             .strip = optimize != .Debug,
         }),
@@ -86,6 +83,12 @@ pub fn build(b: *std.Build) void {
         "FX_TEST_PRODUCT_EXE",
         b.getInstallPath(.bin, "fx"),
     );
+    if (b.option([]const u8, "test-filter", "Only run tests whose name contains this text")) |filter| {
+        const arena = b.allocator.create(std.heap.ArenaAllocator) catch @panic("OOM");
+        arena.* = std.heap.ArenaAllocator.init(b.allocator);
+        const owned = arena.allocator().dupe([]const u8, &.{filter}) catch @panic("OOM");
+        @field(exe_tests, "filters") = owned;
+    }
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
@@ -97,166 +100,6 @@ pub fn build(b: *std.Build) void {
         addNapiArtifact(b, napi_surface, target, git_commit, app_version, update_channel);
     }
 
-    const mcp_test_exports = b.createModule(.{
-        .root_source_file = b.path("src/mcp_test_exports.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    mcp_test_exports.addImport("build_options", build_options.createModule());
-    const mcp_dispatcher_e2e = b.addExecutable(.{
-        .name = "mcp-stdio-dispatcher-driver",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path(
-                "tests/e2e/fixtures/mcp-stdio-dispatcher-driver.zig",
-            ),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    mcp_dispatcher_e2e.root_module.addImport(
-        "mcp_test_exports",
-        mcp_test_exports,
-    );
-    const run_mcp_dispatcher_e2e = b.addRunArtifact(mcp_dispatcher_e2e);
-    if (b.args) |args| run_mcp_dispatcher_e2e.addArgs(args);
-    const mcp_dispatcher_e2e_step = b.step(
-        "run-mcp-stdio-dispatcher-e2e",
-        "Run the MCP stdio dispatcher E2E driver",
-    );
-    mcp_dispatcher_e2e_step.dependOn(&run_mcp_dispatcher_e2e.step);
-
-    // --- file_index search benchmark ---
-    const benchmark_exports_mod = b.createModule(.{
-        .root_source_file = b.path("src/benchmark_exports.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    const file_index_bench = b.addExecutable(.{
-        .name = "file-index-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("benchmarks/file_index_bench.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    file_index_bench.root_module.addImport("file_index", benchmark_exports_mod);
-    const install_bench = b.addInstallArtifact(file_index_bench, .{});
-    const bench_step = b.step("bench-file-index", "Build file_index search benchmark");
-    bench_step.dependOn(&install_bench.step);
-
-    const run_bench = b.addRunArtifact(file_index_bench);
-    run_bench.step.dependOn(&install_bench.step);
-    if (b.args) |args| run_bench.addArgs(args);
-    const run_bench_step = b.step("run-bench-file-index", "Build and run file_index search benchmark");
-    run_bench_step.dependOn(&run_bench.step);
-
-    // --- UI activity progress benchmark ---
-    const ui_activity_bench = b.addExecutable(.{
-        .name = "ui-activity-progress-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("benchmarks/activity_progress.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    ui_activity_bench.root_module.addImport(
-        "benchmark_exports",
-        benchmark_exports_mod,
-    );
-    const install_ui_activity_bench = b.addInstallArtifact(ui_activity_bench, .{});
-    const ui_activity_bench_step = b.step(
-        "bench-ui-activity",
-        "Build the UI activity progress benchmark",
-    );
-    ui_activity_bench_step.dependOn(&install_ui_activity_bench.step);
-
-    const run_ui_activity_bench = b.addRunArtifact(ui_activity_bench);
-    run_ui_activity_bench.step.dependOn(&install_ui_activity_bench.step);
-    const run_ui_activity_bench_step = b.step(
-        "run-bench-ui-activity",
-        "Build and run the UI activity progress benchmark",
-    );
-    run_ui_activity_bench_step.dependOn(&run_ui_activity_bench.step);
-
-    const ui_activity_bench_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("benchmarks/activity_progress.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    ui_activity_bench_tests.root_module.addImport(
-        "benchmark_exports",
-        benchmark_exports_mod,
-    );
-    const run_ui_activity_bench_tests = b.addRunArtifact(ui_activity_bench_tests);
-    test_step.dependOn(&run_ui_activity_bench_tests.step);
-    const test_ui_activity_bench_step = b.step(
-        "test-ui-activity-benchmark",
-        "Run UI activity benchmark policy tests",
-    );
-    test_ui_activity_bench_step.dependOn(&run_ui_activity_bench_tests.step);
-
-    // --- file-diff approval review benchmark ---
-    const approval_review_bench = b.addExecutable(.{
-        .name = "approval-review-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("benchmarks/approval_review.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    approval_review_bench.root_module.addImport(
-        "benchmark_exports",
-        benchmark_exports_mod,
-    );
-    const install_approval_review_bench = b.addInstallArtifact(
-        approval_review_bench,
-        .{},
-    );
-    const approval_review_bench_step = b.step(
-        "bench-approval-review",
-        "Build the file-diff approval review benchmark",
-    );
-    approval_review_bench_step.dependOn(&install_approval_review_bench.step);
-
-    const run_approval_review_bench = b.addRunArtifact(approval_review_bench);
-    run_approval_review_bench.step.dependOn(&install_approval_review_bench.step);
-    if (b.args) |args| run_approval_review_bench.addArgs(args);
-    const run_approval_review_bench_step = b.step(
-        "run-bench-approval-review",
-        "Build and run the file-diff approval review benchmark",
-    );
-    run_approval_review_bench_step.dependOn(&run_approval_review_bench.step);
-
-    const approval_review_bench_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("benchmarks/approval_review.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    approval_review_bench_tests.root_module.addImport(
-        "benchmark_exports",
-        benchmark_exports_mod,
-    );
-    const run_approval_review_bench_tests = b.addRunArtifact(
-        approval_review_bench_tests,
-    );
-    const test_approval_review_bench_step = b.step(
-        "test-approval-review-benchmark",
-        "Run file-diff approval review benchmark qualification tests",
-    );
-    test_approval_review_bench_step.dependOn(
-        &run_approval_review_bench_tests.step,
-    );
-
     const pgso_ir_step = b.step(
         "pgso-ir",
         "Emit selected ReleaseSafe LLVM bitcode for PGO/PGSO qualification",
@@ -264,15 +107,9 @@ pub fn build(b: *std.Build) void {
     if (pgso_artifact) |artifact| {
         const selected: *std.Build.Step.Compile = switch (artifact) {
             .fx => exe,
-            .file_index => file_index_bench,
-            .ui_activity => ui_activity_bench,
-            .approval_review => approval_review_bench,
         };
         const output_name = switch (artifact) {
             .fx => "pgso/fx.bc",
-            .file_index => "pgso/file-index.bc",
-            .ui_activity => "pgso/ui-activity.bc",
-            .approval_review => "pgso/approval-review.bc",
         };
         const install_ir = b.addInstallFile(
             selected.getEmittedLlvmBc(),

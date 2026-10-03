@@ -91,7 +91,6 @@ jobs:
         run: |
           node --experimental-wasm-jspi sdk/tests/test-host-tools.mjs wasm
           node --experimental-wasm-jspi sdk/tests/test-host-tool-cancel.mjs wasm
-          node --experimental-wasm-jspi sdk/tests/test-mcp-adapter.mjs http wasm
           node --experimental-wasm-jspi sdk/tests/test-skills-adapter.mjs host wasm
 
   sdk-node-napi:
@@ -121,7 +120,6 @@ jobs:
           node sdk/tests/test-minimal-api.mjs
           node sdk/tests/test-host-tools.mjs native
           node sdk/tests/test-host-tool-cancel.mjs native
-          node sdk/tests/test-mcp-adapter.mjs stdio native
           node sdk/tests/test-skills-adapter.mjs disk native
 
   sdk-bun:
@@ -160,9 +158,6 @@ jobs:
       - name: Test Bun + WASM
         run: bun sdk/tests/test-node-wasm.mjs
 
-      - name: Test Bun benchmark path
-        run: bun sdk/tests/test-libfx-benchmark.mjs
-
       - name: Test Bun cross-backend integrations
         run: |
           bun sdk/tests/test-agent-bootstrap.mjs auto
@@ -172,8 +167,6 @@ jobs:
           bun sdk/tests/test-host-tools.mjs wasm
           bun sdk/tests/test-host-tool-cancel.mjs native
           bun sdk/tests/test-host-tool-cancel.mjs wasm
-          bun sdk/tests/test-mcp-adapter.mjs stdio native
-          bun sdk/tests/test-mcp-adapter.mjs http wasm
           bun sdk/tests/test-skills-adapter.mjs disk native
           bun sdk/tests/test-skills-adapter.mjs host wasm
 
@@ -311,10 +304,6 @@ jobs:
         run: bun install
         working-directory: tests/e2e
 
-      - name: Install isolated MCP conformance package
-        run: npm ci
-        working-directory: tests/e2e/conformance
-
       - name: Install tmux
         run: |
           if ! command -v tmux >/dev/null 2>&1; then
@@ -329,28 +318,6 @@ jobs:
       - name: Run ACP tests (no-key subset)
         run: bun test acp.test.ts
         working-directory: tests/e2e
-
-      - name: Run legacy stdio MCP tool lifecycle test
-        run: bun test gateway-stream-lifecycle.test.ts --test-name-pattern "selected dynamic MCP review cautions with zero sends and clears exactly once"
-        working-directory: tests/e2e
-
-      - name: Run stdio MCP dispatcher lifecycle tests
-        run: bun test mcp-stdio.test.ts
-        working-directory: tests/e2e
-
-      - name: Run modern MCP Streamable HTTP tests
-        run: bun test mcp-http.test.ts
-        working-directory: tests/e2e
-
-      - name: Run legacy MCP remote compatibility tests
-        run: bun test mcp-legacy-remote.test.ts
-        working-directory: tests/e2e
-
-      - name: Run isolated MCP conformance baseline
-        run: npm test
-        working-directory: tests/e2e/conformance
-        env:
-          FX_SOUND: "0"
 
       - name: Run persistence tests
         run: bun test config-persistence.test.ts session-recovery.test.ts prompt-history.test.ts
@@ -472,7 +439,6 @@ jobs:
       - name: Shellcheck Fx scripts
         run: |
           scripts=(
-            benchmarks/startup.sh
             scripts/check-public-surface.sh
           )
           bash -n "${scripts[@]}"

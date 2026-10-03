@@ -4,9 +4,11 @@ const types = @import("../shared/types.zig");
 const configured_provider = @import("configured_provider.zig");
 
 pub const ProviderId = union(enum) {
-    gateway,
-    codex,
-    grok,
+    openrouter,
+    groq,
+    /// A built-in OpenAI-compatible endpoint whose base URL and API key are
+    /// supplied by the user through `/provider` and stored in profile settings.
+    openai_compatible,
     configured: struct {
         bytes: [configured_provider.max_id_bytes]u8 = @splat(0),
         len: u8,
@@ -16,9 +18,9 @@ pub const ProviderId = union(enum) {
     /// Borrows the inline name; built-in names have static storage.
     pub fn label(self: *const ProviderId) []const u8 {
         return switch (self.*) {
-            .gateway => "gateway",
-            .codex => "codex",
-            .grok => "grok",
+            .openrouter => "openrouter",
+            .groq => "groq",
+            .openai_compatible => "openai-compatible",
             .configured => |*value| value.bytes[0..value.len],
         };
     }
@@ -104,9 +106,12 @@ pub const ProviderSelection = struct {
 };
 
 pub fn parse(value: []const u8) ?ProviderId {
-    if (std.ascii.eqlIgnoreCase(value, "gateway")) return .gateway;
-    if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
-    if (std.ascii.eqlIgnoreCase(value, "grok")) return .grok;
+    if (std.ascii.eqlIgnoreCase(value, "openrouter")) return .openrouter;
+    if (std.ascii.eqlIgnoreCase(value, "groq")) return .groq;
+    if (std.ascii.eqlIgnoreCase(value, "openai-compatible")) return .openai_compatible;
+    // The user-facing name is sometimes typed with the trailing "able" spelling.
+    if (std.ascii.eqlIgnoreCase(value, "openai-compatable")) return .openai_compatible;
+    if (std.ascii.eqlIgnoreCase(value, "openai_compatible")) return .openai_compatible;
     configured_provider.validate_id(value) catch return null;
     var result: ProviderId = .{ .configured = .{ .len = @intCast(value.len) } };
     @memcpy(result.configured.bytes[0..value.len], value);
@@ -135,73 +140,9 @@ pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSourc
     const selected = source orelse return false;
     if (selected == .host_managed) return true;
     return switch (provider) {
-        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription and selected != .configured,
+        .openrouter => selected == .openrouter_api_key or selected == .stored_key,
+        .groq => selected == .groq_api_key or selected == .groq_stored_key,
+        .openai_compatible => selected == .openai_compatible_api_key or selected == .openai_compatible_key,
         .configured => selected == .configured,
-        .codex => selected == .chatgpt_subscription,
-        .grok => selected == .grok_subscription,
     };
-}
-
-test "explicit providers authorize only their own credential origins" {
-    try std.testing.expect(authorizesCredential(.gateway, .ai_gateway_api_key));
-    try std.testing.expect(authorizesCredential(.gateway, .fx_login));
-    try std.testing.expect(!authorizesCredential(.gateway, .chatgpt_subscription));
-    try std.testing.expect(authorizesCredential(.codex, .chatgpt_subscription));
-    try std.testing.expect(!authorizesCredential(.codex, .ai_gateway_api_key));
-    try std.testing.expect(!authorizesCredential(.codex, null));
-    try std.testing.expect(authorizesCredential(.grok, .grok_subscription));
-    try std.testing.expect(!authorizesCredential(.grok, .chatgpt_subscription));
-    try std.testing.expect(!authorizesCredential(.gateway, .grok_subscription));
-}
-
-test "configured provider identity serializes its binding and rejects rebinding" {
-    const alloc = std.testing.allocator;
-    var registry = try configured_provider.Registry.parse_json(alloc, "{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1\",\"auth\":{\"type\":\"none\"}}}");
-    defer registry.deinit(alloc);
-    const unbound = parse("local").?;
-    const bound = try unbound.bind(registry);
-    try std.testing.expect(!unbound.same_authority(bound));
-    var output: std.Io.Writer.Allocating = .init(alloc);
-    defer output.deinit();
-    try std.json.Stringify.value(bound, .{}, &output.writer);
-    var decoded = try std.json.parseFromSlice(ProviderId, alloc, output.written(), .{});
-    defer decoded.deinit();
-    try std.testing.expectEqualStrings("local", decoded.value.label());
-    try std.testing.expect(decoded.value.same_authority(bound));
-    var changed = bound;
-    changed.configured.binding.?[0] ^= 1;
-    try std.testing.expectError(error.ConfiguredProviderChanged, changed.bind(registry));
-    try std.testing.expectError(error.UnknownConfiguredProvider, bound.bind(.{}));
-    try std.testing.expectError(error.InvalidProviderBinding, parse_saved(.{ .string = "local" }));
-    try std.testing.expect(!authorizesCredential(.gateway, .configured));
-    try std.testing.expect(!authorizesCredential(bound, .ai_gateway_api_key));
-}
-
-test "provider equality compares tags before names and name keys stay name-only" {
-    const gateway = parse("gateway").?;
-    const codex = parse("codex").?;
-    try std.testing.expect(gateway.eql(parse("gateway").?));
-    try std.testing.expect(!gateway.eql(codex));
-    try std.testing.expect(!gateway.eql(parse("local").?));
-    const local = parse("local").?;
-    try std.testing.expect(local.eql(parse("local").?));
-    try std.testing.expect(!local.eql(parse("remote").?));
-    const key = NameKey.fromProvider(local);
-    try std.testing.expectEqualStrings("local", key.label());
-    try std.testing.expect(key.eqlName("local"));
-    try std.testing.expect(!key.eqlName("remote"));
-    try std.testing.expect(key.eqlProvider(local));
-    try std.testing.expect(!key.eqlProvider(parse("remote").?));
-    const builtin_key = NameKey.fromProvider(gateway);
-    try std.testing.expect(builtin_key.eqlName("gateway"));
-    try std.testing.expect(builtin_key.eqlProvider(gateway));
-}
-
-test "provider parsing recognizes builtins and validated configured names" {
-    try std.testing.expectEqual(ProviderId.gateway, parse("gateway").?);
-    try std.testing.expectEqual(ProviderId.codex, parse("CODEX").?);
-    try std.testing.expectEqual(ProviderId.grok, parse("GROK").?);
-    try std.testing.expect(parse("openai-codex").? == .configured);
-    try std.testing.expect(parse("bad/name") == null);
-    try std.testing.expect(parse("") == null);
 }

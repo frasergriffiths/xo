@@ -5,7 +5,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
-const mcp_servers = @import("mcp_servers.zig");
+
 const server = @import("server.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_display_metadata = @import("../core/session/session_display_metadata.zig");
@@ -16,10 +16,7 @@ const session_runtime = @import("../core/session/session.zig");
 const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const tool_call_presentation = @import("tool_call_presentation.zig");
-const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
-const mcp_contract = @import("../core/mcp/mcp_contract.zig");
-const project_config = @import("../core/mcp/project_config.zig");
-const workspace_config = @import("../core/mcp/workspace_config.zig");
+
 const config_runtime = @import("../core/config/config_runtime.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
@@ -33,8 +30,8 @@ const mode_registry = @import("../core/modes/mode_registry.zig");
 const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
 const types = @import("../core/shared/types.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
-const test_builtin_gateway = if (builtin.is_test)
-    @import("../builtins/gateway.zig")
+const test_openrouter = if (builtin.is_test)
+    @import("../gateway/openrouter_test_fixtures.zig")
 else
     struct {};
 
@@ -182,46 +179,26 @@ pub fn commitWasmSession(alloc: Allocator, session: *server.ActiveSessionState) 
     try commitWasmSessionLocked(alloc, session);
 }
 
-pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
-    var mcp_configs = mcp_servers.parse(alloc, msg.params_raw) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = mcp_servers.parseErrorMessage(err),
-        }),
+fn rejectServerConnections(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !bool {
+    const raw = msg.params_raw orelse return true;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch {
+        try state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid session parameters" });
+        return false;
     };
-    defer mcp_configs.deinit(alloc);
-    if (!state.cfg.allow_acp_mcp and mcp_configs.items.items.len > 0) {
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "MCP servers are unavailable in this runtime",
-        });
-    }
-    if (state.cfg.allow_acp_mcp) try appendProjectMcpConfigs(state, alloc, &mcp_configs);
-    retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
-    var mcp_preparation = try mcp_servers.prepare(
-        alloc,
-        &mcp_configs,
-        state.client_elicitation,
-        server.legacyUrlCompletionSink(state),
-    );
-    defer mcp_preparation.deinit(alloc);
-    switch (mcp_preparation) {
-        .ready => {},
-        .failed => |message| return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = message,
-        }),
-    }
-    const session_mcp = mcp_preparation.takeRuntime();
-    var session_mcp_owned = true;
-    defer if (session_mcp_owned) {
-        if (session_mcp) |runtime| {
-            runtime.deinit();
-            alloc.destroy(runtime);
+    defer parsed.deinit();
+    if (parsed.value == .object) {
+        if (parsed.value.object.get("mcpServers")) |servers| {
+            if (servers != .array or servers.array.items.len != 0) {
+                try state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Server connections are not supported" });
+                return false;
+            }
         }
-    };
+    }
+    return true;
+}
 
+pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+    if (!try rejectServerConnections(state, alloc, msg)) return;
     var store = (if (state.cfg.home_override) |home|
         session_store.Store.initFromHome(alloc, home, state.workspace_root)
     else
@@ -281,7 +258,6 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         .fast_mode = state.fast_mode,
         .effort = state.effort,
         .session_rt = session_rt,
-        .mcp = session_mcp,
     }) catch {
         _ = store.discardPristineStartedSession(alloc, &writable);
         writable_owned = false;
@@ -295,7 +271,6 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     session_id_owned = false;
     model_owned = false;
     session_rt_owned = false;
-    session_mcp_owned = false;
 
     try writeNewSessionResponse(state, alloc, msg, session_id);
 }
@@ -359,6 +334,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     else
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing sessionId" });
 
+    if (!try rejectServerConnections(state, alloc, msg)) return;
     if (state.active_session) |*active| {
         if (sameSessionId(active.session_id, session_id)) {
             for (active.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
@@ -375,7 +351,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     const sid_copy = try alloc.dupe(u8, loaded.state.id);
     var sid_owned = true;
     defer if (sid_owned) alloc.free(sid_copy);
-    if (loaded.state.preferences.provider != .gateway) {
+    if (loaded.state.preferences.provider != .openrouter) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = "Subscription models are unavailable in this WASM runtime",
@@ -509,70 +485,19 @@ fn handleRestoreSession(
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing sessionId" });
     };
 
-    var mcp_configs = switch (kind) {
-        .load => mcp_servers.parse(alloc, msg.params_raw),
-        .reconnect => mcp_servers.parseResume(alloc, msg.params_raw),
-    } catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = mcp_servers.parseErrorMessage(err),
-        }),
-    };
-    defer mcp_configs.deinit(alloc);
-    if (!state.cfg.allow_acp_mcp) {
-        if (mcp_configs.items.items.len > 0) {
-            return state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.invalid_params,
-                .message = "MCP servers are unavailable in this runtime",
-            });
-        }
-    } else {
-        try appendProjectMcpConfigs(state, alloc, &mcp_configs);
-    }
-    retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
-    var mcp_preparation = try mcp_servers.prepare(
-        alloc,
-        &mcp_configs,
-        state.client_elicitation,
-        server.legacyUrlCompletionSink(state),
-    );
-    defer mcp_preparation.deinit(alloc);
-    switch (mcp_preparation) {
-        .ready => {},
-        .failed => |message| return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = message,
-        }),
-    }
-    const session_mcp = mcp_preparation.takeRuntime();
-    var session_mcp_owned = true;
-    defer if (session_mcp_owned) {
-        if (session_mcp) |runtime| {
-            runtime.deinit();
-            alloc.destroy(runtime);
-        }
-    };
-
     if (state.active_session) |*active| {
         if (sameSessionId(active.session_id, session_id)) {
             server.cancelAndReapActivePrompt(state);
             server.disableSubagentHost(state);
             state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-            const previous_mcp = active.mcp;
-            active.mcp = session_mcp;
-            session_mcp_owned = false;
+
             server.applySessionMode(
                 state.cfg.mode_registry,
                 active,
                 state.cfg.mode_registry.default_mode_id,
             );
             state.subagent_authority_mutex.unlock(io_mod.getIo());
-            if (previous_mcp) |runtime| {
-                runtime.retireAndWait();
-                runtime.deinit();
-                alloc.destroy(runtime);
-            }
+
             server.enableSubagentHost(state);
             if (kind.replaysHistory()) {
                 try sendActiveHistoryUpdates(state, alloc, session_id);
@@ -638,10 +563,8 @@ fn handleRestoreSession(
         if (err != error.ProviderCredentialUnavailable) return err;
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
-            .message = if (effective_provider == .codex)
-                credentials.missing_chatgpt_credential_message
-            else if (effective_provider == .grok)
-                credentials.missing_grok_credential_message
+            .message = if (effective_provider == .openrouter)
+                credentials.missing_credential_message
             else if (effective_provider == .configured)
                 "Configured provider authentication is unavailable"
             else
@@ -692,7 +615,6 @@ fn handleRestoreSession(
         .fast_mode = writable.state.preferences.fast_mode,
         .effort = writable.state.preferences.effort,
         .session_rt = session_rt,
-        .mcp = session_mcp,
     }) catch
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
@@ -703,7 +625,6 @@ fn handleRestoreSession(
     sid_owned = false;
     model_owned = false;
     session_rt_owned = false;
-    session_mcp_owned = false;
     if (kind.replaysHistory()) {
         try sendActiveHistoryUpdates(state, alloc, session_id);
     }
@@ -720,90 +641,6 @@ fn handleRestoreSession(
         alloc,
         msg,
         state.active_session.?.model,
-    );
-}
-
-fn detachActiveMcpForAuthorityReduction(
-    state: *server.ServerState,
-    active: *server.ActiveSessionState,
-) *mcp_runtime.McpRuntime {
-    server.cancelAndReapActivePrompt(state);
-    server.disableSubagentHost(state);
-    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-    const previous = active.mcp.?;
-    active.mcp = null;
-    state.subagent_authority_mutex.unlock(io_mod.getIo());
-    return previous;
-}
-
-fn retireReducedActiveMcp(
-    state: *server.ServerState,
-    alloc: Allocator,
-    next_configs: []const mcp_contract.McpServerConfig,
-) void {
-    const active = if (state.active_session) |*value| value else return;
-    const runtime = active.mcp orelse return;
-    if (!runtime.workspaceAuthorityReducedAgainstConfigs(
-        next_configs,
-        .acp_startup,
-    )) return;
-    const previous = detachActiveMcpForAuthorityReduction(state, active);
-    previous.retireAndWait();
-    previous.deinit();
-    alloc.destroy(previous);
-    server.enableSubagentHost(state);
-}
-
-fn appendProjectMcpConfigs(
-    state: *server.ServerState,
-    alloc: Allocator,
-    configs: *mcp_servers.OwnedServerConfigs,
-) !void {
-    var choices = if (state.cfg.home_override) |home|
-        config_runtime.loadProjectMcpChoicesFromHome(alloc, home, state.workspace_root) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
-            return;
-        }
-    else
-        config_runtime.loadProjectMcpChoices(alloc, state.workspace_root) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
-            return;
-        };
-    defer choices.deinit(alloc);
-
-    var workspace = try workspace_config.load(
-        alloc,
-        state.workspace_root,
-        .workspace,
-        choices.choices,
-    );
-    defer workspace.deinit(alloc);
-    for (workspace.diagnostics.items) |diagnostic| {
-        var name_buf: [256]u8 = undefined;
-        var variable_buf: [160]u8 = undefined;
-        debug_trace.logf(
-            "mcp",
-            "ACP workspace MCP config skipped cause={s} server={s} field={s} variable={s}",
-            .{
-                @tagName(diagnostic.cause),
-                if (diagnostic.server_name) |name|
-                    debug_trace.terminalPreview(name_buf[0..], name)
-                else
-                    "none",
-                if (diagnostic.environment_field) |field| @tagName(field) else "none",
-                if (diagnostic.environment_variable) |name|
-                    debug_trace.terminalPreview(variable_buf[0..], name)
-                else
-                    "none",
-            },
-        );
-    }
-    try project_config.appendWorkspaceAfterAcpPrimary(
-        alloc,
-        &configs.items,
-        &workspace.configs,
     );
 }
 
@@ -930,7 +767,6 @@ const SessionActivation = struct {
     fast_mode: bool,
     effort: types.ReasoningEffort,
     session_rt: session_runtime.SessionRuntime,
-    mcp: ?*mcp_runtime.McpRuntime,
 };
 
 fn activateSession(
@@ -960,7 +796,7 @@ fn activateSession(
         .permission_mode = state.permission_mode,
         .permission_rules = state.permission_rules,
         .session_rt = activation.session_rt,
-        .mcp = activation.mcp,
+
         .cancel_flag = std.atomic.Value(bool).init(false),
         .pending_prompt_id = null,
     };
@@ -1596,9 +1432,8 @@ pub fn writeProviderConfigOption(
 ) !void {
     try w.writeAll("{\"id\":\"provider\",\"name\":\"Provider\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(current.label(), w);
-    try w.writeAll(",\"options\":[{\"value\":\"gateway\",\"name\":\"Vercel AI Gateway\"},{\"value\":\"codex\",\"name\":\"Codex subscription\"}");
+    try w.writeAll(",\"options\":[{\"value\":\"openrouter\",\"name\":\"OpenRouter\"}");
     if (comptime !host_target.is_wasm) {
-        try w.writeAll(",{\"value\":\"grok\",\"name\":\"Grok subscription\"}");
         for (definitions) |definition| {
             try w.writeAll(",{\"value\":");
             try writeJsonStr(definition.id, w);
@@ -1704,464 +1539,13 @@ pub fn writeEffortConfigOption(
     try w.writeAll("]}");
 }
 
-test "writeEffortConfigOption produces thought_level select with auto first" {
-    const alloc = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    const efforts = model_capabilities.ReasoningEffortOptions.fromSlice(&.{
-        types.ReasoningEffort.literal("low"),
-        types.ReasoningEffort.literal("high"),
-    });
-    try writeEffortConfigOption(&out.writer, efforts, .literal("high"));
-    const items = out.writer.buffered();
-    try std.testing.expect(std.mem.find(u8, items, "\"id\":\"effort\"") != null);
-    try std.testing.expect(std.mem.find(u8, items, "\"category\":\"thought_level\"") != null);
-    try std.testing.expect(std.mem.find(u8, items, "\"currentValue\":\"high\"") != null);
-    const auto_index = std.mem.find(u8, items, "\"value\":\"auto\"").?;
-    const low_index = std.mem.find(u8, items, "\"value\":\"low\"").?;
-    try std.testing.expect(auto_index < low_index);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, items, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("select", parsed.value.object.get("type").?.string);
-}
-
-test "effortSupportedBy accepts auto and advertised names only" {
-    const efforts = model_capabilities.ReasoningEffortOptions.fromSlice(&.{
-        types.ReasoningEffort.literal("low"),
-        types.ReasoningEffort.literal("high"),
-    });
-    try std.testing.expect(effortSupportedBy(efforts, .auto));
-    try std.testing.expect(effortSupportedBy(efforts, .literal("high")));
-    try std.testing.expect(!effortSupportedBy(efforts, .literal("max")));
-}
-
-test "writeEffortConfigOption appends an unadvertised current effort" {
-    const alloc = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    const efforts = model_capabilities.ReasoningEffortOptions.fromSlice(&.{
-        types.ReasoningEffort.literal("low"),
-    });
-    try writeEffortConfigOption(&out.writer, efforts, .literal("max"));
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
-    defer parsed.deinit();
-    const options = parsed.value.object.get("options").?.array;
-    try std.testing.expectEqual(@as(usize, 3), options.items.len);
-    try std.testing.expectEqualStrings("max", options.items[2].object.get("value").?.string);
-}
-
-test "formatIso8601 produces valid format" {
-    const alloc = std.testing.allocator;
-    const result = try formatIso8601(alloc, 1700000000000);
-    defer alloc.free(result);
-    try std.testing.expect(result.len > 0);
-    try std.testing.expect(std.mem.endsWith(u8, result, "Z"));
-    try std.testing.expect(std.mem.find(u8, result, "T") != null);
-}
-
-test "formatIso8601 produces known timestamp" {
-    const alloc = std.testing.allocator;
-    const result = try formatIso8601(alloc, 0);
-    defer alloc.free(result);
-    try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", result);
-}
-
-test "writeModelConfigOption produces valid json with single model fallback" {
-    const alloc = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try writeModelConfigOption(&out.writer, "gpt-4", null);
-    const items = out.writer.buffered();
-    try std.testing.expect(std.mem.find(u8, items, "\"id\":\"model\"") != null);
-    try std.testing.expect(std.mem.find(u8, items, "\"currentValue\":\"gpt-4\"") != null);
-    try std.testing.expect(std.mem.find(u8, items, "\"value\":\"gpt-4\"") != null);
-}
-
-test "writeModelConfigOption includes all cached model ids" {
-    const alloc = std.testing.allocator;
-    const entries = [_]model_catalog.ModelCatalogEntry{
-        .{ .id = @constCast("anthropic/claude-opus-4.6"), .model_type = @constCast("language") },
-        .{ .id = @constCast("openai/gpt-4o"), .model_type = @constCast("language") },
-        .{ .id = @constCast("xai/grok-3"), .model_type = @constCast("language") },
-    };
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try writeModelConfigOption(&out.writer, "openai/gpt-4o", &entries);
-    const items = out.writer.buffered();
-    try std.testing.expect(std.mem.find(u8, items, "\"currentValue\":\"openai/gpt-4o\"") != null);
-    try std.testing.expect(std.mem.find(u8, items, "anthropic/claude-opus-4.6") != null);
-    try std.testing.expect(std.mem.find(u8, items, "openai/gpt-4o") != null);
-    try std.testing.expect(std.mem.find(u8, items, "xai/grok-3") != null);
-}
-
-test "writeModelConfigOption appends current model when not in cached list" {
-    const alloc = std.testing.allocator;
-    const entries = [_]model_catalog.ModelCatalogEntry{
-        .{ .id = @constCast("anthropic/claude-opus-4.6"), .model_type = @constCast("language") },
-    };
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try writeModelConfigOption(&out.writer, "custom/my-model", &entries);
-    const items = out.writer.buffered();
-    try std.testing.expect(std.mem.find(u8, items, "\"currentValue\":\"custom/my-model\"") != null);
-    try std.testing.expect(std.mem.find(u8, items, "anthropic/claude-opus-4.6") != null);
-    try std.testing.expect(std.mem.find(u8, items, "custom/my-model") != null);
-}
-
-test "writeModeConfigOption produces valid json with all modes" {
-    const alloc = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try writeModeConfigOption(&out.writer, test_session_mode_registry, "inspect");
-    const items = out.writer.buffered();
-    try std.testing.expect(std.mem.find(u8, items, "\"id\":\"mode\"") != null);
-    try std.testing.expect(std.mem.find(u8, items, "\"currentValue\":\"inspect\"") != null);
-    try std.testing.expect(std.mem.find(u8, items, "\"review\"") != null);
-    try std.testing.expect(std.mem.find(u8, items, "\"inspect\"") != null);
-    try std.testing.expect(std.mem.find(u8, items, "\"permissionMode\":\"ask\"") != null);
-}
-
-test "writeModesArray preserves supplied registry order" {
-    const alloc = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try writeModesArray(&out.writer, test_session_mode_registry);
-    const items = out.writer.buffered();
-    try std.testing.expect(items[0] == '[');
-    try std.testing.expect(items[items.len - 1] == ']');
-    const review_index = std.mem.find(u8, items, "\"review\"") orelse return error.TestExpectedEqual;
-    const inspect_index = std.mem.find(u8, items, "\"inspect\"") orelse return error.TestExpectedEqual;
-    try std.testing.expect(review_index < inspect_index);
-}
-
-test "ACP load recognizes the retained active session exactly" {
-    try std.testing.expect(sameSessionId(
-        "release.2026.06",
-        "release.2026.06",
-    ));
-    try std.testing.expect(!sameSessionId(
-        "release.2026.06",
-        "release.2026",
-    ));
-}
-
-test "ACP history excludes typed summaries without filtering original user text" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
-    defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace, capture);
-    defer state.deinit();
-
-    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .compacted_summary = .{
-        .summary = @constCast("internal summary"),
-        .removed_turn_count = 1,
-        .compaction_count = 1,
-    } });
-    try std.testing.expectEqual(@as(u64, 0), try capture.length(io_mod.getIo()));
-
-    const original = "Explain <context_handoff> without hiding my question.";
-    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .assistant = .{
-        .user = .{ .text = @constCast(original) },
-        .assistant = @constCast("original reply"),
-    } });
-    var file = try tmp.dir.openFile(io_mod.getIo(), "history.jsonl", .{});
-    defer file.close(io_mod.getIo());
-    const captured = try io_mod.readFileToEnd(alloc, &file, 16 * 1024);
-    defer alloc.free(captured);
-    try std.testing.expect(std.mem.find(u8, captured, original) != null);
-    try std.testing.expect(std.mem.find(u8, captured, "original reply") != null);
-    try std.testing.expect(std.mem.find(u8, captured, "internal summary") == null);
-}
-
-test "ACP interrupted history replay hides model-only abort context" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    var capture = try tmp.dir.createFile(
-        io_mod.getIo(),
-        "acp-interrupted-history.jsonl",
-        .{ .read = true },
-    );
-    defer capture.close(io_mod.getIo());
-
-    {
-        var state = try initAcpSessionTestState(arena, workspace, capture);
-        defer state.deinit();
-        var completed_tool_names = [_][]u8{@constCast("read_file")};
-        try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .interrupted = .{
-            .user = .{ .text = @constCast("inspect the project") },
-            .completed_tool_names = completed_tool_names[0..],
-        } });
-        try capture.sync(io_mod.getIo());
-    }
-
-    var captured_file = try tmp.dir.openFile(
-        io_mod.getIo(),
-        "acp-interrupted-history.jsonl",
-        .{},
-    );
-    defer captured_file.close(io_mod.getIo());
-    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 16 * 1024);
-    defer alloc.free(captured);
-    try std.testing.expect(std.mem.find(u8, captured, "cancelled") != null);
-    try std.testing.expect(std.mem.find(u8, captured, "Interrupted by user after completing") == null);
-    try std.testing.expect(std.mem.find(u8, captured, "<turn_aborted>") == null);
+fn testResolveChatUrl(_: ?*anyopaque, fallback: []const u8) []const u8 {
+    return if (fallback.len == 0) test_openrouter.chat_url_provider.resolve_fn() else fallback;
 }
 
 fn readCaptured(capture_file: *std.Io.File, alloc: Allocator) ![]u8 {
     try capture_file.sync(io_mod.getIo());
     return io_mod.readFileToEnd(alloc, capture_file, 1024 * 1024);
-}
-
-test "ACP history replay emits structured tool call frames" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
-    defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace, capture);
-    defer state.deinit();
-
-    var calls = [_]types.ToolCall{
-        .{ .id = "call_read_1", .name = "read_file", .arguments_json = "{\"path\":\"README.md\"}" },
-        .{ .id = "call_write_1", .name = "write_file", .arguments_json = "{\"path\":\"out.txt\",\"content\":\"done\"}" },
-    };
-    var results = [_]types.PersistedToolResult{
-        .{
-            .tool_call_id = @constCast("call_read_1"),
-            .tool_name = @constCast("read_file"),
-            .status = .success,
-            .output = @constCast("<content>readme text</content>"),
-            .output_bytes = 27,
-            .stored_output_bytes = 27,
-        },
-        .{
-            .tool_call_id = @constCast("call_write_1"),
-            .tool_name = @constCast("write_file"),
-            .status = .failure,
-            .output = @constCast("permission denied"),
-            .output_bytes = 17,
-            .stored_output_bytes = 17,
-        },
-    };
-    var steps = [_]types.ToolExecutionStep{.{
-        .assistant = @constCast("Let me inspect those files."),
-        .tool_calls = calls[0..],
-        .tool_results = results[0..],
-    }};
-    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .assistant = .{
-        .user = .{ .text = @constCast("read and write") },
-        .assistant = @constCast("All done."),
-        .execution = .{ .tool_steps = steps[0..] },
-    } });
-
-    const captured = try readCaptured(&capture, alloc);
-    defer alloc.free(captured);
-
-    try std.testing.expect(std.mem.find(u8, captured, "Previous tool execution") == null);
-    try std.testing.expect(std.mem.find(u8, captured, "Let me inspect those files.") != null);
-    try std.testing.expect(std.mem.find(u8, captured, "All done.") != null);
-
-    const announce_read = std.mem.find(u8, captured, "\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"call_read_1\"").?;
-    const announce_write = std.mem.find(u8, captured, "\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"call_write_1\"").?;
-    const finish_read = std.mem.find(u8, captured, "\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"call_read_1\"").?;
-    const finish_write = std.mem.find(u8, captured, "\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"call_write_1\"").?;
-    try std.testing.expect(announce_read < finish_read);
-    try std.testing.expect(announce_write < finish_write);
-    try std.testing.expect(announce_read < announce_write);
-
-    try std.testing.expect(std.mem.find(u8, captured, "\"name\":\"read_file\"") != null);
-    try std.testing.expect(std.mem.find(u8, captured, "\"kind\":\"read\"") != null);
-    try std.testing.expect(std.mem.find(u8, captured, "\"rawInput\":{\"path\":\"README.md\"}") != null);
-    try std.testing.expect(std.mem.find(u8, captured, "\"status\":\"completed\"") != null);
-    try std.testing.expect(std.mem.find(u8, captured, "\"status\":\"failed\"") != null);
-    try std.testing.expect(std.mem.find(u8, captured, "readme text") != null);
-    try std.testing.expect(std.mem.find(u8, captured, "permission denied") != null);
-}
-
-test "ACP history replay leaves resultless tool calls pending" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
-    defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace, capture);
-    defer state.deinit();
-
-    var calls = [_]types.ToolCall{
-        .{ .id = "call_orphan", .name = "read_file", .arguments_json = "{\"path\":\"a.txt\"}" },
-    };
-    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = calls[0..] }};
-    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .interrupted = .{
-        .user = .{ .text = @constCast("inspect") },
-        .execution = .{ .tool_steps = steps[0..] },
-    } });
-
-    const captured = try readCaptured(&capture, alloc);
-    defer alloc.free(captured);
-    try std.testing.expect(std.mem.find(u8, captured, "\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"call_orphan\"") != null);
-    try std.testing.expect(std.mem.find(u8, captured, "\"sessionUpdate\":\"tool_call_update\"") == null);
-    try std.testing.expect(std.mem.find(u8, captured, "Previous tool execution") == null);
-}
-
-test "ACP history replay redacts sensitive tool arguments" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
-    defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace, capture);
-    defer state.deinit();
-
-    var calls = [_]types.ToolCall{
-        .{ .id = "call_secret", .name = "run_command", .arguments_json = "{\"command\":\"echo ok\",\"api_key\":\"sk-live-secret\"}" },
-    };
-    var results = [_]types.PersistedToolResult{.{
-        .tool_call_id = @constCast("call_secret"),
-        .tool_name = @constCast("run_command"),
-        .status = .success,
-        .output = @constCast("ok"),
-        .output_bytes = 2,
-        .stored_output_bytes = 2,
-    }};
-    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = calls[0..], .tool_results = results[0..] }};
-    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .assistant = .{
-        .user = .{ .text = @constCast("run it") },
-        .assistant = @constCast("done"),
-        .execution = .{ .tool_steps = steps[0..] },
-    } });
-
-    const captured = try readCaptured(&capture, alloc);
-    defer alloc.free(captured);
-    try std.testing.expect(std.mem.find(u8, captured, "sk-live-secret") == null);
-    try std.testing.expect(std.mem.find(u8, captured, "[REDACTED]") != null);
-}
-
-test "execution replay plan interleaves assistant text and orphan results" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var calls = [_]types.ToolCall{
-        .{ .id = "call_a", .name = "read_file", .arguments_json = "{\"path\":\"a.txt\"}" },
-    };
-    var results = [_]types.PersistedToolResult{
-        .{
-            .tool_call_id = @constCast("call_a"),
-            .tool_name = @constCast("read_file"),
-            .status = .success,
-            .output = @constCast("alpha"),
-            .output_bytes = 5,
-            .stored_output_bytes = 5,
-        },
-        .{
-            .tool_call_id = @constCast("call_orphaned"),
-            .tool_name = @constCast("write_file"),
-            .status = .failure,
-            .output = @constCast("denied"),
-            .output_bytes = 6,
-            .stored_output_bytes = 6,
-        },
-    };
-    var steps = [_]types.ToolExecutionStep{.{
-        .assistant = @constCast("working"),
-        .tool_calls = calls[0..],
-        .tool_results = results[0..],
-    }};
-
-    const frames = try planExecutionReplay(
-        arena,
-        @import("../builtins/tools.zig").registry,
-        .{ .tool_steps = steps[0..] },
-    );
-    try std.testing.expectEqual(@as(usize, 3), frames.len);
-    try std.testing.expectEqualStrings("working", frames[0].assistant_text);
-    try std.testing.expectEqualStrings("call_a", frames[1].tool_call.id);
-    try std.testing.expectEqual(acp_types.ToolCallStatus.completed, frames[1].tool_call.status);
-    try std.testing.expectEqual(acp_types.ToolCallKind.read, frames[1].tool_call.kind);
-    try std.testing.expectEqualStrings("alpha", frames[1].tool_call.content_text.?);
-    try std.testing.expectEqualStrings("call_orphaned", frames[2].tool_call.id);
-    try std.testing.expectEqual(acp_types.ToolCallStatus.failed, frames[2].tool_call.status);
-    try std.testing.expect(frames[2].tool_call.raw_input != null);
-}
-
-test "ACP load maps one-off child denial to invalid params" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    var capture = try tmp.dir.createFile(
-        io_mod.getIo(),
-        "acp-one-off-error.jsonl",
-        .{ .read = true },
-    );
-    defer capture.close(io_mod.getIo());
-    {
-        var state = try initAcpSessionTestState(arena, workspace, capture);
-        defer state.deinit();
-        var msg = jsonrpc.Message{
-            .id = .{ .integer = 1 },
-            .method = "session/load",
-        };
-        try handleLoadFailure(
-            &state,
-            arena,
-            &msg,
-            error.OneOffSessionNotResumable,
-        );
-        try std.testing.expect(state.active_session == null);
-        try capture.sync(io_mod.getIo());
-    }
-    var captured_file = try tmp.dir.openFile(
-        io_mod.getIo(),
-        "acp-one-off-error.jsonl",
-        .{},
-    );
-    defer captured_file.close(io_mod.getIo());
-    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 4096);
-    defer alloc.free(captured);
-    try std.testing.expect(std.mem.find(u8, captured, "\"code\":-32602") != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        captured,
-        "Subagent child sessions cannot be resumed directly",
-    ) != null);
 }
 
 var acp_session_stable_test_environ: ?*std.process.Environ.Map = null;
@@ -2239,8 +1623,8 @@ fn acpSessionTestConfig() server.Config {
         .gateway_retry_count = 0,
         .gateway_chat_url = "http://127.0.0.1/unused",
         .gateway_models_path = "/v1/models",
-        .gateway_provider = test_builtin_gateway.provider,
-        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
+        .gateway_provider = .{ .chat_url = .{ .context = @constCast(&test_openrouter), .resolve_fn = testResolveChatUrl } },
+        .provider_set = provider_set.openrouter_only(test_openrouter.provider_bundle),
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "test" },
         .ignored_list_entries = &.{},
@@ -2276,403 +1660,10 @@ fn initAcpSessionTestState(
         .writer = .{ .stdout = capture },
         .workspace_root = workspace,
         .api_key = api_key,
-        .credential_source = .ai_gateway_api_key,
+        .credential_source = .openrouter_api_key,
         .selected_model = selected_model,
         .configured_model = configured_model,
         .agent_step_limit = 8,
         .max_tool_result_bytes = 64 * 1024,
     };
-}
-
-test "ACP project MCP loading expands workspace environment templates" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try tmp.dir.writeFile(io_mod.getIo(), .{
-        .sub_path = "workspace/.mcp.json",
-        .data =
-        \\{"mcpServers":{"expanded":{"command":"${ACP_MCP_COMMAND}","args":["${ACP_MCP_ARG:-fallback}"],"env":{"TOKEN":"${ACP_MCP_TOKEN}"}}}}
-        ,
-    });
-    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home_path);
-    const workspace_path = try io_mod.dirRealpathAlloc(
-        alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer alloc.free(workspace_path);
-    const test_home = try AcpSessionTestHome.install(alloc, home_path);
-    defer test_home.deinit();
-    try test_home.map.put("ACP_MCP_COMMAND", "node");
-    try test_home.map.put("ACP_MCP_TOKEN", "secret-value");
-    var approved_names = [_][]u8{@constCast("expanded")};
-
-    var result = try workspace_config.load(
-        alloc,
-        workspace_path,
-        .workspace,
-        .{ .approved = &approved_names },
-    );
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
-    const config = result.configs.items[0];
-    try std.testing.expectEqualStrings("node", config.command.?);
-    try std.testing.expectEqualStrings("fallback", config.args[0]);
-    try std.testing.expectEqualStrings("secret-value", config.env[0].value);
-}
-
-test "ACP host-disabled new load and resume skip project MCP effects" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-
-    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home_path);
-    const workspace_path = try io_mod.dirRealpathAlloc(
-        alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer alloc.free(workspace_path);
-    const marker_path = try std.fs.path.join(
-        alloc,
-        &.{ workspace_path, "project-mcp-launched" },
-    );
-    defer alloc.free(marker_path);
-    const project_json = try std.fmt.allocPrint(
-        alloc,
-        "{{\"mcpServers\":{{\"fixture\":{{\"command\":\"/bin/sh\",\"args\":[\"-c\",\"printf launched > {s}\"]}},\"remote\":{{\"type\":\"http\",\"url\":\"http://127.0.0.1:1/mcp\",\"startup_timeout_ms\":5000}}}}}}",
-        .{marker_path},
-    );
-    defer alloc.free(project_json);
-    try tmp.dir.writeFile(io_mod.getIo(), .{
-        .sub_path = "workspace/.mcp.json",
-        .data = project_json,
-    });
-    try tmp.dir.writeFile(io_mod.getIo(), .{
-        .sub_path = "home/.fx/settings.json",
-        .data = "{}",
-    });
-    const test_home = try AcpSessionTestHome.install(alloc, home_path);
-    defer test_home.deinit();
-
-    var capture = try tmp.dir.createFile(
-        io_mod.getIo(),
-        "acp-host-disabled.jsonl",
-        .{ .read = true },
-    );
-    defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace_path, capture);
-    defer state.deinit();
-    state.cfg.allow_acp_mcp = false;
-
-    var new_msg = jsonrpc.Message{
-        .id = .{ .integer = 1 },
-        .method = "session/new",
-        .params_raw = "{\"mcpServers\":[]}",
-    };
-    try handleNewSession(&state, arena, &new_msg);
-    try std.testing.expect(state.active_session.?.mcp == null);
-    const session_id = try alloc.dupe(u8, state.active_session.?.session_id);
-    defer alloc.free(session_id);
-
-    inline for (.{
-        .{ .method = "session/load", .handler = handleLoadSession },
-        .{ .method = "session/resume", .handler = handleResumeSession },
-    }, 0..) |restore, index| {
-        const params = try std.fmt.allocPrint(
-            arena,
-            "{{\"sessionId\":\"{s}\",\"mcpServers\":[]}}",
-            .{session_id},
-        );
-        var msg = jsonrpc.Message{
-            .id = .{ .integer = @intCast(index + 2) },
-            .method = restore.method,
-            .params_raw = params,
-        };
-        try restore.handler(&state, arena, &msg);
-        try std.testing.expect(state.active_session.?.mcp == null);
-    }
-
-    const local_request = try std.fmt.allocPrint(
-        arena,
-        "{{\"name\":\"request-local\",\"command\":\"/bin/sh\",\"args\":[\"-c\",\"printf launched > {s}\"],\"env\":[]}}",
-        .{marker_path},
-    );
-    const remote_request =
-        "{\"type\":\"http\",\"name\":\"request-remote\",\"url\":\"http://127.0.0.1:1/mcp\",\"headers\":[]}";
-    inline for (.{
-        .{ .method = "session/new", .handler = handleNewSession, .server = local_request },
-        .{ .method = "session/load", .handler = handleLoadSession, .server = remote_request },
-        .{ .method = "session/resume", .handler = handleResumeSession, .server = local_request },
-    }, 0..) |request, index| {
-        const params = if (std.mem.eql(u8, request.method, "session/new"))
-            try std.fmt.allocPrint(
-                arena,
-                "{{\"mcpServers\":[{s}]}}",
-                .{request.server},
-            )
-        else
-            try std.fmt.allocPrint(
-                arena,
-                "{{\"sessionId\":\"{s}\",\"mcpServers\":[{s}]}}",
-                .{ session_id, request.server },
-            );
-        var msg = jsonrpc.Message{
-            .id = .{ .integer = @intCast(index + 10) },
-            .method = request.method,
-            .params_raw = params,
-        };
-        try request.handler(&state, arena, &msg);
-        try std.testing.expect(state.active_session.?.mcp == null);
-        try std.testing.expectEqualStrings(
-            session_id,
-            state.active_session.?.session_id,
-        );
-    }
-
-    try std.testing.expectError(
-        error.FileNotFound,
-        tmp.dir.openFile(io_mod.getIo(), "workspace/project-mcp-launched", .{}),
-    );
-    try capture.sync(io_mod.getIo());
-    var captured_file = try tmp.dir.openFile(
-        io_mod.getIo(),
-        "acp-host-disabled.jsonl",
-        .{},
-    );
-    defer captured_file.close(io_mod.getIo());
-    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 64 * 1024);
-    defer alloc.free(captured);
-    try std.testing.expectEqual(
-        @as(usize, 3),
-        std.mem.count(u8, captured, "MCP servers are unavailable in this runtime"),
-    );
-}
-
-test "ACP new and loaded sessions provide a writable subagent host" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-
-    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home_path);
-    const workspace_path = try io_mod.dirRealpathAlloc(
-        alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer alloc.free(workspace_path);
-    const test_home = try AcpSessionTestHome.install(alloc, home_path);
-    defer test_home.deinit();
-
-    var capture = try tmp.dir.createFile(
-        io_mod.getIo(),
-        "acp-output.jsonl",
-        .{ .read = true },
-    );
-    defer capture.close(io_mod.getIo());
-    {
-        var state = try initAcpSessionTestState(arena, workspace_path, capture);
-        defer state.deinit();
-
-        var new_msg = jsonrpc.Message{
-            .id = .{ .integer = 1 },
-            .method = "session/new",
-            .params_raw = "{\"mcpServers\":[]}",
-        };
-        try handleNewSession(&state, arena, &new_msg);
-
-        const new_active = &state.active_session.?;
-        const new_writable = &new_active.writable.?;
-        try std.testing.expectEqualStrings(
-            test_session_mode_registry.default_mode_id,
-            new_active.mode,
-        );
-        server.applySessionMode(
-            state.cfg.mode_registry,
-            new_active,
-            "review",
-        );
-        try std.testing.expectEqualStrings("review", new_active.mode);
-        try std.testing.expect(new_writable.state.usage != null);
-        try std.testing.expect(
-            new_active.session_rt.usage.generation_usage_providers.select(.gateway).?.lookup_fn ==
-                state.cfg.provider_set.deferredUsageProviders().select(.gateway).?.lookup_fn,
-        );
-        io_mod.sleep(10 * std.time.ns_per_ms);
-        var live_usage = try new_active.session_rt.usage.snapshot(alloc);
-        defer live_usage.deinit(alloc);
-        try std.testing.expect(live_usage.wall_duration_ms > 0);
-        try std.testing.expect(state.subagent_store != null);
-        try std.testing.expect(state.subagent_host != null);
-
-        _ = try new_writable.appendEvent(arena, .{ .history_turn_committed = .{
-            .conversation_language = .literal("en"),
-            .total_input_tokens = 0,
-            .total_output_tokens = 0,
-            .turn = .{ .assistant = .{
-                .user = .{ .text = @constCast("remember this") },
-                .assistant = @constCast("retained answer"),
-            } },
-        } }, io_mod.milliTimestamp());
-        const session_id = try alloc.dupe(u8, new_active.session_id);
-        defer alloc.free(session_id);
-        try server.releaseActiveSession(&state);
-        try std.testing.expect(state.active_session == null);
-        try std.testing.expect(state.subagent_store == null);
-        try std.testing.expect(state.subagent_host == null);
-
-        var load_params: std.Io.Writer.Allocating = .init(arena);
-        defer load_params.deinit();
-        try load_params.writer.writeAll("{\"sessionId\":");
-        try writeJsonStr(session_id, &load_params.writer);
-        try load_params.writer.writeAll(",\"mcpServers\":[]}");
-        var load_msg = jsonrpc.Message{
-            .id = .{ .integer = 2 },
-            .method = "session/load",
-            .params_raw = load_params.writer.buffered(),
-        };
-        try handleLoadSession(&state, arena, &load_msg);
-
-        const loaded_active = &state.active_session.?;
-        const loaded_writable = &loaded_active.writable.?;
-        try std.testing.expectEqual(@as(usize, 1), loaded_active.session_rt.historyLen());
-        try std.testing.expectEqual(@as(usize, 0), loaded_writable.state.history.len);
-        try std.testing.expectEqualStrings(
-            test_session_mode_registry.default_mode_id,
-            loaded_active.mode,
-        );
-        try std.testing.expect(loaded_writable.state.usage != null);
-        try std.testing.expect(state.subagent_store != null);
-        try std.testing.expect(state.subagent_host != null);
-        try std.testing.expect(
-            loaded_active.session_rt.usage.generation_usage_providers.select(.gateway).?.lookup_fn ==
-                state.cfg.provider_set.deferredUsageProviders().select(.gateway).?.lookup_fn,
-        );
-
-        try capture.sync(io_mod.getIo());
-    }
-    var captured_file = try tmp.dir.openFile(
-        io_mod.getIo(),
-        "acp-output.jsonl",
-        .{},
-    );
-    defer captured_file.close(io_mod.getIo());
-    const captured = try io_mod.readFileToEnd(
-        alloc,
-        &captured_file,
-        64 * 1024,
-    );
-    defer alloc.free(captured);
-    try std.testing.expect(std.mem.find(u8, captured, "\"id\":1") != null);
-    try std.testing.expect(std.mem.find(u8, captured, "\"id\":2") != null);
-}
-
-test "ACP same-session restore retires the replaced MCP runtime after active users drain" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-
-    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home_path);
-    const workspace_path = try io_mod.dirRealpathAlloc(
-        alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer alloc.free(workspace_path);
-    const test_home = try AcpSessionTestHome.install(alloc, home_path);
-    defer test_home.deinit();
-
-    var capture = try tmp.dir.createFile(
-        io_mod.getIo(),
-        "acp-replace-output.jsonl",
-        .{ .read = true },
-    );
-    defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace_path, capture);
-    defer state.deinit();
-
-    var new_msg = jsonrpc.Message{
-        .id = .{ .integer = 1 },
-        .method = "session/new",
-        .params_raw = "{\"mcpServers\":[]}",
-    };
-    try handleNewSession(&state, arena, &new_msg);
-
-    const runtime = try arena.create(mcp_runtime.McpRuntime);
-    runtime.* = mcp_runtime.McpRuntime.init(arena);
-    state.active_session.?.mcp = runtime;
-    try std.testing.expect(runtime.acquireUse());
-
-    var load_params: std.Io.Writer.Allocating = .init(arena);
-    defer load_params.deinit();
-    try load_params.writer.writeAll("{\"sessionId\":");
-    try writeJsonStr(state.active_session.?.session_id, &load_params.writer);
-    try load_params.writer.writeAll(",\"mcpServers\":[]}");
-    var load_msg = jsonrpc.Message{
-        .id = .{ .integer = 2 },
-        .method = "session/load",
-        .params_raw = load_params.writer.buffered(),
-    };
-
-    const Restore = struct {
-        state: *server.ServerState,
-        alloc: Allocator,
-        msg: *jsonrpc.Message,
-        done: std.atomic.Value(bool) = .init(false),
-        err: ?anyerror = null,
-
-        fn run(self: *@This()) void {
-            handleLoadSession(self.state, self.alloc, self.msg) catch |err| {
-                self.err = err;
-            };
-            self.done.store(true, .release);
-        }
-    };
-    var restore = Restore{
-        .state = &state,
-        .alloc = arena,
-        .msg = &load_msg,
-    };
-    const restore_thread = try std.Thread.spawn(.{}, Restore.run, .{&restore});
-    var joined = false;
-    defer if (!joined) restore_thread.join();
-
-    const observation_deadline = io_mod.milliTimestamp() + 5_000;
-    while (!restore.done.load(.acquire) and
-        !runtime.retiring.load(.acquire) and
-        io_mod.milliTimestamp() < observation_deadline)
-    {
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-    const retired_before_destroy = runtime.retiring.load(.acquire);
-    const completed_while_leased = restore.done.load(.acquire);
-
-    runtime.releaseUse();
-    restore_thread.join();
-    joined = true;
-
-    if (restore.err) |err| return err;
-    try std.testing.expect(retired_before_destroy);
-    try std.testing.expect(!completed_while_leased);
 }

@@ -22,8 +22,7 @@ const change_tracker = @import("../workspace/change_tracker.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const io_mod = @import("../shared/io.zig");
-const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
-const mcp_model_catalog = @import("../mcp/model_catalog.zig");
+
 const permission_gate = @import("../permissions/permission_gate.zig");
 const permissions = @import("../permissions/permissions.zig");
 const prompt_policy_contract = @import("../config/prompt_policy.zig");
@@ -41,12 +40,12 @@ const tool_admission = @import("../tooling/tool_admission.zig");
 const tool_projection_mod = @import("../tooling/tool_projection.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
-const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
+
 const context_contract = @import("../workspace/context_contract.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_set = @import("../gateway/provider_set.zig");
-const test_builtin_gateway = if (@import("builtin").is_test)
-    @import("../../builtins/gateway.zig")
+const test_openrouter = if (@import("builtin").is_test)
+    @import("../../gateway/openrouter_test_fixtures.zig")
 else
     struct {};
 const test_builtin_tools = if (@import("builtin").is_test)
@@ -201,7 +200,7 @@ pub fn Runtime(comptime App: type) type {
             const selected_provider = provider_runtime.provider(app);
             const provider_capabilities = if (comptime @hasDecl(App, "providerSet"))
                 app.providerSet().select(selected_provider).capabilities
-            else if (selected_provider == .gateway)
+            else if (selected_provider == .openrouter)
                 provider_set.Bundle.Capabilities{ .fx_search = true, .vision_fallback = true }
             else
                 provider_set.Bundle.Capabilities{};
@@ -223,12 +222,10 @@ pub fn Runtime(comptime App: type) type {
                     app.agentStreamProvider()
                 else
                     agent_stream_provider.unavailable_provider,
-                .gateway_team = app.auth.gatewayTeam(),
                 .credential_source = app.auth.credentialSource(),
                 .account_id = app.auth.accountId(),
                 .provider = selected_provider,
                 .provider_capabilities = provider_capabilities,
-                .oauth_transport = app.auth.oauthTransport(),
                 .secret_store = if (comptime @hasDecl(@TypeOf(app.auth), "secretStore"))
                     app.auth.secretStore()
                 else
@@ -241,8 +238,8 @@ pub fn Runtime(comptime App: type) type {
                 .agent_step_limit = app.agent_step_limit,
                 .fast_mode = agent_settings.fast_mode,
                 .effort = agent_settings.effort,
-                .provider_order = if (selected_provider == .gateway) agent_settings.provider_order else &.{},
-                .provider_strict = selected_provider == .gateway and agent_settings.provider_strict,
+                .provider_order = if (selected_provider == .openrouter) agent_settings.provider_order else &.{},
+                .provider_strict = selected_provider == .openrouter and agent_settings.provider_strict,
                 .first_call_tool_choice = agent_settings.first_call_tool_choice,
                 .tool_registry = if (comptime @hasDecl(App, "toolRegistry")) app.toolRegistry() else .{},
                 .subagent_host = if (comptime @hasField(App, "session_persistence"))
@@ -287,16 +284,7 @@ pub fn Runtime(comptime App: type) type {
                 } else .none,
                 .permission_reviewer_provider = if (comptime @hasDecl(App, "permissionReviewerProvider")) app.permissionReviewerProvider() else null,
                 .tracker = &app.change_tracker,
-                .mcp_ctx = @ptrCast(app),
-                .mcp_has_tool = if (comptime runtime_profile.allows(App, .mcp)) mcpHasTool else null,
-                .mcp_validate_tool = if (comptime runtime_profile.allows(App, .mcp)) validateMcpTool else null,
-                .mcp_call_tool = if (comptime runtime_profile.allows(App, .mcp)) callMcpTool else null,
-                .mcp_search_tools = if (comptime runtime_profile.allows(App, .mcp)) searchMcpTools else null,
-                .mcp_tool_schema = if (comptime runtime_profile.allows(App, .mcp)) mcpToolSchemaJson else null,
-                .mcp_snapshot_tool = if (comptime runtime_profile.allows(App, .mcp)) mcpSnapshotTool else null,
-                .mcp_call_feature = if (comptime runtime_profile.allows(App, .mcp)) callMcpFeature else null,
-                .mcp_progress_ctx = @ptrCast(app),
-                .on_mcp_progress = app_callbacks.Bindings(App).onMcpProgress,
+
                 .tool_progress_ctx = @ptrCast(app),
                 .on_tool_progress = app_callbacks.Bindings(App).onToolProgress,
                 .subagent_status_renderer = app_callbacks.Bindings(App).subagentStatusRenderer(app),
@@ -315,7 +303,6 @@ pub fn Runtime(comptime App: type) type {
                     app.web_search_runtime.configure(.{
                         .api_key = app.auth.apiKey() orelse "",
                         .credential_source = app.auth.credentialSource(),
-                        .gateway_team = app.auth.gatewayTeam(),
                         .worker_model = provider_runtime.model(app),
                         .gateway_retry_count = gateway_retry_count,
                         .gateway_chat_url = gateway_chat_url,
@@ -328,83 +315,10 @@ pub fn Runtime(comptime App: type) type {
                 ctx.web_search_progress_ctx = @ptrCast(app);
                 ctx.on_web_search_progress = app_callbacks.Bindings(App).onWebSearchProgress;
             }
-            if (comptime runtime_profile.allows(App, .mcp) and
-                @hasDecl(@TypeOf(app.worker), "requestMcpElicitationAnswerBlocking") and
-                @hasDecl(App, "urlOpener"))
-            {
-                ctx.mcp_input_responder = .{
-                    .context = @ptrCast(app),
-                    .capabilities = .{ .form = true, .url = true },
-                    .legacy_url_manual_completion = true,
-                    .callback = respondToMcpInput,
-                };
-            }
+
             ctx.model_capability_resolver = app_callbacks.Bindings(App).modelCapabilityResolver(app);
             ctx.model_override_resolver = app_callbacks.Bindings(App).modelOverrideResolver(app);
             return ctx;
-        }
-
-        fn respondToMcpInput(
-            raw_ctx: *anyopaque,
-            alloc: Allocator,
-            origin: tool_mcp_runtime.InputOrigin,
-            required: tool_mcp_runtime.InputRequired,
-        ) anyerror![]const u8 {
-            return mcp_elicitation_interaction.respond(alloc, origin, required, .{
-                .questioner = .{ .context = raw_ctx, .ask_fn = askMcpQuestion },
-                .browser = .{ .context = raw_ctx, .open_fn = openMcpUrl },
-                .compact_forms = true,
-                .capabilities = .{ .form = true, .url = true },
-            });
-        }
-
-        fn askMcpQuestion(
-            raw_ctx: *anyopaque,
-            alloc: Allocator,
-            entries: []const types.QuestionBatchEntry,
-            deadline_ms: i64,
-            lifecycle_cancel_flag: ?*const std.atomic.Value(bool),
-        ) anyerror!?[][]u8 {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            var watch = DeadlineWatch{
-                .app = app,
-                .deadline_ms = deadline_ms,
-                .lifecycle_cancel_flag = lifecycle_cancel_flag,
-            };
-            const watcher = try std.Thread.spawn(.{}, DeadlineWatch.run, .{&watch});
-            defer {
-                watch.done.store(true, .release);
-                watcher.join();
-            }
-
-            const c_alloc = std.heap.c_allocator;
-            const answers = try app.worker.requestMcpElicitationAnswerBlocking(c_alloc, entries) orelse {
-                if (watch.timed_out.load(.acquire)) return error.McpInputTimedOut;
-                return null;
-            };
-            defer freeMcpAnswers(c_alloc, answers);
-            const copy = try alloc.alloc([]u8, answers.len);
-            errdefer alloc.free(copy);
-            var copied: usize = 0;
-            errdefer for (copy[0..copied]) |answer| alloc.free(answer);
-            while (copied < answers.len) : (copied += 1) {
-                copy[copied] = try alloc.dupe(u8, answers[copied]);
-            }
-            return copy;
-        }
-
-        fn openMcpUrl(
-            raw_ctx: ?*anyopaque,
-            alloc: Allocator,
-            url: []const u8,
-        ) anyerror!bool {
-            const app: *App = @ptrCast(@alignCast(raw_ctx.?));
-            return app.urlOpener().open(alloc, url);
-        }
-
-        fn freeMcpAnswers(alloc: Allocator, answers: [][]u8) void {
-            for (answers) |answer| alloc.free(answer);
-            alloc.free(answers);
         }
 
         const DeadlineWatch = struct {
@@ -440,65 +354,6 @@ pub fn Runtime(comptime App: type) type {
                 std.math.minInt(i64)
             else
                 std.math.maxInt(i64);
-        }
-
-        fn mcpHasTool(raw_ctx: *anyopaque, name: []const u8, access: tool_mcp_runtime.Access) bool {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            return app.hasMcpTool(name, access);
-        }
-
-        fn validateMcpTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (comptime @hasDecl(App, "validateMcpTool")) {
-                return app.validateMcpTool(arena, name, arguments_json, access);
-            }
-            return .not_available;
-        }
-
-        fn callMcpTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, max_tool_result_bytes: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            return app.callMcpTool(arena, name, arguments_json, max_tool_result_bytes, options);
-        }
-
-        fn searchMcpTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, _: @import("../config/context_limits.zig").Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!tool_mcp_runtime.SearchResult {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (comptime @hasDecl(App, "searchMcpTools")) {
-                return app.searchMcpTools(arena, request, permission_rules, access, cancel_flag);
-            }
-            return .{ .model_output = try arena.dupe(u8, "{\"tools\":[],\"count\":0}") };
-        }
-
-        fn mcpSnapshotTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, limits: @import("../config/context_limits.zig").Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.DefinitionSnapshot {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (comptime @hasDecl(App, "acquireMcpRuntime")) {
-                var lease = app.acquireMcpRuntime() orelse return .unavailable;
-                defer lease.deinit();
-                return lease.runtime.snapshotToolDefinition(arena, name, known, permission_rules, limits, access);
-            }
-            return .unavailable;
-        }
-
-        fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, _: @import("../config/context_limits.zig").Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (comptime @hasDecl(App, "mcpToolSchemaJson")) {
-                return app.mcpToolSchemaJson(arena, name, permission_rules, access, cancel_flag);
-            }
-            return null;
-        }
-
-        fn callMcpFeature(
-            raw_ctx: *anyopaque,
-            arena: Allocator,
-            request: tool_mcp_runtime.FeatureRequest,
-            options: tool_mcp_runtime.FeatureCallOptions,
-        ) anyerror!tool_mcp_runtime.FeatureResult {
-            if (comptime !@hasDecl(App, "acquireMcpRuntime")) {
-                return error.McpRuntimeUnavailable;
-            }
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            var lease = app.acquireMcpRuntime() orelse return error.McpRuntimeUnavailable;
-            defer lease.deinit();
-            return lease.runtime.callFeatureForModel(arena, request, options);
         }
 
         pub fn resolveToolActionDisplayTarget(
@@ -621,7 +476,6 @@ pub fn Runtime(comptime App: type) type {
             live_authority: ?agent_runtime.LiveToolAuthority,
             revalidation: ?agent_runtime.LivePermissionRevalidation,
             advertised_dynamic_tool_names: []const []const u8,
-            mcp_review_schema_json: ?[]const u8,
             ignored_list_entries: []const []const u8,
             max_list_entries: usize,
             max_read_file_bytes: usize,
@@ -634,7 +488,6 @@ pub fn Runtime(comptime App: type) type {
             var ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
             applyCredentialLease(app, &ctx, review_turn.credential, gateway_retry_count, gateway_chat_url);
             ctx.permission_review_turn = review_turn;
-            ctx.mcp_review_schema_json = mcp_review_schema_json;
             const admission = ctx.admissionInputWithLiveAuthority(live_authority);
             return if (revalidation) |request| switch (request) {
                 .action => |action| tool_admission.revalidateLiveActionPermissionOutcome(
@@ -792,7 +645,6 @@ pub fn Runtime(comptime App: type) type {
                     app.web_search_runtime.configure(.{
                         .api_key = credential_secret,
                         .credential_source = credential_source,
-                        .gateway_team = credential.tenant(),
                         .worker_model = provider_runtime.model(app),
                         .gateway_retry_count = gateway_retry_count,
                         .gateway_chat_url = gateway_chat_url,
@@ -829,39 +681,6 @@ pub fn Runtime(comptime App: type) type {
             try app.contextRegistry().appendDefaultStatic(.{
                 .project_context = project_context orelse modelVisibleProjectContext(app),
             }, arena, messages);
-            var report = if (comptime @hasDecl(App, "snapshotMcpModelCatalog"))
-                try app.snapshotMcpModelCatalog(
-                    arena,
-                    if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{},
-                    false,
-                )
-            else
-                mcp_model_catalog.Report{ .snapshot = try mcp_model_catalog.Snapshot.empty(arena) };
-            // The request arena retains the change notice, which outlives this
-            // function inside `messages`; only the snapshot names are released.
-            defer report.snapshot.deinit(arena);
-            const section = try mcp_model_catalog.render(arena, report.snapshot);
-            if (section.text.len > 0) {
-                try messages.append(arena, .{ .role = .system, .content = section.text });
-            }
-            if (report.change_notice) |notice| {
-                try messages.append(arena, .{ .role = .system, .content = notice });
-            }
-            if (section.notice) |notice| try pushMcpModelCatalogNotice(app, notice);
-        }
-
-        fn pushMcpModelCatalogNotice(app: *App, notice: []const u8) !void {
-            if (comptime @hasDecl(@TypeOf(app.session), "claimContextNotice")) {
-                if (!try app.session.claimContextNotice(std.heap.c_allocator, notice)) return;
-            }
-            const body = try types.renderContextNoticeBody(std.heap.c_allocator, notice);
-            defer std.heap.c_allocator.free(body);
-            try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
-                .topic = "context",
-                .tone = .warning,
-                .body = body,
-                .visibility = .full_only,
-            });
         }
 
         pub fn appendTransientRuntimeContextMessage(
@@ -1028,21 +847,7 @@ pub fn Runtime(comptime App: type) type {
                     .visibility = .full_only,
                 });
             }
-            if (comptime @hasDecl(App, "waitForRequiredMcp")) {
-                const failure = try app.waitForRequiredMcp(
-                    std.heap.c_allocator,
-                    &app.worker.worker_cancel_requested,
-                );
-                if (failure) |message| {
-                    defer std.heap.c_allocator.free(message);
-                    try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
-                        .topic = "mcp",
-                        .tone = .warning,
-                        .body = message,
-                    });
-                    return error.McpRequiredServerUnavailable;
-                }
-            }
+
             var tool_projection = try app.snapshotModelToolProjection(
                 std.heap.c_allocator,
                 job.permission_mode,
@@ -1180,7 +985,6 @@ pub fn Runtime(comptime App: type) type {
                     .api_key = job.api_key,
                     .credential_source = job.credential_source,
                     .account_id = job.account_id,
-                    .gateway_team = job.gateway_team,
                     .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
                     .retry_count = gateway_retry_count,
                     .cancel_flag = &app.worker.worker_cancel_requested,
@@ -1241,20 +1045,9 @@ pub fn Runtime(comptime App: type) type {
                 app.providerSet()
             else
                 provider_set.Set{
-                    .gateway = .{
+                    .openrouter = .{
                         .capabilities = tool_context.provider_capabilities,
                         .agent_stream = tool_context.agent_stream_provider,
-                        .permission_reviewer = tool_context.permission_reviewer_provider,
-                    },
-                    .codex = .{
-                        .capabilities = tool_context.provider_capabilities,
-                        .agent_stream = tool_context.agent_stream_provider,
-                        .permission_reviewer = tool_context.permission_reviewer_provider,
-                    },
-                    .grok = .{
-                        .capabilities = tool_context.provider_capabilities,
-                        .agent_stream = tool_context.agent_stream_provider,
-                        .permission_reviewer = tool_context.permission_reviewer_provider,
                     },
                 };
             return subagent_agent_adapter.run(.{
@@ -1315,7 +1108,7 @@ pub fn Runtime(comptime App: type) type {
                 .advertised_functions = tool_projection.advertised_functions,
                 .provider_capabilities = if (comptime @hasDecl(App, "providerSet"))
                     app.providerSet().select(job.provider).capabilities
-                else if (job.provider == .gateway)
+                else if (job.provider == .openrouter)
                     .{ .fx_search = true, .vision_fallback = true }
                 else
                     .{},
@@ -1326,8 +1119,8 @@ pub fn Runtime(comptime App: type) type {
                 .review_enabled = false,
                 .fast_mode = job.agent_settings.fast_mode,
                 .effort = job.agent_settings.effort,
-                .provider_order = if (job.provider == .gateway) job.agent_settings.provider_order else &.{},
-                .provider_strict = job.provider == .gateway and job.agent_settings.provider_strict,
+                .provider_order = if (job.provider == .openrouter) job.agent_settings.provider_order else &.{},
+                .provider_strict = job.provider == .openrouter and job.agent_settings.provider_strict,
                 .first_call_tool_choice = job.agent_settings.first_call_tool_choice,
                 .workspace_root = app.workspace_root,
                 .access_scope = appAccessScope(app),
@@ -1365,11 +1158,6 @@ fn formatToolAction(
         return formatWebSearchAction(arena, call, state, denied_label);
     }
     const spec = ctx.tool_registry.lookup(call.name) orelse {
-        if (dynamicMcpActionLabel(state)) |label| {
-            if (mcpToolAvailable(ctx, call.name)) {
-                return formatToolActionValue(arena, label, call.name);
-            }
-        }
         return formatMissingSpecToolAction(arena, state, denied_label, call.name);
     };
     if (try tool_presentation.formatRunCommandActivity(arena, ctx.tool_registry, ctx.workspace_root, call)) |activity| {
@@ -1478,28 +1266,6 @@ fn presentationLabel(presentation: tool_dispatch.CallPresentation, state: ToolAc
         .completed => presentation.completed_action_label,
         .denied => denied_label.?,
     };
-}
-
-fn dynamicMcpActionLabel(state: ToolActionState) ?[]const u8 {
-    return switch (state) {
-        .active => "Running MCP",
-        .completed => "Ran MCP",
-        .denied => null,
-    };
-}
-
-fn mcpToolAvailable(ctx: tool_runtime.Context, name: []const u8) bool {
-    var advertised = false;
-    for (ctx.advertised_dynamic_tool_names) |advertised_name| {
-        if (std.mem.eql(u8, advertised_name, name)) {
-            advertised = true;
-            break;
-        }
-    }
-    if (!advertised) return false;
-    const raw_ctx = ctx.mcp_ctx orelse return false;
-    const has_tool = ctx.mcp_has_tool orelse return false;
-    return has_tool(raw_ctx, name, ctx.mcp_access);
 }
 
 const test_ignored_list_entries = [_][]const u8{ ".git", "zig-out" };
@@ -1665,7 +1431,7 @@ const FakeApp = struct {
     workspace_root: []const u8 = "/tmp/workspace",
     auth: auth_runtime.Runtime = .{},
     selected_model: std.ArrayList(u8) = .empty,
-    selected_provider: model_provider.ProviderId = .gateway,
+    selected_provider: model_provider.ProviderId = .openrouter,
     permission_engine: permissions.PermissionEngine = .{},
     agent_step_limit: usize = 8,
     fast_mode: bool = true,
@@ -1688,14 +1454,11 @@ const FakeApp = struct {
     snapshot_barrier: ?*ProjectionBarrier = null,
     snapshot_tools_error: ?anyerror = null,
     snapshot_custom_guidance: []const u8 = "",
-    mcp_name: []const u8 = "mcp_lookup",
-    mcp_has_tool_calls: usize = 0,
-    mcp_result: []const u8 = "{\"ok\":true}",
-    mcp_change_notice: ?[]const u8 = null,
+
     diff_blocks: usize = 0,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
-        .provider = test_builtin_gateway.default_web_search_provider,
+        .provider = test_openrouter.default_web_search_provider,
     }),
     web_search_models_path: []const u8 = "/models",
     lifecycle_runtime: hooks.Runtime,
@@ -1715,7 +1478,7 @@ const FakeApp = struct {
         errdefer app.context_snapshot.deinit(alloc);
         var credential = credentials.Credential{
             .token = try alloc.dupe(u8, "api-key"),
-            .source = .ai_gateway_api_key,
+            .source = .openrouter_api_key,
         };
         defer credential.deinit(alloc);
         _ = app.auth.adoptCredential(alloc, &credential);
@@ -1730,18 +1493,6 @@ const FakeApp = struct {
 
     fn contextRegistry(self: *const FakeApp) context_contract.Registry {
         return self.context_registry;
-    }
-
-    fn snapshotMcpModelCatalog(
-        self: *FakeApp,
-        alloc: Allocator,
-        _: types.PermissionRuleSet,
-        _: bool,
-    ) !mcp_model_catalog.Report {
-        return .{
-            .snapshot = try mcp_model_catalog.Snapshot.empty(alloc),
-            .change_notice = if (self.mcp_change_notice) |notice| try alloc.dupe(u8, notice) else null,
-        };
     }
 
     fn promptPolicy(_: *const FakeApp) prompt_policy_contract.Policy {
@@ -1763,17 +1514,6 @@ const FakeApp = struct {
         self.session.deinit(self.alloc);
         self.change_tracker.deinit(self.alloc);
         self.lifecycle_runtime.deinit();
-    }
-
-    fn hasMcpTool(self: *FakeApp, name: []const u8, _: tool_mcp_runtime.Access) bool {
-        self.mcp_has_tool_calls += 1;
-        return std.mem.eql(u8, name, self.mcp_name);
-    }
-
-    fn callMcpTool(self: *FakeApp, arena: Allocator, name: []const u8, arguments_json: []const u8, _: usize, _: tool_mcp_runtime.CallOptions) !?tool_mcp_runtime.CallResult {
-        _ = arguments_json;
-        if (!self.hasMcpTool(name, .unrestricted)) return null;
-        return .{ .model_output = try arena.dupe(u8, self.mcp_result) };
     }
 
     fn subagentToolContextForAdmission(
@@ -1852,8 +1592,8 @@ const FakeApp = struct {
         return Runtime(FakeApp).requestToolPermissionSync(self, arena, call, "", permission_mode, local_grants, null, null, &.{}, null, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     }
 
-    pub fn requestToolPermissionSyncWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) !command_admission.PermissionOutcome {
-        return Runtime(FakeApp).requestToolPermissionSync(self, arena, call, review_turn, permission_mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, mcp_review_schema_json, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    pub fn requestToolPermissionSyncWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
+        return Runtime(FakeApp).requestToolPermissionSync(self, arena, call, review_turn, permission_mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     }
 
     pub fn requestPreparedFileMutationPermissionSyncWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
@@ -1920,7 +1660,7 @@ const FakeApp = struct {
 };
 
 fn testAgentStreamProvider(stream_fn: agent_stream_provider.StreamFn) agent_stream_provider.Provider {
-    var provider = test_builtin_gateway.agent_stream_provider;
+    var provider = test_openrouter.agent_stream;
     provider.stream_fn = stream_fn;
     return provider;
 }
@@ -1949,7 +1689,7 @@ const TestCatalogProvider = struct {
         self.saw_expected_input =
             std.mem.eql(u8, input.access.authorizationCredential() orelse "", "api-key") and
             input.access.teamContext() == null and
-            input.access.credentialSource() == .ai_gateway_api_key and
+            input.access.credentialSource() == .openrouter_api_key and
             std.mem.eql(u8, input.endpoint, "/catalog") and
             input.cancel_flag == null and
             input.view == .full;
@@ -1962,1544 +1702,14 @@ const TestCatalogProvider = struct {
     }
 };
 
-test "app model id loading uses the injected catalog provider" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-    var test_provider = TestCatalogProvider{};
-
-    var ids = try Runtime(FakeApp).fetchModelIds(
-        &app,
-        .{
-            .context = @ptrCast(&test_provider),
-            .fetch_fn = TestCatalogProvider.fetch,
-        },
-        "/catalog",
-    );
-    defer {
-        for (ids.items) |id| alloc.free(id);
-        ids.deinit(alloc);
-    }
-
-    try std.testing.expect(test_provider.saw_expected_input);
-    try std.testing.expectEqual(@as(usize, 2), ids.items.len);
-    try std.testing.expectEqualStrings("provider/first", ids.items[0]);
-    try std.testing.expectEqualStrings("provider/second", ids.items[1]);
-}
-
-test "app agent runtime builds tool context from app state and MCP callbacks" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    app.permission_engine.mode = .auto;
-    app.worker.agent_turn_settings = .{
-        .max_tool_result_bytes = 4096,
-        .first_call_tool_choice = .none,
-        .fast_mode = true,
-        .effort = types.ReasoningEffort.literal("high"),
-    };
-    try app.permission_engine.allow(alloc, "run_command", "/tmp/workspace::zig build");
-
-    const ctx = testToolContext(&app);
-    try std.testing.expectEqualStrings("/tmp/workspace", ctx.workspace_root);
-    try std.testing.expectEqualStrings("api-key", ctx.api_key);
-    try std.testing.expectEqualStrings("test-model", ctx.model);
-    try std.testing.expect(ctx.tool_registry.lookup("web_search") != null);
-    try std.testing.expectEqual(PermissionMode.auto, ctx.permission_mode);
-    try std.testing.expectEqual(@as(usize, 1), ctx.permission_grants.len);
-    try std.testing.expect(ctx.fast_mode);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), ctx.effort);
-    try std.testing.expect(!ctx.web_search_runtime_ready);
-    try std.testing.expect(ctx.web_search_backend != null);
-    try std.testing.expect(ctx.web_fetch_runtime.? == &app.web_fetch_runtime);
-    try std.testing.expect(ctx.web_fetch_progress_ctx != null);
-    try std.testing.expect(ctx.on_web_fetch_progress != null);
-    try std.testing.expectEqualStrings("test-model", app.web_search_runtime.worker_model);
-    try std.testing.expectEqual(ctx.gateway_retry_count, app.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(ctx.gateway_chat_url, app.web_search_runtime.gateway_chat_url);
-    try std.testing.expectEqualStrings("/models", ctx.gateway_models_path);
-    try std.testing.expectEqual(@as(usize, 4096), ctx.max_tool_result_bytes);
-    try std.testing.expectEqual(types.ToolChoice.none, ctx.first_call_tool_choice);
-    try std.testing.expect(ctx.cancel_flag.? == &app.worker.worker_cancel_requested);
-    try std.testing.expectEqual(&app.worker, ctx.worker);
-    try std.testing.expect(!@hasField(tool_runtime.Context, "background"));
-    try std.testing.expect(ctx.subagent_host == null);
-    try std.testing.expect(ctx.subagent_caller_id == null);
-    try std.testing.expectEqual(&app.session, ctx.session);
-    try std.testing.expectEqual(&app.change_tracker, ctx.tracker.?);
-    const child_ctx = Runtime(FakeApp).childToolContext(ctx);
-    try std.testing.expect(child_ctx.tracker == null);
-    try std.testing.expect(ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_lookup", .unrestricted));
-
-    const result = try ctx.mcp_call_tool.?(
-        ctx.mcp_ctx.?,
-        alloc,
-        "mcp_lookup",
-        "{}",
-        ctx.max_tool_result_bytes,
-        .{},
-    );
-    defer alloc.free(result.?.model_output);
-    try std.testing.expectEqualStrings("{\"ok\":true}", result.?.model_output);
-}
-
-test "interactive app prepared file mutation callback applies app permission policy" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-    app.workspace_root = workspace;
-    const mutation_tools = [_]tool_dispatch.Tool{test_builtin_tools.write_file};
-    app.tool_registry = .{ .tools = &mutation_tools };
-    var rules = [_]types.PermissionRule{.{
-        .permission = @constCast("edit"),
-        .pattern = @constCast("blocked.txt"),
-        .action = .deny,
-    }};
-    app.permission_engine.rules = .{ .rules = &rules };
-    defer app.permission_engine.rules = .{};
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const call: ToolCall = .{
-        .id = "prepared-app-write",
-        .name = "write_file",
-        .arguments_json = "{\"path\":\"blocked.txt\",\"content\":\"blocked\"}",
-    };
-    var prepared = switch (try tool_admission.prepareFileMutationCall(arena, call, .{
-        .tool_registry = app.toolRegistry(),
-        .workspace_root = workspace,
-    })) {
-        .tool_failure => return error.TestExpectedPreparedFileMutation,
-        .not_file_mutation => return error.TestExpectedPreparedFileMutation,
-        .prepared => |value| value,
-    };
-    defer prepared.deinit(arena);
-
-    const deps = app_callbacks.Bindings(FakeApp).agentRuntimeDeps(&app);
-    const callback = deps.request_prepared_file_mutation_permission orelse
-        return error.TestExpectedPreparedFileMutationCallback;
-    const review_calls = [_]ToolCall{call};
-    const review_root_messages = [_][]const u8{"do not bypass policy"};
-    const review_turn: permission_auto_classifier.ReviewTurnContext = .{
-        .model = "openai/gpt-5",
-        .pending_assistant = .{ .role = .assistant, .tool_calls = &review_calls },
-        .target_call_id = call.id,
-        .origin = .root,
-        .trusted_root_context = review_root_messages[0],
-    };
-    const outcome = try callback(
-        deps.ctx,
-        arena,
-        call,
-        &prepared,
-        review_turn,
-        .ask,
-        &.{},
-        null,
-        &.{},
-    );
-
-    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
-    try std.testing.expect(outcome.execution_authority == null);
-}
-
-test "app prompt projection configures web search then blocks native execution" {
-    const alloc = std.testing.allocator;
-    const web_search_contract = @import("../tooling/web_search_contract.zig");
-    const ProviderState = struct {
-        calls: usize = 0,
-    };
-    const FailingWebSearchProvider = struct {
-        fn execute(
-            raw_ctx: ?*anyopaque,
-            _: Allocator,
-            _: web_search_runtime.Inputs,
-            _: web_search_contract.ProviderRequest,
-            _: ?web_search_contract.ProgressFn,
-            _: ?*anyopaque,
-        ) anyerror!web_search_contract.ProviderResponse {
-            const state: *ProviderState = @ptrCast(@alignCast(raw_ctx orelse return error.TestWebSearchProvider));
-            state.calls += 1;
-            return error.TestWebSearchProvider;
-        }
-    };
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-    var provider_state = ProviderState{};
-    var provider = app.web_search_runtime.provider orelse return error.TestExpectedEqual;
-    provider.context = @ptrCast(&provider_state);
-    provider.execute_fn = FailingWebSearchProvider.execute;
-    app.web_search_runtime = web_search_runtime.Runtime.init(.{
-        .provider = provider,
-    });
-
-    app.web_search_runtime.configure(.{
-        .api_key = "stale-key",
-        .worker_model = "stale-model",
-        .gateway_retry_count = 99,
-        .gateway_chat_url = "https://stale.invalid/chat",
-    });
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var messages: std.ArrayList(ChatMessage) = .empty;
-    defer messages.deinit(arena);
-    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-    try app.appendRuntimeContextMessage(arena, &messages);
-
-    try std.testing.expectEqualStrings("stale-key", app.web_search_runtime.api_key);
-
-    const validation = try app.validateToolCall(arena, .{
-        .id = "search",
-        .name = "web_search",
-        .arguments_json = "{\"query\":\"x\"}",
-    });
-    try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", validation.failure);
-    try std.testing.expectEqualStrings(app.auth.apiKey().?, app.web_search_runtime.api_key);
-    try std.testing.expectEqualStrings(app.selected_model.items, app.web_search_runtime.worker_model);
-    try std.testing.expectEqual(@as(usize, 2), app.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(test_gateway_chat_url, app.web_search_runtime.gateway_chat_url);
-
-    const execution = try app.executeToolCall(.{
-        .call_allocator = arena,
-        .result_allocator = arena,
-        .call = .{
-            .id = "search-execute",
-            .name = "web_search",
-            .arguments_json = "{\"query\":\"current Zig release\"}",
-        },
-        .authority = .ordinary,
-        .session_grants = &.{},
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = 2048,
-    });
-    try std.testing.expectEqualStrings(app.auth.apiKey().?, app.web_search_runtime.api_key);
-    try std.testing.expectEqualStrings(app.selected_model.items, app.web_search_runtime.worker_model);
-    try std.testing.expectEqual(@as(usize, 2), app.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(test_gateway_chat_url, app.web_search_runtime.gateway_chat_url);
-    try std.testing.expectEqual(.failure, execution.status);
-    try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
-}
-
-test "app ChatGPT route removes Gateway-backed auxiliary capabilities" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-    var credential = credentials.Credential{
-        .token = try alloc.dupe(u8, "chatgpt-secret"),
-        .source = .chatgpt_subscription,
-    };
-    defer credential.deinit(alloc);
-    _ = app.auth.adoptCredential(alloc, &credential);
-    app.selected_provider = .codex;
-
-    const ctx = Runtime(FakeApp).toolContext(
-        &app,
-        &test_ignored_list_entries,
-        100,
-        1024,
-        40,
-        120,
-        2048,
-        2,
-        test_gateway_chat_url,
-    );
-    try std.testing.expect(ctx.web_search_backend == null);
-    try std.testing.expect(ctx.permission_reviewer_provider == null);
-}
-
-test "app agent runtime tool context combines active settings with live permission mode" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    app.fast_mode = false;
-    app.effort = types.ReasoningEffort.literal("low");
-    app.worker.agent_turn_settings = .{
-        .max_tool_result_bytes = 1024,
-        .first_call_tool_choice = .auto,
-        .fast_mode = false,
-        .effort = types.ReasoningEffort.literal("low"),
-    };
-    app.worker.setActiveAgentTurnSettings(.{
-        .max_tool_result_bytes = 8192,
-        .first_call_tool_choice = .none,
-        .fast_mode = true,
-        .effort = types.ReasoningEffort.literal("high"),
-    });
-    defer app.worker.clearActiveAgentTurnSettings();
-    app.permission_engine.mode = .auto;
-
-    const ctx = testToolContext(&app);
-
-    try std.testing.expectEqual(@as(usize, 8192), ctx.max_tool_result_bytes);
-    try std.testing.expectEqual(types.ToolChoice.none, ctx.first_call_tool_choice);
-    try std.testing.expect(ctx.fast_mode);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), ctx.effort);
-    try std.testing.expectEqual(PermissionMode.auto, ctx.permission_mode);
-}
-
-test "app agent runtime formats active completed denied and MCP tool actions" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    const run_call: ToolCall = .{
-        .id = "1",
-        .name = "shell",
-        .arguments_json = "{\"action\":\"run\",\"command\":\"zig build\"}",
-    };
-
-    const active = try app.describeToolAction(arena, run_call);
-    try std.testing.expect(std.mem.find(u8, active, "● ") != null);
-    try std.testing.expect(std.mem.find(u8, active, "•") == null);
-    try std.testing.expect(std.mem.find(u8, active, "⏺") == null);
-    try std.testing.expect(std.mem.find(u8, active, "▸") == null);
-    try std.testing.expect(std.mem.find(u8, active, "Running") != null);
-    try std.testing.expect(std.mem.find(u8, active, "\x1b[38;5;252mzig\x1b[39m") != null);
-    try std.testing.expect(std.mem.find(u8, active, " build") != null);
-
-    const completed = try app.describeToolActionCompleted(arena, run_call);
-    try std.testing.expect(std.mem.find(u8, completed, "● ") != null);
-    try std.testing.expect(std.mem.find(u8, completed, "•") == null);
-    try std.testing.expect(std.mem.find(u8, completed, "⏺") == null);
-    try std.testing.expect(std.mem.find(u8, completed, "▸") == null);
-    try std.testing.expect(std.mem.find(u8, completed, "Ran") != null);
-    try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252mzig\x1b[39m") != null);
-    try std.testing.expect(std.mem.find(u8, completed, " build") != null);
-
-    const denied = try app.describeToolActionDenied(arena, run_call, "Denied");
-    try std.testing.expect(std.mem.find(u8, denied, "Denied") != null);
-    try std.testing.expect(std.mem.find(u8, denied, "\x1b[38;5;252mzig\x1b[39m") != null);
-    try std.testing.expect(std.mem.find(u8, denied, " build") != null);
-
-    const malformed_registered: ToolCall = .{
-        .id = "malformed_registered",
-        .name = "grep_files",
-        .arguments_json = "{",
-    };
-    const malformed_completed = try app.describeToolActionCompleted(arena, malformed_registered);
-    try std.testing.expectEqualStrings(
-        "● Completed\x1b[0m \x1b[38;5;245mtool call\x1b[0m",
-        malformed_completed,
-    );
-    const malformed_denied = try app.describeToolActionDenied(arena, malformed_registered, "Denied");
-    try std.testing.expectEqualStrings(
-        "● Denied\x1b[0m \x1b[38;5;245mtool call\x1b[0m",
-        malformed_denied,
-    );
-
-    const malformed_unknown: ToolCall = .{
-        .id = "malformed_unknown",
-        .name = "mcp_unknown",
-        .arguments_json = "{",
-    };
-    const malformed_unknown_completed = try app.describeToolActionCompleted(arena, malformed_unknown);
-    try std.testing.expect(std.mem.find(u8, malformed_unknown_completed, "mcp_unknown") != null);
-
-    const historical_memory: ToolCall = .{
-        .id = "historical_memory",
-        .name = "memory",
-        .arguments_json = "{\"action\":\"list\"}",
-    };
-    const historical_memory_completed = try app.describeToolActionCompleted(arena, historical_memory);
-    try std.testing.expect(std.mem.find(u8, historical_memory_completed, "memory") != null);
-
-    const mcp_call: ToolCall = .{ .id = "mcp", .name = "mcp_lookup", .arguments_json = "{}" };
-    const mcp_action = try app.describeToolActionCompleted(arena, mcp_call);
-    try std.testing.expect(std.mem.find(u8, mcp_action, "Completed") != null);
-    try std.testing.expect(std.mem.find(u8, mcp_action, "MCP") == null);
-    try std.testing.expect(std.mem.find(u8, mcp_action, "mcp_lookup") != null);
-
-    const advertised = [_][]const u8{"mcp_lookup"};
-    const advertised_mcp_active = try Runtime(FakeApp).describeToolAction(&app, arena, mcp_call, null, &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-    try std.testing.expectEqualStrings(
-        "● Running MCP\x1b[0m \x1b[38;5;245mmcp_lookup\x1b[0m",
-        advertised_mcp_active,
-    );
-    const advertised_mcp_action = try Runtime(FakeApp).describeToolActionCompleted(&app, arena, mcp_call, null, &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-    try std.testing.expectEqualStrings(
-        "● Ran MCP\x1b[0m \x1b[38;5;245mmcp_lookup\x1b[0m",
-        advertised_mcp_action,
-    );
-    app.mcp_has_tool_calls = 0;
-    const advertised_mcp_denied = try Runtime(FakeApp).describeToolActionDenied(&app, arena, mcp_call, null, "Denied", &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-    try std.testing.expectEqualStrings(
-        "● Denied\x1b[0m \x1b[38;5;245mmcp_lookup\x1b[0m",
-        advertised_mcp_denied,
-    );
-    try std.testing.expectEqual(@as(usize, 0), app.mcp_has_tool_calls);
-
-    app.mcp_name = "mcp_other";
-    app.mcp_has_tool_calls = 0;
-    const unavailable_mcp_action = try Runtime(FakeApp).describeToolActionCompleted(&app, arena, mcp_call, null, &advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-    try std.testing.expect(std.mem.find(u8, unavailable_mcp_action, "MCP") == null);
-    try std.testing.expectEqual(@as(usize, 1), app.mcp_has_tool_calls);
-
-    app.mcp_has_tool_calls = 0;
-    const builtin_advertised = [_][]const u8{"shell"};
-    _ = try Runtime(FakeApp).describeToolActionCompleted(&app, arena, run_call, null, &builtin_advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-    try std.testing.expectEqual(@as(usize, 0), app.mcp_has_tool_calls);
-}
-
-test "app agent runtime formats registered tool labels from context registry" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-    app.tool_registry = custom_tool_registry;
-
-    const call: ToolCall = .{
-        .id = "custom",
-        .name = "custom_registered_tool",
-        .arguments_json = "{\"name\":\"registry value\"}",
-    };
-    const active = try app.describeToolAction(arena, call);
-    try std.testing.expect(std.mem.find(u8, active, "Custom running") != null);
-    try std.testing.expect(std.mem.find(u8, active, "registry value") != null);
-
-    const completed = try app.describeToolActionCompleted(arena, call);
-    try std.testing.expect(std.mem.find(u8, completed, "Custom ran") != null);
-    try std.testing.expect(std.mem.find(u8, completed, "registry value") != null);
-}
-
-test "app agent runtime bounds a large multiline run command activity" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    const arguments_json = "{\"action\":\"run\",\"command\":\"" ++ ("x\\n" ** 20_000) ++ "\"}";
-    const label = try app.describeToolAction(arena, .{
-        .id = "large_command",
-        .name = "shell",
-        .arguments_json = arguments_json,
-    });
-
-    try std.testing.expect(label.len <= 180);
-    try std.testing.expect(std.mem.findScalar(u8, label, '\n') == null);
-    try std.testing.expect(std.mem.find(u8, label, "...") != null);
-}
-
-test "native web_search labels preserve bounded query and domain filters" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    const call: ToolCall = .{
-        .id = "web_search",
-        .name = "web_search",
-        .arguments_json = "{\"query\":\"current Zig release\",\"allowed_domains\":[\"ziglang.org\",\"github.com\"]}",
-    };
-    const active = try app.describeToolAction(arena, call);
-    try std.testing.expect(std.mem.find(u8, active, "Searching") != null);
-    try std.testing.expect(std.mem.find(u8, active, "current Zig release") != null);
-    try std.testing.expect(std.mem.find(u8, active, "allowed: ziglang.org, github.com") != null);
-
-    const completed = try app.describeToolActionCompleted(arena, call);
-    try std.testing.expect(std.mem.find(u8, completed, "Searched") != null);
-    try std.testing.expect(std.mem.find(u8, completed, "current Zig release") != null);
-}
-
-test "provider search labels use search wording and generic fallback" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    const call: ToolCall = .{
-        .id = "provider_search",
-        .name = "parallel_search",
-        .arguments_json = "{}",
-        .provenance = .provider_executed,
-    };
-    const active = try app.describeToolAction(arena, call);
-    try std.testing.expect(std.mem.find(u8, active, "Searching") != null);
-    try std.testing.expect(std.mem.find(u8, active, "web") != null);
-
-    const completed = try app.describeToolActionCompleted(arena, call);
-    try std.testing.expect(std.mem.find(u8, completed, "Searched") != null);
-    try std.testing.expect(std.mem.find(u8, completed, "web") != null);
-}
-
-test "tool labels preserve skill name value" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    const selected: @import("../skills/skill_contract.zig").PreparedSkill = .{ .skill = .{
-        .name = "selected-workflow",
-        .description = "",
-        .path = "/skills/different-directory",
-        .source = .workspace_fx,
-    } };
-    const selected_call: ToolCall = .{
-        .id = "selected",
-        .name = "skill",
-        .arguments_json = "{\"location\":\"skill:0000000000000001:0/different-directory\"}",
-        .resolved_skill = &selected,
-    };
-    const selected_active = try app.describeToolAction(arena, selected_call);
-    try std.testing.expect(std.mem.find(u8, selected_active, "selected-workflow") != null);
-    const selected_completed = try app.describeToolActionCompleted(arena, selected_call);
-    try std.testing.expect(std.mem.find(u8, selected_completed, "selected-workflow") != null);
-
-    var selected_resource = selected_call;
-    selected_resource.arguments_json = "{\"location\":\"/skills/different-directory\",\"resource\":\"references/rules.md\"}";
-    const selected_resource_completed = try app.describeToolActionCompleted(arena, selected_resource);
-    try std.testing.expect(std.mem.find(u8, selected_resource_completed, "Read skill resource") != null);
-    try std.testing.expect(std.mem.find(u8, selected_resource_completed, "references/rules.md") != null);
-
-    const skill_call: ToolCall = .{
-        .id = "skill",
-        .name = "skill",
-        .arguments_json = "{\"name\":\"workflow\"}",
-    };
-    const active = try app.describeToolAction(arena, skill_call);
-    try std.testing.expect(std.mem.find(u8, active, "Loading skill") != null);
-    try std.testing.expect(std.mem.find(u8, active, "workflow") != null);
-
-    const completed = try app.describeToolActionCompleted(arena, skill_call);
-    try std.testing.expect(std.mem.find(u8, completed, "Loaded skill") != null);
-    try std.testing.expect(std.mem.find(u8, completed, "workflow") != null);
-
-    const resource_call: ToolCall = .{
-        .id = "skill_resource",
-        .name = "skill",
-        .arguments_json = "{\"name\":\"workflow\",\"resource\":\"references/contract-design.md\"}",
-    };
-    const resource_active = try app.describeToolAction(arena, resource_call);
-    try std.testing.expect(std.mem.find(u8, resource_active, "Reading skill resource") != null);
-    try std.testing.expect(std.mem.find(u8, resource_active, "references/contract-design.md") != null);
-    try std.testing.expect(std.mem.find(u8, resource_active, "Loading skill workflow") == null);
-
-    const resource_completed = try app.describeToolActionCompleted(arena, resource_call);
-    try std.testing.expect(std.mem.find(u8, resource_completed, "Read skill resource") != null);
-    try std.testing.expect(std.mem.find(u8, resource_completed, "references/contract-design.md") != null);
-    try std.testing.expect(std.mem.find(u8, resource_completed, "Loaded skill workflow") == null);
-
-    const install_call: ToolCall = .{
-        .id = "install_skill",
-        .name = "install_skill",
-        .arguments_json = "{\"source\":\"vercel-labs/agent-skills\",\"skill\":\"workflow\"}",
-    };
-    const install_active = try app.describeToolAction(arena, install_call);
-    try std.testing.expect(std.mem.find(u8, install_active, "Installing skill") != null);
-    try std.testing.expect(std.mem.find(u8, install_active, "vercel-labs/agent-skills") != null);
-
-    const install_completed = try app.describeToolActionCompleted(arena, install_call);
-    try std.testing.expect(std.mem.find(u8, install_completed, "Installed skill") != null);
-    try std.testing.expect(std.mem.find(u8, install_completed, "vercel-labs/agent-skills") != null);
-}
-
-test "subagent labels show named request and reply" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    const subagent_call: ToolCall = .{
-        .id = "subagent",
-        .name = "subagent",
-        .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check replay\"}}",
-    };
-
-    const active = try app.describeToolAction(arena, subagent_call);
-    try std.testing.expectEqualStrings("● reviewer working\x1b[0m \x1b[38;5;245m· Check replay\x1b[0m", active);
-
-    const completed = try app.describeToolActionCompleted(arena, subagent_call);
-    try std.testing.expectEqualStrings("● reviewer replied\x1b[0m \x1b[38;5;245m· Check replay\x1b[0m", completed);
-}
-
-test "app agent runtime refreshes enabled project context through registry" {
-    const alloc = std.testing.allocator;
-    refresh_gather_calls = 0;
-    refresh_targets_match = false;
-    var app = RefreshContextApp{
-        .alloc = alloc,
-        .context_enabled = true,
-        .context_snapshot = try makeTestContextSnapshot(alloc, "test.stale_context", "stale context"),
-        .context_registry = fresh_context_registry,
-    };
-    defer app.deinit();
-
-    const targets = [_]context_contract.ApplicableTarget{.{
-        .path = "/tmp/workspace/images/example.png",
-        .kind = .file,
-    }};
-    try Runtime(RefreshContextApp).refreshProjectContext(&app, &targets);
-
-    try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
-    try std.testing.expect(refresh_targets_match);
-    const contribution = app.context_snapshot.contribution orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("test.fresh_context", contribution.provider_id);
-    try std.testing.expectEqualStrings("fresh:/tmp/workspace", contribution.content);
-    try std.testing.expectEqualStrings("fresh context notice", app.context_notices.items);
-    try std.testing.expectEqual(types.NoticeTone.warning, app.context_notice_tone.?);
-    try std.testing.expectEqual(types.NoticeVisibility.full_only, app.context_notice_visibility.?);
-}
-
-test "app agent runtime clears disabled project context without gathering" {
-    const alloc = std.testing.allocator;
-    refresh_gather_calls = 0;
-    var app = RefreshContextApp{
-        .alloc = alloc,
-        .context_enabled = false,
-        .context_snapshot = try makeTestContextSnapshot(alloc, "test.stale_context", "stale context"),
-        .context_registry = fresh_context_registry,
-    };
-    defer app.deinit();
-
-    try Runtime(RefreshContextApp).refreshProjectContext(&app, &.{});
-
-    try std.testing.expectEqual(@as(usize, 0), refresh_gather_calls);
-    try std.testing.expect(app.context_snapshot.contribution == null);
-}
-
-test "app agent runtime propagates project context gathering failures" {
-    const alloc = std.testing.allocator;
-    const errors = [_]context_contract.ProviderError{
-        error.OutOfMemory,
-        error.NoSpaceLeft,
-        error.WriteFailed,
-    };
-    for (errors) |expected_error| {
-        refresh_gather_calls = 0;
-        refresh_gather_error = expected_error;
-        var app = RefreshContextApp{
-            .alloc = alloc,
-            .context_enabled = true,
-            .context_snapshot = try makeTestContextSnapshot(alloc, "test.stale_context", "stale context"),
-            .context_registry = failing_context_registry,
-        };
-        defer app.deinit();
-
-        try std.testing.expectError(
-            expected_error,
-            Runtime(RefreshContextApp).refreshProjectContext(&app, &.{}),
-        );
-
-        try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
-        try std.testing.expect(app.context_snapshot.contribution == null);
-    }
-}
-
-test "app agent runtime appends static and transient context through configured registry" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var messages: std.ArrayList(ChatMessage) = .empty;
-    defer messages.deinit(arena);
-    app.permission_engine.mode = .auto;
-
-    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-    try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-
-    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
-    try std.testing.expectEqual(types.ChatRole.system, messages.items[0].role);
-    try std.testing.expectEqualStrings("provider static:project context", messages.items[0].content.?);
-    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
-    try std.testing.expectEqualStrings("provider transient:/tmp/workspace:auto", messages.items[2].content.?);
-}
-
-test "app agent runtime prefers active queued project context snapshot" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-    var queued_snapshot = try makeTestContextSnapshot(alloc, "test.queued_context", "queued project context");
-    defer queued_snapshot.deinit(alloc);
-    app.worker.active_context_snapshot = &queued_snapshot;
-    defer app.worker.active_context_snapshot = null;
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var messages: std.ArrayList(ChatMessage) = .empty;
-    defer messages.deinit(arena);
-
-    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-
-    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
-    try std.testing.expectEqualStrings("provider static:queued project context", messages.items[0].content.?);
-    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
-    const tool_context = testToolContext(&app);
-    try std.testing.expectEqualStrings("test.default_context", tool_context.context_registry.defaultProvider().id);
-}
-
-test "app agent runtime shows MCP availability changes to the model" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-    app.mcp_change_notice = "MCP server availability changed since earlier in this session:\n  linear: authentication_required -> ready (74 tools)\n";
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var messages: std.ArrayList(ChatMessage) = .empty;
-    defer messages.deinit(arena);
-
-    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-
-    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
-    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
-    try std.testing.expectEqual(types.ChatRole.system, messages.items[2].role);
-    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "linear: authentication_required -> ready (74 tools)") != null);
-}
-
 fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
     return .{
         .prompt = try alloc.dupe(u8, "draft an issue"),
         .images = &.{},
         .model = try alloc.dupe(u8, "test-model"),
         .api_key = try alloc.dupe(u8, "api-key"),
-        .permission_mode = .auto,
+        .permission_mode = .yolo,
         .history = try alloc.alloc(types.HistoryTurn, 0),
         .grants = try alloc.alloc(types.PermissionGrant, 0),
     };
-}
-
-test "queued fresh prompt closes only a still-paused turn before provider execution" {
-    const session_codec = @import("../session/session_codec.zig");
-    const session_store = @import("../session/session_store.zig");
-    const Probe = struct {
-        app: *FakeApp,
-        returned: std.atomic.Value(bool) = .init(false),
-        requests: std.atomic.Value(usize) = .init(0),
-        failure: ?anyerror = null,
-        cancel_after_prepare: bool = false,
-
-        fn run(self: *@This(), job: worker_runtime.QueuedPrompt) void {
-            Runtime(FakeApp).processQueuedPrompt(self.app, job, 1, test_gateway_chat_url, null) catch |err| {
-                self.failure = err;
-            };
-            self.returned.store(true, .release);
-        }
-
-        fn stream(raw: ?*anyopaque, _: Allocator, request: agent_stream_provider.ModelRequest) !agent_stream_provider.Result {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            _ = self.requests.fetchAdd(1, .seq_cst);
-            try std.testing.expect(!self.app.session_persistence.writable.?.conversation_writer.turn_open);
-            try request.admission.admit();
-            request.delivery.markPossiblySent();
-            return .{ .completed = .{ .completion = .{ .content = "new answer", .finish_reason = .stop } } };
-        }
-
-        fn prepare(raw: *anyopaque, request: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            const result = try app_session_runtime.Runtime(FakeApp).prepareFreshPrompt(self.app, request);
-            if (self.cancel_after_prepare) self.app.worker.worker_cancel_requested.store(true, .seq_cst);
-            return result;
-        }
-    };
-    const alloc = std.testing.allocator;
-    const queue_alloc = std.heap.c_allocator;
-    const Outcome = enum { success, preflight_oom, cancel_after_prepare, finished_before_prepare };
-    for ([_]Outcome{ .success, .preflight_oom, .cancel_after_prepare, .finished_before_prepare }) |outcome| {
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-        defer alloc.free(root);
-        var app = try FakeApp.init(alloc);
-        defer app.deinit();
-        app.workspace_root = root;
-        app.session_persistence.store = try session_store.Store.initFromHome(alloc, root, root);
-        defer app.session_persistence.deinit(alloc);
-        app.session_persistence.writable = try app.session_persistence.store.?.startWritableSession(alloc, .{
-            .id = @constCast("queued-pause"),
-            .origin_workspace_root = @constCast(root),
-            .workspace_root = @constCast(root),
-            .created_at_ms = 1,
-            .updated_at_ms = 1,
-            .conversation_language = .literal("en"),
-            .history = &.{},
-            .total_input_tokens = 0,
-            .total_output_tokens = 0,
-            .preferences = .{ .model = @constCast("test-model"), .effort = .auto, .fast_mode = false },
-        });
-        try app_session_runtime.Runtime(FakeApp).commitContextCompaction(&app, .{
-            .summary = @constCast("<context_handoff>original request</context_handoff>"),
-            .removed_turn_count = 0,
-            .compaction_count = 1,
-        }, .{ .user = .{ .text = @constCast("same prompt") }, .assistant = @constCast("") }, null);
-        const checkpoint: session_codec.RecoveryCheckpoint = .{
-            .turn_id = 41,
-            .user = .{ .text = @constCast("same prompt") },
-            .assistant_source = @constCast("old partial answer"),
-            .cause = .response_interrupted,
-            .action = .paused,
-            .authority = .{ .provider = .gateway, .model = @constCast("test-model") },
-            .requested_fast_mode = false,
-            .fast_mode = false,
-            .max_provider_attempts = 1,
-            .consumed_provider_attempts = 1,
-        };
-        try app_session_runtime.Runtime(FakeApp).setRecoveryCheckpoint(&app, checkpoint);
-        app.worker.worker_processing = true;
-        app.worker.active_turn_id = 41;
-        var queued = try makeQueuedPrompt(queue_alloc);
-        queue_alloc.free(queued.prompt);
-        queued.prompt = try queue_alloc.dupe(u8, "same prompt");
-        types.freeHistoryTurnSlice(queue_alloc, queued.history);
-        queued.history = try app.session.snapshotHistory(queue_alloc);
-        try app.worker.admitInteractivePrompt(queue_alloc, queued);
-        try app.worker.enqueuePrompt(queue_alloc, try makeQueuedPrompt(queue_alloc));
-        const previous_finished = types.FinishedPrompt{ .turn = .{ .assistant = .{
-            .user = .{ .text = @constCast("same prompt") },
-            .assistant = @constCast("old completed answer"),
-        } } };
-        if (outcome == .finished_before_prepare) {
-            try app.worker.propagateHistoryTurn(queue_alloc, previous_finished.turn, 0);
-            try app.worker.pushEvent(queue_alloc, .{ .finish_prompt = previous_finished });
-        }
-        app.worker.finishProcessing();
-        const job = (try app.worker.tryTakeNextPrompt(queue_alloc)).?;
-        defer worker_runtime.freeQueuedPrompt(queue_alloc, job);
-        try std.testing.expect(job.delivery.isContinuation());
-        try std.testing.expect(job.recovery_checkpoint == null);
-        var probe: Probe = .{ .app = &app, .cancel_after_prepare = outcome == .cancel_after_prepare };
-        var provider = testAgentStreamProvider(Probe.stream);
-        provider.context = &probe;
-        app.agent_stream_provider = provider;
-        if (outcome == .preflight_oom) app.snapshot_tools_error = error.OutOfMemory;
-        const thread = try std.Thread.spawn(.{}, Probe.run, .{ &probe, job });
-        var joined = false;
-        defer if (!joined) {
-            app.worker.requestShutdown();
-            thread.join();
-        };
-        const deadline = io_mod.milliTimestamp() + 5_000;
-        var observed = false;
-        while (true) {
-            app.worker.worker_mutex.lockUncancelable(io_mod.getIo());
-            const waiting = app.worker.history_publication_response == .waiting;
-            app.worker.worker_mutex.unlock(io_mod.getIo());
-            if (waiting) break;
-            if (io_mod.milliTimestamp() >= deadline) return error.TestExpectedFreshPromptPreparation;
-            io_mod.sleep(std.time.ns_per_ms);
-        }
-        while (!observed) {
-            var events = app.worker.takeEvents();
-            defer events.deinit(queue_alloc);
-            defer for (events.items) |event| worker_runtime.freeWorkerEvent(queue_alloc, event);
-            for (events.items) |event| {
-                if (event == .finish_prompt) {
-                    try app_session_runtime.Runtime(FakeApp).appendFinishedPrompt(&app, event.finish_prompt);
-                    continue;
-                }
-                if (event != .prepare_fresh_prompt) continue;
-                try std.testing.expectEqual(@as(usize, 0), probe.requests.load(.seq_cst));
-                try std.testing.expect(!probe.returned.load(.acquire));
-                try std.testing.expectEqual(outcome != .finished_before_prepare, app.session_persistence.writable.?.conversation_writer.turn_open);
-                const current = app_session_runtime.Runtime(FakeApp).normalizeFreshPromptPreparation(&app, event.prepare_fresh_prompt);
-                app.worker.resolveFreshPrompt(queue_alloc, current, &probe, Probe.prepare);
-                observed = true;
-            }
-            if (io_mod.milliTimestamp() >= deadline) return error.TestExpectedFreshPromptPreparation;
-            if (!observed) io_mod.sleep(std.time.ns_per_ms);
-        }
-        thread.join();
-        joined = true;
-        if (outcome == .preflight_oom) {
-            try std.testing.expectEqual(error.OutOfMemory, probe.failure.?);
-            try std.testing.expectEqual(@as(usize, 0), probe.requests.load(.seq_cst));
-            try std.testing.expect(!app.session_persistence.writable.?.conversation_writer.turn_open);
-            continue;
-        }
-        if (probe.failure) |err| return err;
-        if (outcome == .cancel_after_prepare) {
-            try std.testing.expectEqual(@as(usize, 0), probe.requests.load(.seq_cst));
-            continue;
-        }
-        try std.testing.expectEqual(@as(usize, 1), probe.requests.load(.seq_cst));
-        if (outcome == .finished_before_prepare) {
-            for (app.worker.queued_history) |turn| try std.testing.expect(turn != .interrupted);
-        } else {
-            try std.testing.expectEqualStrings("old partial answer", app.worker.queued_history[1].interrupted.assistant.?);
-        }
-        var events = app.worker.takeEvents();
-        defer events.deinit(queue_alloc);
-        defer for (events.items) |event| worker_runtime.freeWorkerEvent(queue_alloc, event);
-        for (events.items) |event| {
-            if (event == .finish_prompt) try app_session_runtime.Runtime(FakeApp).appendFinishedPrompt(&app, event.finish_prompt);
-        }
-        var page = try app.session_persistence.store.?.loadHistoryPage(alloc, "queued-pause", null, 10);
-        defer page.deinit(alloc);
-        try std.testing.expectEqual(@as(usize, 2), page.turns.len);
-        if (outcome == .finished_before_prepare) {
-            try std.testing.expectEqualStrings("same prompt", page.turns[0].assistant.user.text);
-            try std.testing.expectEqualStrings("old completed answer", page.turns[0].assistant.assistant);
-        } else {
-            try std.testing.expectEqualStrings("same prompt", page.turns[0].interrupted.user.text);
-            try std.testing.expectEqualStrings("old partial answer", page.turns[0].interrupted.assistant.?);
-        }
-        try std.testing.expectEqualStrings("same prompt", page.turns[1].assistant.user.text);
-        try std.testing.expectEqualStrings("new answer", page.turns[1].assistant.assistant);
-    }
-}
-
-test "manual compaction worker call commits a checkpoint without a continuation" {
-    const Gateway = struct {
-        request_count: usize = 0,
-        saw_no_tools: bool = false,
-        observed_model: ?[]const u8 = null,
-
-        fn stream(
-            raw: ?*anyopaque,
-            _: Allocator,
-            request: agent_stream_provider.ModelRequest,
-        ) !agent_stream_provider.Result {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.request_count += 1;
-            self.observed_model = request.model;
-            self.saw_no_tools = request.tools.advertised_names.len == 0 and
-                request.tools.advertised_functions.len == 0 and
-                request.tools.additional_functions.len == 0 and
-                request.tools.selected_dynamic.len == 0 and
-                request.tool_choice == .none;
-            try request.admission.admit();
-            request.delivery.markPossiblySent();
-            const response = "Continue after manual compaction with the user's constraints intact.";
-            request.events.emit(.{ .content_delta = response });
-            return .{ .completed = .{ .completion = .{
-                .content = response,
-                .finish_reason = .stop,
-            } } };
-        }
-    };
-
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-    var gateway = Gateway{};
-    var provider = testAgentStreamProvider(Gateway.stream);
-    provider.context = &gateway;
-    app.agent_stream_provider = provider;
-
-    var job = worker_runtime.ContextCompactionTask{
-        .model = try alloc.dupe(u8, "test-model"),
-        .api_key = try alloc.dupe(u8, "api-key"),
-        .credential_source = .ai_gateway_api_key,
-        .history = try alloc.alloc(types.HistoryTurn, 2),
-    };
-    defer worker_runtime.freeContextCompactionTask(alloc, job);
-    job.history[0] = try types.dupeHistoryTurn(alloc, .{ .assistant = .{
-        .user = .{ .text = @constCast("exact user request") },
-        .assistant = @constCast("exact completed response\n" ++ ("evidence " ** 1_000)),
-    } });
-    job.history[1] = try types.dupeHistoryTurn(alloc, .{ .assistant = .{
-        .user = .{ .text = @constCast("second user request") },
-        .assistant = @constCast("second response"),
-    } });
-    for (job.history) |turn| try app.session.appendHistoryEntry(alloc, turn);
-
-    const Worker = struct {
-        returned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-        failure: ?anyerror = null,
-
-        fn run(self: *@This(), target: *FakeApp, task: worker_runtime.ContextCompactionTask) void {
-            Runtime(FakeApp).processContextCompaction(target, task, 1, null) catch |err| {
-                self.failure = err;
-            };
-            self.returned.store(true, .release);
-        }
-
-        fn commit(raw: *anyopaque, event: worker_runtime.ContextCompaction) !void {
-            const target: *FakeApp = @ptrCast(@alignCast(raw));
-            try app_session_runtime.Runtime(FakeApp).commitContextCompaction(target, event.summary, event.active_prefix, event.retained_from);
-        }
-    };
-    var worker: Worker = .{};
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &worker, &app, job });
-    var joined = false;
-    defer if (!joined) {
-        app.worker.requestShutdown();
-        thread.join();
-    };
-    var events: std.ArrayList(worker_runtime.WorkerEvent) = .empty;
-    defer events.deinit(std.heap.c_allocator);
-    defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
-    const deadline = io_mod.milliTimestamp() + 5_000;
-    while (events.items.len == 0) {
-        var batch = app.worker.takeEvents();
-        defer batch.deinit(std.heap.c_allocator);
-        try events.appendSlice(std.heap.c_allocator, batch.items);
-        if (io_mod.milliTimestamp() >= deadline) return error.TestExpectedCompactionEvent;
-        if (events.items.len == 0) io_mod.sleep(std.time.ns_per_ms);
-    }
-    try std.testing.expect(events.items[0] == .context_compaction);
-    try std.testing.expect(!worker.returned.load(.acquire));
-    const pending_activity = app.worker.compactionActivitySnapshot();
-    try std.testing.expectEqual(compaction_activity.Stage.publication, pending_activity.operation.?.phase.running);
-    try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
-    app.worker.resolveContextCompaction(std.heap.c_allocator, events.items[0].context_compaction, &app, Worker.commit);
-    thread.join();
-    joined = true;
-    if (worker.failure) |err| return err;
-    try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
-    var tail_events = app.worker.takeEvents();
-    defer tail_events.deinit(std.heap.c_allocator);
-    try events.appendSlice(std.heap.c_allocator, tail_events.items);
-
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_count);
-    try std.testing.expect(gateway.saw_no_tools);
-    try std.testing.expectEqualStrings("test-model", gateway.observed_model.?);
-    try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    try std.testing.expect(events.items[0] == .context_compaction);
-    try std.testing.expect(events.items[0].context_compaction.active_prefix == null);
-
-    const completed_activity = app.worker.compactionActivitySnapshot();
-    try std.testing.expectEqual(pending_activity.operation.?.id, completed_activity.operation.?.id);
-    try std.testing.expectEqual(compaction_activity.Outcome.succeeded, completed_activity.operation.?.phase.terminal.outcome);
-    try std.testing.expect(completed_activity.revision > pending_activity.revision);
-    app.worker.finishProcessing();
-    try std.testing.expectEqualDeep(completed_activity, app.worker.compactionActivitySnapshot());
-
-    app.snapshot_custom_guidance = "fixed tool guidance " ** 20_000;
-    var provenance: ?compaction_activity.ErrorProvenance = null;
-    try std.testing.expectError(error.ContextCapacityExceeded, Runtime(FakeApp).processContextCompaction(&app, job, 1, &provenance));
-    const failed_activity = app.worker.compactionActivitySnapshot();
-    try std.testing.expectEqual(failed_activity.operation.?.id, provenance.?.operation_id);
-    try std.testing.expectEqual(error.ContextCapacityExceeded, provenance.?.err);
-    try std.testing.expectEqual(error.ContextCapacityExceeded, failed_activity.operation.?.phase.terminal.err.?);
-    try std.testing.expect(failed_activity.operation.?.id != completed_activity.operation.?.id);
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_count);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.worker_events.items.len);
-}
-
-test "app agent runtime processes a cancelled queued prompt" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
-
-    const job = try makeQueuedPrompt(alloc);
-    defer worker_runtime.freeQueuedPrompt(alloc, job);
-
-    try Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url, null);
-
-    try std.testing.expectEqual(@as(usize, 0), app.append_context_count);
-    try std.testing.expectEqual(@as(usize, 1), app.snapshot_tools_count);
-
-    var events = app.worker.takeEvents();
-    defer events.deinit(std.heap.c_allocator);
-    defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
-
-    try std.testing.expectEqual(@as(usize, 2), events.items.len);
-    try std.testing.expect(events.items[0] == .tool_lifecycle);
-    try std.testing.expect(events.items[0].tool_lifecycle.turn_finished.turn_id != 0);
-    try std.testing.expectEqual(
-        types.TurnPresentationOutcome.interrupted,
-        events.items[0].tool_lifecycle.turn_finished.outcome,
-    );
-    try std.testing.expect(events.items[1] == .finish_prompt);
-    try std.testing.expect(events.items[1].finish_prompt.turn == .interrupted);
-}
-
-test "app direct ask delivers semantic presentation through the runtime sink" {
-    const Gateway = struct {
-        fn stream(
-            _: ?*anyopaque,
-            _: Allocator,
-            request: agent_stream_provider.ModelRequest,
-        ) !agent_stream_provider.Result {
-            try request.admission.admit();
-            request.events.emit(.{ .content_delta = "Before table.\n" ++
-                "| Name | Count |\n" ++
-                "|------|------:|\n" ++
-                "| api | 7 |\n" ++
-                "After table.\n\n" ++
-                "```zig\n" ++
-                "const ready = true;\n" ++
-                "```\n\n" ++
-                "---\n" });
-            return .{ .completed = .{ .completion = .{ .content = "", .finish_reason = .stop } } };
-        }
-    };
-
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-    const job = try makeQueuedPrompt(alloc);
-    defer worker_runtime.freeQueuedPrompt(alloc, job);
-
-    app.agent_stream_provider = testAgentStreamProvider(Gateway.stream);
-
-    try Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url, null);
-
-    var events = app.worker.takeEvents();
-    defer events.deinit(std.heap.c_allocator);
-    defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
-
-    var table_count: usize = 0;
-    var code_count: usize = 0;
-    var rule_count: usize = 0;
-    const SemanticEvent = enum { table, code_block, thematic_rule };
-    var semantic_events: [3]SemanticEvent = undefined;
-    var semantic_event_count: usize = 0;
-    for (events.items) |event| switch (event) {
-        .assistant_presentation => |presentation| switch (presentation) {
-            .table => |table| {
-                table_count += 1;
-                semantic_events[semantic_event_count] = .table;
-                semantic_event_count += 1;
-                try std.testing.expectEqualStrings("api", table.rows[1].cells[0]);
-            },
-            .code_block => |block| {
-                code_count += 1;
-                semantic_events[semantic_event_count] = .code_block;
-                semantic_event_count += 1;
-                try std.testing.expectEqualStrings("zig", block.language);
-                try std.testing.expectEqualStrings("const ready = true;\n", block.code);
-            },
-            .thematic_rule => {
-                rule_count += 1;
-                semantic_events[semantic_event_count] = .thematic_rule;
-                semantic_event_count += 1;
-            },
-            .text => {},
-        },
-        else => {},
-    };
-
-    try std.testing.expectEqual(@as(usize, 1), table_count);
-    try std.testing.expectEqual(@as(usize, 1), code_count);
-    try std.testing.expectEqual(@as(usize, 1), rule_count);
-    try std.testing.expectEqualSlices(
-        SemanticEvent,
-        &.{ .table, .code_block, .thematic_rule },
-        semantic_events[0..semantic_event_count],
-    );
-}
-
-test "app agent runtime clears active turn settings when queued prompt setup fails" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    app.fast_mode = false;
-    app.effort = types.ReasoningEffort.literal("low");
-    app.worker.agent_turn_settings = .{
-        .fast_mode = false,
-        .effort = types.ReasoningEffort.literal("low"),
-    };
-    app.snapshot_tools_error = error.TestExpectedEqual;
-
-    var job = try makeQueuedPrompt(alloc);
-    defer worker_runtime.freeQueuedPrompt(alloc, job);
-    job.agent_settings = .{
-        .fast_mode = true,
-        .effort = types.ReasoningEffort.literal("high"),
-    };
-    job.permission_mode = .yolo;
-
-    try std.testing.expectError(error.TestExpectedEqual, Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url, null));
-    try std.testing.expectEqual(
-        @as(?PermissionMode, .yolo),
-        app.snapshot_permission_mode,
-    );
-
-    const effective = app.worker.effectiveAgentTurnSettings();
-    try std.testing.expect(!effective.fast_mode);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("low"), effective.effort);
-}
-
-test "subagent tool projection uses immutable admission permission rules" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    var live_rules = [_]types.PermissionRule{.{
-        .permission = @constCast("bash"),
-        .pattern = @constCast("live-rule"),
-        .action = .deny,
-    }};
-    app.permission_engine.rules = .{ .rules = &live_rules };
-    defer app.permission_engine.rules = .{};
-
-    var admission_rules = [_]types.PermissionRule{.{
-        .permission = @constCast("bash"),
-        .pattern = @constCast("admitted-rule"),
-        .action = .allow,
-    }};
-    var admission = try subagent_domain.captureAdmission(alloc, .{
-        .parent_id = "parent",
-        .source_id = "parent",
-        .model = "test-model",
-        .effort = .auto,
-        .permission_mode = .auto,
-        .rules = .{ .rules = &admission_rules },
-    });
-    defer admission.deinit(alloc);
-
-    var replacement_rules = [_]types.PermissionRule{.{
-        .permission = @constCast("bash"),
-        .pattern = @constCast("replacement-rule"),
-        .action = .ask,
-    }};
-    var barrier = ProjectionBarrier{};
-    app.snapshot_barrier = &barrier;
-    app.snapshot_tools_error = error.TestExpectedEqual;
-    var turn: subagent_execution.TurnContext = undefined;
-    var cancel = std.atomic.Value(bool).init(false);
-    const message = subagent_domain.QueuedMessage{
-        .id = @constCast("message"),
-        .source_id = @constCast("parent"),
-        .content = @constCast("run"),
-        .created_at_ms = 1,
-    };
-
-    const Project = struct {
-        app: *FakeApp,
-        turn: *subagent_execution.TurnContext,
-        message: subagent_domain.QueuedMessage,
-        admission: subagent_domain.AdmissionSnapshot,
-        cancel: *std.atomic.Value(bool),
-        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-        err: ?anyerror = null,
-
-        fn run(self: *@This()) void {
-            defer self.done.store(true, .release);
-            _ = Runtime(FakeApp).runSubagentChild(
-                self.app,
-                self.turn,
-                self.message,
-                self.admission,
-                self.cancel,
-            ) catch |err| {
-                self.err = err;
-                return;
-            };
-        }
-    };
-    var project = Project{
-        .app = &app,
-        .turn = &turn,
-        .message = message,
-        .admission = admission,
-        .cancel = &cancel,
-    };
-    const projection_thread = try std.Thread.spawn(.{}, Project.run, .{&project});
-    var joined = false;
-    defer if (!joined) {
-        barrier.release.store(true, .release);
-        projection_thread.join();
-    };
-    const observation_deadline = io_mod.milliTimestamp() + 5_000;
-    while (!barrier.entered.load(.acquire) and
-        !project.done.load(.acquire) and
-        io_mod.milliTimestamp() < observation_deadline)
-    {
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-    if (!barrier.entered.load(.acquire)) {
-        cancel.store(true, .release);
-        barrier.release.store(true, .release);
-        projection_thread.join();
-        joined = true;
-        return error.TestProjectionNotEntered;
-    }
-    app.permission_engine.rules = .{ .rules = &replacement_rules };
-    barrier.release.store(true, .release);
-    projection_thread.join();
-    joined = true;
-
-    try std.testing.expectEqual(error.OutOfMemory, project.err.?);
-    try std.testing.expectEqualStrings(
-        "admitted-rule",
-        app.snapshot_permission_rule_pattern orelse return error.TestExpectedEqual,
-    );
-}
-
-test "subagent tool context uses immutable admission authority" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    var live_rules = [_]types.PermissionRule{.{
-        .permission = @constCast("bash"),
-        .pattern = @constCast("live-rule"),
-        .action = .deny,
-    }};
-    app.permission_engine.rules = .{ .rules = &live_rules };
-    defer app.permission_engine.rules = .{};
-
-    var admission_rules = [_]types.PermissionRule{.{
-        .permission = @constCast("bash"),
-        .pattern = @constCast("admitted-rule"),
-        .action = .allow,
-    }};
-    const admission_grants = [_]types.PermissionGrant{.{
-        .tool_name = @constCast("run_command"),
-        .target_path = @constCast("/tmp/workspace::zig build"),
-    }};
-    var admission = try subagent_domain.captureAdmission(alloc, .{
-        .parent_id = "parent",
-        .source_id = "parent",
-        .model = "test-model",
-        .effort = .auto,
-        .permission_mode = .auto,
-        .rules = .{ .rules = &admission_rules },
-        .grants = &admission_grants,
-    });
-    defer admission.deinit(alloc);
-
-    const ctx = app.subagentToolContextForAdmission(admission);
-    try std.testing.expectEqual(PermissionMode.auto, ctx.permission_mode);
-    try std.testing.expectEqual(@as(usize, 1), ctx.permission_rules.rules.len);
-    try std.testing.expectEqualStrings(
-        "admitted-rule",
-        ctx.permission_rules.rules[0].pattern,
-    );
-    try std.testing.expectEqual(@as(usize, 1), ctx.permission_grants.len);
-    try std.testing.expectEqualStrings(
-        "run_command",
-        ctx.permission_grants[0].tool_name,
-    );
-}
-
-test "app agent runtime settles queued snapshot ownership when prompt admission fails" {
-    const alloc = std.testing.allocator;
-    const Admission = enum { projection_failure, invalid_writer, uncertain_checkpoint };
-    for ([_]Admission{ .projection_failure, .invalid_writer, .uncertain_checkpoint }) |admission| {
-        const invalid_writer = admission != .projection_failure;
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        {
-            var file = try tmp.dir.createFile(std.testing.io, "queued-snapshot.bin", .{});
-            defer file.close(std.testing.io);
-            try file.writeStreamingAll(std.testing.io, "\x89PNG\r\n\x1a\nqueued");
-        }
-        const snapshot_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "queued-snapshot.bin");
-        defer alloc.free(snapshot_path);
-
-        var app = try FakeApp.init(alloc);
-        defer app.deinit();
-        app.snapshot_tools_error = error.TestExpectedEqual;
-        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-        defer alloc.free(root);
-        defer app.session_persistence.deinit(alloc);
-        if (invalid_writer) {
-            app.session_persistence.store = try @import("../session/session_store.zig").Store.initFromHome(alloc, root, root);
-            app.session_persistence.writable = try app.session_persistence.store.?.startWritableSession(alloc, .{
-                .id = @constCast("rejected-images"),
-                .origin_workspace_root = @constCast(root),
-                .workspace_root = @constCast(root),
-                .created_at_ms = 1,
-                .updated_at_ms = 1,
-                .conversation_language = .literal("en"),
-                .history = &.{},
-                .total_input_tokens = 0,
-                .total_output_tokens = 0,
-                .preferences = .{ .model = @constCast("test-model"), .effort = .auto, .fast_mode = false },
-            });
-            app.session_persistence.writable.?.conversation_writer.failure = error.SessionCommitFailed;
-        }
-
-        var job = try makeQueuedPrompt(alloc);
-        defer worker_runtime.freeQueuedPrompt(alloc, job);
-        job.images = try types.dupeImageAttachmentSlice(alloc, &.{.{
-            .id = 1,
-            .path = @constCast("/tmp/source.png"),
-            .media_type = @constCast("image/png"),
-            .snapshot_path = snapshot_path,
-            .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        }});
-
-        if (admission == .uncertain_checkpoint) {
-            app.worker.active_turn_id = 41;
-            app.worker.preservePromptSnapshots(41, job.images);
-            app.session_persistence.writable.?.conversation_writer.failure = error.SessionPersistenceUncertain;
-        }
-        try std.testing.expectError(
-            switch (admission) {
-                .projection_failure => error.TestExpectedEqual,
-                .invalid_writer => error.SessionCommitFailed,
-                .uncertain_checkpoint => error.SessionPersistenceUncertain,
-            },
-            Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url, null),
-        );
-        if (admission == .uncertain_checkpoint) {
-            try std.Io.Dir.accessAbsolute(std.testing.io, snapshot_path, .{});
-        } else {
-            try std.testing.expectError(
-                error.FileNotFound,
-                std.Io.Dir.accessAbsolute(std.testing.io, snapshot_path, .{}),
-            );
-        }
-    }
-}
-
-test "app agent runtime discards every snapshot in a failed multi-image preflight" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    {
-        var first = try tmp.dir.createFile(std.testing.io, "first.bin", .{});
-        defer first.close(std.testing.io);
-        try first.writeStreamingAll(std.testing.io, "first");
-    }
-    {
-        var second = try tmp.dir.createFile(std.testing.io, "second.bin", .{});
-        defer second.close(std.testing.io);
-        try second.writeStreamingAll(std.testing.io, "second");
-    }
-    const first_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "first.bin");
-    defer alloc.free(first_path);
-    const second_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "second.bin");
-    defer alloc.free(second_path);
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-    app.snapshot_tools_error = error.TestExpectedEqual;
-    var job = try makeQueuedPrompt(alloc);
-    defer worker_runtime.freeQueuedPrompt(alloc, job);
-    job.images = try types.dupeImageAttachmentSlice(alloc, &.{
-        .{
-            .id = 1,
-            .path = @constCast("/tmp/first.png"),
-            .media_type = @constCast("image/png"),
-            .snapshot_path = first_path,
-            .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        },
-        .{
-            .id = 2,
-            .path = @constCast("/tmp/second.png"),
-            .media_type = @constCast("image/png"),
-            .snapshot_path = second_path,
-            .snapshot_sha256 = @constCast("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-        },
-    });
-
-    try std.testing.expectError(
-        error.TestExpectedEqual,
-        Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url, null),
-    );
-    try std.testing.expectError(
-        error.FileNotFound,
-        std.Io.Dir.accessAbsolute(std.testing.io, first_path, .{}),
-    );
-    try std.testing.expectError(
-        error.FileNotFound,
-        std.Io.Dir.accessAbsolute(std.testing.io, second_path, .{}),
-    );
-}
-
-test "app agent runtime queued prompt config uses captured job settings over stale live app state" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    app.fast_mode = false;
-    app.effort = types.ReasoningEffort.literal("low");
-    app.worker.agent_turn_settings = .{
-        .max_tool_result_bytes = 1024,
-        .first_call_tool_choice = .auto,
-        .fast_mode = false,
-        .effort = types.ReasoningEffort.literal("low"),
-    };
-
-    var job = try makeQueuedPrompt(alloc);
-    defer worker_runtime.freeQueuedPrompt(alloc, job);
-    job.agent_settings = .{
-        .max_tool_result_bytes = 8192,
-        .first_call_tool_choice = .none,
-        .fast_mode = true,
-        .effort = types.ReasoningEffort.literal("high"),
-    };
-    const custom_guidance = try alloc.dupe(u8, "app custom tool guidance");
-    var tool_projection = tool_projection_mod.EffectiveToolProjection{
-        .advertised_names = try alloc.alloc([]const u8, 0),
-        .advertised_functions = try alloc.alloc(model_tool_schema.FunctionSchema, 0),
-        .custom_guidance = custom_guidance,
-    };
-    defer tool_projection.deinit(alloc);
-    const config = Runtime(FakeApp).buildQueuedPromptConfig(&app, job, .{ .skills = &.{} }, &.{}, 1, test_gateway_chat_url, &tool_projection, null);
-
-    try std.testing.expect(config.fast_mode);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), config.effort);
-    try std.testing.expectEqual(@as(usize, 8192), config.max_tool_result_bytes);
-    try std.testing.expectEqual(types.ToolChoice.none, config.first_call_tool_choice);
-    try std.testing.expectEqualSlices([]const u8, tool_projection.advertised_names, config.advertised_tool_names);
-    try std.testing.expectEqualSlices(model_tool_schema.FunctionSchema, tool_projection.advertised_functions, config.advertised_functions);
-    try std.testing.expectEqualStrings(tool_projection.custom_guidance, config.custom_tool_guidance);
-    try std.testing.expectEqualStrings(test_prompt_policy.system_prompt, config.system_prompt);
-    try std.testing.expectEqualStrings("test model overlay", config.model_prompt_overlay.?);
-    try std.testing.expect(!app.fast_mode);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("low"), app.effort);
-}
-
-test "app agent runtime highlights shell command rows over the tool text base" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    const run_call: ToolCall = .{
-        .id = "1",
-        .name = "shell",
-        .arguments_json = "{\"action\":\"run\",\"command\":\"printf 'hello world' | wc -c\"}",
-    };
-    const completed = try app.describeToolActionCompleted(arena, run_call);
-
-    // The label and untokenized command text keep the muted tool-text base,
-    // while the command verb and quoted string pick up syntax palette colors
-    // and return to the base after their closes.
-    try std.testing.expect(std.mem.startsWith(u8, completed, "● Ran\x1b[0m \x1b[38;5;245m"));
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        completed,
-        "\x1b[38;5;252mprintf\x1b[39m\x1b[38;5;245m",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        completed,
-        "\x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m",
-    ) != null);
-    try std.testing.expect(std.mem.endsWith(u8, completed, "\x1b[0m"));
-    // The pipe and the command after it take the keyword color, the flag the
-    // number color; plain bytes are intact beneath the styling.
-    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;252m|\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;252mwc\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;250m-c\x1b[39m") != null);
 }

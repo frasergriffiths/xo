@@ -7,7 +7,26 @@ const types = @import("../../../shared/types.zig");
 const permissions = @import("../../../permissions/permissions.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
 const builtin_context = @import("../../../../builtins/context.zig");
-const builtin_gateway = @import("../../../../builtins/gateway.zig");
+const openrouter = @import("../../../../gateway/openrouter.zig");
+const openrouter_protocol = @import("../../../../gateway/chat_completions_protocol.zig");
+
+const openrouter_identity: model_provider.ProviderId = .openrouter;
+
+/// Serializes a request exactly as the OpenRouter transport does, so a fake
+/// stream observes the same body the real one would send.
+pub fn buildTestAgentRequest(
+    alloc: std.mem.Allocator,
+    request: agent_stream_provider.RequestData,
+) ![]u8 {
+    return openrouter_protocol.build_request(alloc, request, .{
+        .tool_choice_mode = openrouter.definition.tool_choice_mode,
+        .provider = &openrouter_identity,
+        .upstream_routing = .{
+            .order = request.provider_options.provider_order,
+            .allow_fallback = !request.provider_options.provider_strict,
+        },
+    });
+}
 const builtin_tools = @import("../../../../builtins/tools.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
@@ -122,7 +141,7 @@ pub const VisionAgentToolRuntime = struct {
             .gateway_chat_url = "https://example.invalid",
             .agent_step_limit = 8,
             .tool_registry = .{ .tools = vision_agent_test_tools[0..] },
-            .permission_mode = .ask,
+            .permission_mode = .yolo,
             .permission_grants = &.{},
             .permission_rules = .{},
             .worker = &self.worker,
@@ -164,7 +183,6 @@ const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.skill,
     builtin_tools.install_skill,
     builtin_tools.subagent,
-    builtin_tools.mcp_select_tool,
     builtin_tools.ask_user_question,
     builtin_tools.read_tool_result,
 };
@@ -218,26 +236,74 @@ pub const FakeCompletion = struct {
     cancel_during_tool_stream: bool = false,
 };
 
+/// The outbound request body now speaks the OpenAI chat-completions shape, so
+/// the conversation lives under `messages` with string content. Older
+/// Responses-style bodies used `prompt` arrays; accept either so fixtures that
+/// still build a legacy body stay readable.
+pub fn promptMessages(value: std.json.Value) ?[]const std.json.Value {
+    if (value != .object) return null;
+    if (value.object.get("messages")) |messages| {
+        if (messages == .array) return messages.array.items;
+    }
+    if (value.object.get("prompt")) |prompt| {
+        if (prompt == .array) return prompt.array.items;
+    }
+    return null;
+}
+
+/// Text of one prompt message. Chat-completions keeps plain string content,
+/// while image-bearing user messages use a typed part array.
+pub fn promptMessageText(message: std.json.Value) ?[]const u8 {
+    if (message != .object) return null;
+    const content = message.object.get("content") orelse return null;
+    return switch (content) {
+        .string => |string| string,
+        .array => |array| blk: {
+            if (array.items.len != 1 or array.items[0] != .object) break :blk null;
+            const text = array.items[0].object.get("text") orelse break :blk null;
+            break :blk if (text == .string) text.string else null;
+        },
+        else => null,
+    };
+}
+
+/// First prompt message whose text contains `needle`, in declaration order.
+pub fn promptMessageTextContaining(value: std.json.Value, needle: []const u8) ?[]const u8 {
+    const messages = promptMessages(value) orelse return null;
+    for (messages) |message| {
+        const text = promptMessageText(message) orelse continue;
+        if (std.mem.find(u8, text, needle) != null) return text;
+    }
+    return null;
+}
+
 /// Fails a model request whose prompt ends on an assistant message, and one the
 /// runtime had to continue unless the test expects that repair.
 pub fn expectReplyablePromptTail(alloc: Allocator, payload: []const u8, allow_continuation: bool) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return;
     defer parsed.deinit();
     if (parsed.value != .object) return;
-    const prompt = parsed.value.object.get("prompt") orelse return;
-    if (prompt != .array or prompt.array.items.len == 0) return;
-    const tail = prompt.array.items[prompt.array.items.len - 1];
+    const messages = promptMessages(parsed.value) orelse return;
+    if (messages.len == 0) return;
+    const tail = messages[messages.len - 1];
     if (tail != .object) return;
     const role = tail.object.get("role") orelse return;
     if (role != .string) return;
     if (std.mem.eql(u8, role.string, "assistant")) return error.TestAssistantPrefillRequest;
     if (allow_continuation or !std.mem.eql(u8, role.string, "user")) return;
     const content = tail.object.get("content") orelse return;
-    if (content != .array or content.array.items.len != 1 or content.array.items[0] != .object) return;
-    const text = content.array.items[0].object.get("text") orelse return;
-    if (text == .string and std.mem.eql(u8, text.string, runtime_orchestrator.assistant_tail_continuation_prompt)) {
+    const text: ?[]const u8 = switch (content) {
+        .string => |string| string,
+        .array => |array| blk: {
+            if (array.items.len != 1 or array.items[0] != .object) break :blk null;
+            const part = array.items[0].object.get("text") orelse break :blk null;
+            break :blk if (part == .string) part.string else null;
+        },
+        else => null,
+    };
+    if (text) |value| if (std.mem.eql(u8, value, runtime_orchestrator.assistant_tail_continuation_prompt)) {
         return error.TestAssistantTailContinued;
-    }
+    };
 }
 
 pub const FakeGateway = struct {
@@ -273,7 +339,7 @@ pub const FakeGateway = struct {
     }
 
     pub fn provider(self: *FakeGateway) agent_stream_provider.Provider {
-        var result = builtin_gateway.agent_stream_provider;
+        var result = openrouter.provider_bundle.agent_stream.?;
         result.context = self;
         result.stream_fn = fakeGatewayStream;
         return result;
@@ -286,7 +352,7 @@ pub const FakeGateway = struct {
     ) !agent_stream_provider.Result {
         if (self.observe_request) |observe| try observe(request);
         const payload = request.prepared_request_body orelse
-            try builtin_gateway.buildAgentRequest(alloc, request.data());
+            try buildTestAgentRequest(alloc, request.data());
         defer if (request.prepared_request_body == null) alloc.free(payload);
         try expectReplyablePromptTail(alloc, payload, self.allow_assistant_tail_continuation);
         try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, payload));
@@ -507,8 +573,7 @@ pub const FakeAgentRuntimeDeps = struct {
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
     root_permission_mode: ?PermissionMode = null,
-    validation_mcp_runtime_generation: ?u64 = null,
-    validation_mcp_tool_name: ?[]const u8 = null,
+
     execute_mutex: std.Io.Mutex = .init,
     log: std.ArrayList([]u8) = .empty,
     texts: std.ArrayList([]u8) = .empty,
@@ -535,7 +600,7 @@ pub const FakeAgentRuntimeDeps = struct {
     validated_names: std.ArrayList([]u8) = .empty,
     availability_checked_names: std.ArrayList([]u8) = .empty,
     execution_classification_complete: std.ArrayList(bool) = .empty,
-    execution_mcp_runtime_generations: std.ArrayList(?u64) = .empty,
+
     last_validated_arguments: ?[]u8 = null,
     last_permission_arguments: ?[]u8 = null,
     last_executed_arguments: ?[]u8 = null,
@@ -686,7 +751,6 @@ pub const FakeAgentRuntimeDeps = struct {
     credential_refresh_sources: std.ArrayList(types.CredentialSource) = .empty,
     credential_refresh_modes: std.ArrayList(runtime_deps.CredentialRefreshMode) = .empty,
     credential_refresh_error: ?anyerror = null,
-    last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
     recovery_checkpoints: std.ArrayList(session_codec.RecoveryCheckpoint) = .empty,
@@ -739,7 +803,6 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.validated_names);
         freeStringList(self.alloc, &self.availability_checked_names);
         self.execution_classification_complete.deinit(self.alloc);
-        self.execution_mcp_runtime_generations.deinit(self.alloc);
         if (self.last_validated_arguments) |value| self.alloc.free(value);
         if (self.last_permission_arguments) |value| self.alloc.free(value);
         if (self.last_executed_arguments) |value| self.alloc.free(value);
@@ -773,7 +836,6 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.capability_queries);
         self.credential_refresh_sources.deinit(self.alloc);
         self.credential_refresh_modes.deinit(self.alloc);
-        if (self.last_credential_refresh_expected_account) |value| self.alloc.free(value);
         for (self.recovery_checkpoints.items) |*checkpoint| checkpoint.deinit(self.alloc);
         self.recovery_checkpoints.deinit(self.alloc);
     }
@@ -909,15 +971,10 @@ pub const FakeAgentRuntimeDeps = struct {
         return self.default_model_capabilities;
     }
 
-    fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode, expected_account_id: ?[]const u8) !?[]u8 {
+    fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode) !?[]u8 {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.credential_refresh_sources.append(self.alloc, source);
         try self.credential_refresh_modes.append(self.alloc, mode);
-        if (self.last_credential_refresh_expected_account) |value| self.alloc.free(value);
-        self.last_credential_refresh_expected_account = if (expected_account_id) |account_id|
-            try self.alloc.dupe(u8, account_id)
-        else
-            null;
         if (self.credential_refresh_error) |err| return err;
         if (self.credential_refresh_index >= self.credential_refresh_tokens.len) return null;
         const token = self.credential_refresh_tokens[self.credential_refresh_index];
@@ -1080,16 +1137,8 @@ pub const FakeAgentRuntimeDeps = struct {
                 return .{ .failure = try std.fmt.allocPrint(arena, "{s} arguments failed registered-tool validation", .{call.name}) };
             }
         }
-        const mcp_runtime_generation = if (self.validation_mcp_tool_name) |name|
-            if (std.mem.eql(u8, name, call.name))
-                self.validation_mcp_runtime_generation
-            else
-                null
-        else
-            null;
-        return .{ .valid = .{
-            .mcp_runtime_generation = mcp_runtime_generation,
-        } };
+
+        return .{ .valid = .{} };
     }
 
     fn checkToolAvailability(raw: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
@@ -1128,7 +1177,6 @@ pub const FakeAgentRuntimeDeps = struct {
         live_authority: ?runtime_tool_contracts.LiveToolAuthority,
         revalidation: ?runtime_tool_contracts.LivePermissionRevalidation,
         advertised_dynamic_tool_names: []const []const u8,
-        _: ?[]const u8,
     ) !command_admission.PermissionOutcome {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         if (self.permission_request_override) |override| {
@@ -1451,10 +1499,6 @@ pub const FakeAgentRuntimeDeps = struct {
             try self.execution_classification_complete.append(
                 self.alloc,
                 request.classification_complete,
-            );
-            try self.execution_mcp_runtime_generations.append(
-                self.alloc,
-                request.expected_mcp_runtime_generation,
             );
             try self.execute_timeout_started_ms.append(
                 self.alloc,
@@ -1873,8 +1917,8 @@ pub const PromptFixture = struct {
             .images = self.images[0..],
             .model = @constCast("anthropic/claude-opus-4.6"),
             .api_key = @constCast("key"),
-            .credential_source = .ai_gateway_api_key,
-            .permission_mode = .ask,
+            .credential_source = .openrouter_api_key,
+            .permission_mode = .yolo,
             .history = self.history[0..],
             .grants = self.grants[0..],
         };
@@ -2184,7 +2228,7 @@ pub fn expectGatewayPromptFinalUserText(gateway: *const FakeGateway, index: usiz
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, gateway.request_bodies.items[index], .{});
     defer parsed.deinit();
 
-    const prompt = parsed.value.object.get("prompt").?.array.items;
+    const prompt = promptMessages(parsed.value) orelse return error.TestExpectedPromptMessageMissing;
     try std.testing.expect(prompt.len > 0);
     var i = prompt.len;
     while (i > 0) {

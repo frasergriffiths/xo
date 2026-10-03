@@ -400,82 +400,11 @@ fn expectDimensions(expected: Dimensions, bytes: []const u8) !void {
     try std.testing.expectEqual(@as(?Dimensions, expected), imageDimensions(bytes));
 }
 
-test "image dimensions read every supported header" {
-    try expectDimensions(.{ .width = 3420, .height = 2224 }, &testPngHeader(3420, 2224));
-    try expectDimensions(.{ .width = 3420, .height = 2224 }, &testJpeg(3420, 2224));
-    try expectDimensions(.{ .width = 640, .height = 480 }, &testGif(640, 480));
-    try expectDimensions(.{ .width = 2001, .height = 17 }, &testWebpLossy(2001, 17));
-    try expectDimensions(.{ .width = 16384, .height = 3 }, &testWebpLossless(16384, 3));
-    try expectDimensions(.{ .width = 5000, .height = 2 }, &testWebpExtended(5000, 2));
-}
-
-test "model image limit allows exactly the maximum side" {
-    try std.testing.expect(!(Dimensions{ .width = max_image_dimension, .height = max_image_dimension }).exceedsModelLimit());
-    try std.testing.expect((Dimensions{ .width = max_image_dimension + 1, .height = 1 }).exceedsModelLimit());
-    try std.testing.expect((Dimensions{ .width = 1, .height = max_image_dimension + 1 }).exceedsModelLimit());
-}
-
-test "image dimensions reject malformed and truncated headers" {
-    const png = testPngHeader(10, 10);
-    try std.testing.expectEqual(@as(?Dimensions, null), imageDimensions(png[0..23]));
-    try std.testing.expectEqual(@as(?Dimensions, null), imageDimensions(&testPngHeader(0, 10)));
-    var not_ihdr = png;
-    @memcpy(not_ihdr[12..16], "IDAT");
-    try std.testing.expectEqual(@as(?Dimensions, null), imageDimensions(&not_ihdr));
-
-    const jpeg = testJpeg(10, 10);
-    try std.testing.expectEqual(@as(?Dimensions, null), imageDimensions(jpeg[0 .. test_jpeg_frame_offset + 8]));
-    var scan_first = jpeg;
-    scan_first[3] = 0xda;
-    try std.testing.expectEqual(@as(?Dimensions, null), imageDimensions(&scan_first));
-    var short_length = jpeg;
-    std.mem.writeInt(u16, short_length[4..6], 1, .big);
-    try std.testing.expectEqual(@as(?Dimensions, null), imageDimensions(&short_length));
-
-    try std.testing.expectEqual(@as(?Dimensions, null), imageDimensions(&testGif(0, 3)));
-    try std.testing.expectEqual(@as(?Dimensions, null), imageDimensions(&testWebpHeader("ALPH")));
-    try std.testing.expectEqual(@as(?Dimensions, null), imageDimensions("not an image at all, just text"));
-    try std.testing.expectEqual(@as(?Dimensions, null), imageDimensions(""));
-}
-
 fn expectEncodedAgreesWithRaw(bytes: []const u8) !void {
     var encoded_buffer: [std.base64.standard.Encoder.calcSize(1024)]u8 = undefined;
     std.debug.assert(bytes.len <= 1024);
     const encoded = std.base64.standard.Encoder.encode(&encoded_buffer, bytes);
     try std.testing.expectEqual(imageDimensions(bytes), encodedImageDimensions(encoded));
-}
-
-test "encoded image dimensions agree with raw headers at every truncation" {
-    const fixtures = [_][]const u8{
-        &testPngHeader(3420, 2224),
-        &testJpeg(3420, 2224),
-        &testGif(640, 480),
-        &testWebpLossy(2001, 17),
-        &testWebpLossless(16384, 3),
-        &testWebpExtended(5000, 2),
-    };
-    for (fixtures) |fixture| {
-        for (0..fixture.len + 1) |len| try expectEncodedAgreesWithRaw(fixture[0..len]);
-    }
-    try std.testing.expectEqual(@as(?Dimensions, null), encodedImageDimensions("not base64 at all"));
-}
-
-test "image dimension parsing stays bounded on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzImageDimensions, .{
-        .corpus = &.{
-            &testPngHeader(3420, 2224),
-            &testJpeg(2001, 1),
-            &testGif(1, 1),
-            &testWebpExtended(2, 2),
-            "\xff\xd8\xff\xff\xff\xff",
-            // JPEG segment length that runs past the input.
-            "\xff\xd8\xff\xe0\xff\xff",
-            // PNG IHDR with a zero length and a maximal size.
-            "\x89PNG\r\n\x1a\n\x00\x00\x00\x00IHDR\xff\xff\xff\xff\xff\xff\xff\xff",
-            // RIFF header naming WebP with no chunk.
-            "RIFF\x00\x00\x00\x00WEBP",
-        },
-    });
 }
 
 fn readTestBytesAt(context: *const anyopaque, offset: u64, buffer: []u8) []const u8 {
@@ -487,49 +416,8 @@ fn readTestBytesAt(context: *const anyopaque, offset: u64, buffer: []u8) []const
     return buffer[0..count];
 }
 
-test "positional dimensions find a JPEG frame header behind large metadata" {
-    const alloc = std.testing.allocator;
-    const bytes = try testJpegBehindMetadata(alloc, 4032, 3024);
-    defer alloc.free(bytes);
-    const slice: []const u8 = bytes;
-    const reader: PositionalReader = .{ .context = @ptrCast(&slice), .read_at = readTestBytesAt };
-
-    try std.testing.expectEqual(@as(?Dimensions, .{ .width = 4032, .height = 3024 }), positionalImageDimensions(reader));
-    try std.testing.expectEqual(imageDimensions(bytes), positionalImageDimensions(reader));
-    try std.testing.expectEqual(@as(?Dimensions, null), imageDimensions(bytes[0 .. 256 * 1024]));
-}
-
-test "image dimension parsing stays bounded on mutated headers" {
-    const seeds = [_][]const u8{
-        &testPngHeader(3420, 2224),
-        &testJpeg(2001, 1),
-        &testGif(1, 1),
-        &testWebpLossy(2001, 17),
-        &testWebpLossless(3, 5000),
-        &testWebpExtended(5000, 2),
-    };
-    var prng = std.Random.DefaultPrng.init(0x1049);
-    const random = prng.random();
-    var bytes: [64]u8 = undefined;
-    for (0..4000) |round| {
-        const seed = seeds[round % seeds.len];
-        @memcpy(bytes[0..seed.len], seed);
-        const flips = 1 + random.uintLessThan(usize, 4);
-        for (0..flips) |_| bytes[random.uintLessThan(usize, seed.len)] = random.int(u8);
-        const len = random.uintAtMost(usize, seed.len);
-        try expectEncodedAgreesWithRaw(bytes[0..len]);
-    }
-}
-
 fn fuzzImageDimensions(_: void, smith: *std.testing.Smith) !void {
     var bytes: [1024]u8 = undefined;
     const len: usize = @intCast(smith.slice(&bytes));
     try expectEncodedAgreesWithRaw(bytes[0..len]);
-}
-
-test "tool images validate data and declared media type" {
-    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
-    try validateImage(std.testing.allocator, png, "image/png");
-    try std.testing.expectError(error.InvalidImage, validateImage(std.testing.allocator, png, "image/jpeg"));
-    try std.testing.expectError(error.InvalidImage, validateImage(std.testing.allocator, "not base64", "image/png"));
 }

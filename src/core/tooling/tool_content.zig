@@ -28,7 +28,7 @@ pub fn parseRichResult(alloc: Allocator, bytes: []const u8, text_limit: usize, i
     return .{ .rich = .{ .text = body, .images = images, .is_error = is_error } };
 }
 
-/// Replaces binary fields in a caller-owned parsed MCP block with delivery notes.
+/// Replaces binary fields in a caller-owned parsed rich-result block with delivery notes.
 /// Images themselves travel through the typed result, never JSON text.
 pub fn projectMediaForText(alloc: std.mem.Allocator, content: *std.json.Value) std.mem.Allocator.Error!void {
     if (content.* == .array) {

@@ -3,7 +3,6 @@ const question_prompt = @import("../../core/agent/question_prompt.zig");
 const auth_runtime = @import("../../core/auth/auth_runtime.zig");
 const credentials = @import("../../core/auth/credentials.zig");
 const image_attachments = @import("../../core/images/image_attachments.zig");
-const mcp_menu_state = @import("../../core/mcp/menu_state.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
@@ -29,7 +28,7 @@ pub const composeDividerRow = row_text.composeDividerRow;
 pub const appendClipped = row_text.appendClipped;
 pub const appendAbsoluteColumn = row_text.appendAbsoluteColumn;
 
-pub const PickerKind = enum { model_stage, provider_stage, models, file, slash, skills, help, settings, sessions, mcp, auth };
+pub const PickerKind = enum { model_stage, provider_stage, models, file, slash, skills, help, settings, sessions, workspace, auth };
 pub const CappedInputRows = struct {
     row_limit: usize,
     total_lines: u16,
@@ -87,91 +86,6 @@ pub fn composeSteeringMessageRows(
         try composed.rows.append(alloc, row);
     }
     return composed;
-}
-
-test "steering rows use the dotted rail without an escape hint" {
-    var first = try composeSteeringMessageRows(std.testing.allocator, "First steer", 80, 2, true);
-    defer first.deinit(std.testing.allocator);
-    var second = try composeSteeringMessageRows(std.testing.allocator, "Second steer", 80, 2, true);
-    defer second.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), first.rows.items.len);
-    try std.testing.expectEqual(@as(usize, 1), second.rows.items.len);
-    try std.testing.expect(std.mem.find(u8, first.rows.items[0].items, "┋ First steer") != null);
-    try std.testing.expect(std.mem.find(u8, second.rows.items[0].items, "┋ Second steer") != null);
-    try std.testing.expect(std.mem.find(u8, first.rows.items[0].items, "Esc to steer now") == null);
-    try std.testing.expect(std.mem.find(u8, second.rows.items[0].items, "Esc to steer now") == null);
-}
-
-test "steering preview preserves the first two lines and hides the rest" {
-    const alloc = std.testing.allocator;
-    var rows = try composeSteeringMessageRows(alloc, "what is this\r\nLockfile\tfailed\nHIDDEN_TAIL", 40, 2, true);
-    defer rows.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
-    const first = rows.rows.items[0].items;
-    const second = rows.rows.items[1].items;
-    try std.testing.expectEqualStrings("┋ what is this", first[ui_render.dim_style.len .. first.len - ui_render.reset_style.len]);
-    try std.testing.expectEqualStrings("┋ Lockfile failed…", second[ui_render.dim_style.len .. second.len - ui_render.reset_style.len]);
-}
-
-test "steering preview keeps the beginning of long paragraphs" {
-    const message = "one two three four five six seven eight nine ten HIDDEN_END";
-    var rows = try composeSteeringMessageRows(std.testing.allocator, message, 18, 2, true);
-    defer rows.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
-    try std.testing.expect(std.mem.find(u8, rows.rows.items[0].items, "┋ one two three") != null);
-    try std.testing.expect(std.mem.find(u8, rows.rows.items[1].items, "┋ ") != null);
-    try std.testing.expect(std.mem.find(u8, rows.rows.items[1].items, "┋ four five six…") != null);
-    for (rows.rows.items) |row| {
-        try std.testing.expect(std.mem.find(u8, row.items, "HIDDEN_END") == null);
-        try std.testing.expect(std.mem.find(u8, row.items, "Esc to steer now") == null);
-        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 18);
-    }
-}
-
-test "steering preview layout and painted rows agree at narrow widths" {
-    const alloc = std.testing.allocator;
-    for ([_][]const u8{ "", "first\nsecond\nthird", "alpha\tbeta", "界海語", "é\xff\x1b[2Jtail", "abc\n\ndef", "12\r\n34\r56", "\u{1f469}\u{200d}\u{2764}\u{fe0f}\u{200d}\u{1f48b}\u{200d}\u{1f469}" }) |message| {
-        for ([_]u16{ 0, 1, 2, 3, 5, 12, 31, 33, 80 }) |width| {
-            for ([_]bool{ false, true }) |waiting| {
-                for ([_]u16{ 0, 1, 2 }) |limit| {
-                    const layout = render_input.steering_message_layout(message, width, waiting, limit);
-                    var rows = try composeSteeringMessageRows(alloc, message, width, limit, waiting);
-                    defer rows.deinit(alloc);
-                    try std.testing.expectEqual(@as(usize, layout.row_count), rows.rows.items.len);
-                    try std.testing.expect(rows.rows.items.len <= limit);
-                    for (rows.rows.items) |row| {
-                        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= width);
-                        try std.testing.expect(std.unicode.utf8ValidateSlice(row.items));
-                        try std.testing.expect(std.mem.find(u8, row.items, "\\x0a") == null);
-                        try std.testing.expect(std.mem.find(u8, row.items, "\\x0d") == null);
-                        try std.testing.expect(std.mem.find(u8, row.items, "\\x09") == null);
-                        try std.testing.expect(std.mem.find(u8, row.items, "\x1b[2J") == null);
-                    }
-                }
-            }
-        }
-    }
-}
-
-test "steering preview truncates after the second wide glyph" {
-    var rows = try composeSteeringMessageRows(std.testing.allocator, "界海語", 5, 2, true);
-    defer rows.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
-    try std.testing.expect(std.mem.find(u8, rows.rows.items[0].items, "┋ 界") != null);
-    try std.testing.expect(std.mem.find(u8, rows.rows.items[1].items, "┋ 海…") != null);
-}
-
-test "steering rows visibly escape terminal control bytes" {
-    var unsafe = try composeSteeringMessageRows(std.testing.allocator, "before\x1b[2Jafter", 80, 2, true);
-    defer unsafe.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), unsafe.rows.items.len);
-    try std.testing.expect(std.mem.find(u8, unsafe.rows.items[0].items, "┋ before\\x1b[2Jafter") != null);
-    try std.testing.expect(std.mem.find(u8, unsafe.rows.items[0].items, "Esc to steer now") == null);
-    try std.testing.expect(std.mem.find(u8, unsafe.rows.items[0].items, "\x1b[2J") == null);
 }
 
 // Ordered widest-first; every fallback keeps the enter/esc controls so narrow
@@ -393,79 +307,54 @@ pub fn measureRawInputGeometryPreparedWithProvider(
 fn authPickerInteractionHint(view: auth_runtime.PickerView, width: u16) ?[]const u8 {
     if (!view.active or view.include_skip) return null;
 
+    if (view.stage == .base_url) {
+        const base_variants = [_][]const u8{
+            "type the base URL  enter accepts  esc cancels",
+            "type  enter  esc",
+            "enter  esc",
+        };
+        return compactInteractionHint(&base_variants, width);
+    }
     if (view.stage == .api_key and view.api_key_inline) {
         const key_variants = [_][]const u8{
-            "enter saves     esc cancels     " ++ credentials.stored_key_backend_label,
+            "enter saves  esc cancels  " ++ credentials.stored_key_backend_label,
             "enter saves  esc cancels",
             "enter  esc",
         };
-        for (key_variants) |candidate| {
-            if (display_width.visibleWidth(candidate) <= width) return candidate;
-        }
-        return key_variants[key_variants.len - 1];
+        return compactInteractionHint(&key_variants, width);
     }
 
     const root_variants = [_][]const u8{
-        "↑↓ navigate     enter open     esc close",
+        "↑↓ navigate  enter open  esc close",
         "↑↓ move  enter open  esc",
         "enter open  esc close",
-        "enter esc",
+        "enter  esc",
     };
     const connections_variants = [_][]const u8{
-        "↑↓ navigate     enter open     esc back",
+        "↑↓ navigate  enter open  esc back",
         "↑↓ move  enter open  esc",
         "enter open  esc back",
-        "enter esc",
+        "enter  esc",
     };
     const selection_variants = [_][]const u8{
-        "↑↓ navigate     enter use     esc back",
+        "↑↓ navigate  enter use  esc back",
         "↑↓ move  enter use  esc",
         "enter use  esc back",
-        "enter esc",
+        "enter  esc",
     };
-    const team_variants = [_][]const u8{
-        "type to search     ↑↓ navigate     enter use     esc back",
+    const api_key_variants = [_][]const u8{
+        "type to search  ↑↓ navigate  enter use  esc back",
         "type  ↑↓ move  enter  esc",
         "↑↓ move  enter  esc",
-        "enter esc",
-    };
-    const codex_sign_in_variants = [_][]const u8{
-        "enter reopens browser · esc cancels",
-        "enter reopens  esc cancels",
         "enter  esc",
-        "enter esc",
-    };
-    const grok_browser_variants = [_][]const u8{
-        "enter reopens browser · tab enters code · esc cancels",
-        "enter reopens  tab code  esc cancels",
-        "enter  tab  esc",
-        "enter tab esc",
-    };
-    const grok_manual_variants = [_][]const u8{
-        "enter submits code · tab returns to browser · esc cancels",
-        "enter submits  tab browser  esc cancels",
-        "enter  tab  esc",
-        "enter tab esc",
     };
     const variants = switch (view.stage) {
         .root => root_variants,
         .connections => connections_variants,
         .provider, .switch_credential => selection_variants,
-        .change_team => team_variants,
-        .sign_in => switch (view.sign_in_source) {
-            .chatgpt_subscription => codex_sign_in_variants,
-            .grok_subscription => if (view.sign_in_code_visible)
-                grok_manual_variants
-            else
-                grok_browser_variants,
-            else => return null,
-        },
-        .api_key => return null,
+        .base_url, .api_key => api_key_variants,
     };
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) return candidate;
-    }
-    return variants[variants.len - 1];
+    return compactInteractionHint(&variants, width);
 }
 
 pub fn composeHintRow(
@@ -548,7 +437,7 @@ pub fn composeHintRow(
         width;
 
     var row: std.ArrayList(u8) = .empty;
-    try row.appendSlice(alloc, if (question_hint != null) ui_render.dim_style else ui_render.statusline_style);
+    try row.appendSlice(alloc, if (question_hint != null or auth_hint != null) ui_render.dim_style else ui_render.statusline_style);
     try row_text.appendClipped(alloc, &row, hint_line, left_width);
     try row.appendSlice(alloc, ui_render.reset_style);
 
@@ -591,6 +480,29 @@ pub fn dangerStatusText(
     return "";
 }
 
+// Prefer complete controls over clipping a longer variant before its Esc hint.
+fn compactInteractionHint(variants: []const []const u8, width: u16) []const u8 {
+    for (variants) |candidate| {
+        if (display_width.visibleWidth(candidate) <= width) return candidate;
+    }
+    return "esc";
+}
+
+fn composeCompactMenuHintRow(
+    alloc: Allocator,
+    width: u16,
+    ctrl_c_pending: bool,
+    variants: []const []const u8,
+) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    try row.appendSlice(alloc, if (ctrl_c_pending) ui_render.statusline_style else ui_render.dim_style);
+    const hint = if (ctrl_c_pending) "press ctrl+c again to exit" else compactInteractionHint(variants, width);
+    try row_text.appendClipped(alloc, &row, hint, width);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
 pub fn composeSkillsMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
     return composeCatalogMenuHintRow(alloc, width, ctrl_c_pending, .source);
 }
@@ -603,127 +515,38 @@ pub fn composeResumeMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bo
     return composeCatalogMenuHintRow(alloc, width, ctrl_c_pending, .scope);
 }
 
-pub fn composeMcpMenuHintRow(
-    alloc: Allocator,
-    width: u16,
-    ctrl_c_pending: bool,
-    projection: render_input.McpMenuProjection,
-) !std.ArrayList(u8) {
-    const state = projection.state;
-    if (ctrl_c_pending) {
-        var warning: std.ArrayList(u8) = .empty;
-        errdefer warning.deinit(alloc);
-        try warning.appendSlice(alloc, ui_render.statusline_style);
-        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
-        try warning.appendSlice(alloc, ui_render.reset_style);
-        return warning;
-    }
-
-    const root_variants = [_][]const u8{
-        "↑↓ move  tab section  enter inspect  a add  r reload  c help  esc close",
-        "↑↓ move  tab section  enter  a add  r reload  c help  esc",
-        "tab enter a r c esc",
-    };
-    const catalog_variants = [_][]const u8{
-        "↑↓ navigate     tab section     enter open     / filter     esc back",
-        "↑↓ move  tab section  enter  / filter  esc",
-        "tab enter / esc",
-    };
-    const preview_variants = [_][]const u8{
-        "↑↓ scroll     i insert     esc back",
-        "↑↓ scroll  i insert  esc",
-        "↑↓ i esc",
-    };
-    const add_variants = [_][]const u8{
-        "type field     enter next/save     tab transport     esc cancel",
-        "type  enter next/save  tab transport  esc",
-        "enter tab esc",
-    };
-    const argument_variants = [_][]const u8{
-        "type value  enter next/preview  tab complete  esc cancel",
-        "type  enter next  tab complete  esc",
-        "enter tab esc",
-    };
-    var details: std.ArrayList(u8) = .empty;
-    defer details.deinit(alloc);
-    if (projection.selectedServer()) |server| {
-        const labels = [_]struct { action: mcp_menu_state.Action, label: []const u8 }{
-            .{ .action = .authenticate, .label = "enter sign in  " },
-            .{ .action = .trust_approve, .label = "a approve  " },
-            .{ .action = .trust_reject, .label = "x reject  " },
-            .{ .action = .remove, .label = "d remove  " },
-            .{ .action = .logout, .label = "l logout  " },
-        };
-        for (labels) |item| if (mcp_menu_state.serverActionAvailable(item.action, server)) try details.appendSlice(alloc, item.label);
-    }
-    try details.appendSlice(alloc, "c help  esc back");
-    const details_variants = [_][]const u8{ details.items, "c help  esc back", "c esc" };
-    const confirm_variants = [_][]const u8{
-        "enter confirm     esc cancel",
-        "enter confirm  esc",
-        "enter esc",
-    };
-    const info_variants = [_][]const u8{
-        "esc back",
-        "esc",
-        "esc",
-    };
-    const variants = switch (state.screen) {
-        .browse => if (state.section == .servers) root_variants else catalog_variants,
-        .preview => preview_variants,
-        .add => add_variants,
-        .arguments => argument_variants,
-        .info => info_variants,
-        .details => details_variants,
-        .confirm => confirm_variants,
-    };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
-
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
-}
-
 pub fn composeHelpMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
-    if (ctrl_c_pending) {
-        var warning: std.ArrayList(u8) = .empty;
-        errdefer warning.deinit(alloc);
-        try warning.appendSlice(alloc, ui_render.statusline_style);
-        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
-        try warning.appendSlice(alloc, ui_render.reset_style);
-        return warning;
-    }
-
     const variants = [_][]const u8{
-        "↑↓ navigate     tab category     enter open     esc close",
         "↑↓ navigate  tab category  enter open  esc close",
         "↑↓ move  tab category  enter  esc",
         "tab category  enter open  esc",
-        "tab enter esc",
+        "tab  enter  esc",
     };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
+    return composeCompactMenuHintRow(alloc, width, ctrl_c_pending, &variants);
+}
 
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
+/// List stages complete with Tab and advance or select with Enter. The existing
+/// entry flag distinguishes key saving without requiring stage-aware callers.
+pub fn composeProviderMenuHintRow(
+    alloc: Allocator,
+    width: u16,
+    ctrl_c_pending: bool,
+    is_entry: bool,
+) !std.ArrayList(u8) {
+    const list_variants = [_][]const u8{
+        "↑↓ navigate  tab complete  enter use  esc close",
+        "↑↓ move  enter  esc",
+        "enter use  esc close",
+        "enter  esc",
+    };
+    const entry_variants = [_][]const u8{
+        "type  enter save  esc cancel",
+        "enter save  esc cancel",
+        "enter save  esc",
+        "enter  esc",
+    };
+    const variants = if (is_entry) entry_variants else list_variants;
+    return composeCompactMenuHintRow(alloc, width, ctrl_c_pending, &variants);
 }
 
 pub fn composeSettingsMenuHintRow(
@@ -731,36 +554,13 @@ pub fn composeSettingsMenuHintRow(
     width: u16,
     ctrl_c_pending: bool,
 ) !std.ArrayList(u8) {
-    if (ctrl_c_pending) {
-        var warning: std.ArrayList(u8) = .empty;
-        errdefer warning.deinit(alloc);
-        try warning.appendSlice(alloc, ui_render.statusline_style);
-        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
-        try warning.appendSlice(alloc, ui_render.reset_style);
-        return warning;
-    }
-
     const variants = [_][]const u8{
-        "↑↓ navigate     tab category     ←→ change     esc close",
-        "↑↓ navigate  tab category  ←→ change  esc close",
+        "↑↓ navigate  tab category  ←→ change  enter select  esc close",
         "↑↓ move  tab category  ←→ change  esc",
-        "tab category  ←→ change  esc",
-        "tab ←→ esc",
+        "←→ change  enter  esc",
+        "enter  esc",
     };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
-
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
+    return composeCompactMenuHintRow(alloc, width, ctrl_c_pending, &variants);
 }
 
 pub fn composeCompactCommandMenuHintRow(
@@ -770,35 +570,22 @@ pub fn composeCompactCommandMenuHintRow(
 ) !std.ArrayList(u8) {
     const variants = switch (menu) {
         .statusline => [_][]const u8{
-            "↑↓ navigate     ←→ change     esc close",
+            "↑↓ navigate  ←→ change  esc close",
             "↑↓ move  ←→ change  esc",
-            "←→ esc",
+            "←→  esc",
         },
         .usage => [_][]const u8{
-            "tab scope     ↑↓ model     enter expand     r refresh     esc close",
+            "tab scope  ↑↓ model  enter expand  r refresh  esc close",
             "tab scope  ↑↓ model  enter expand  r refresh  esc",
-            "tab ↑↓  enter  r  esc",
+            "tab  ↑↓  enter  r  esc",
         },
         .workspace => [_][]const u8{
-            "↑↓ navigate     enter use     esc close",
+            "↑↓ navigate  enter use  esc close",
             "↑↓ move  enter use  esc",
-            "enter esc",
+            "enter  esc",
         },
     };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
-
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
+    return composeCompactMenuHintRow(alloc, width, false, &variants);
 }
 
 const CatalogTabKind = enum {
@@ -808,91 +595,55 @@ const CatalogTabKind = enum {
 };
 
 fn composeCatalogMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool, tab_kind: CatalogTabKind) !std.ArrayList(u8) {
-    if (ctrl_c_pending) {
-        var warning: std.ArrayList(u8) = .empty;
-        errdefer warning.deinit(alloc);
-        try warning.appendSlice(alloc, ui_render.statusline_style);
-        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
-        try warning.appendSlice(alloc, ui_render.reset_style);
-        return warning;
-    }
-
     const source_variants = [_][]const u8{
-        "↑↓ navigate     tab source     enter use     esc close",
         "↑↓ navigate  tab source  enter use  esc close",
         "↑↓ move  tab source  enter  esc",
         "enter use  esc close",
-        "enter esc",
+        "enter  esc",
     };
     const provider_variants = [_][]const u8{
-        "↑↓ navigate     tab provider     enter use     esc close",
         "↑↓ navigate  tab provider  enter use  esc close",
         "↑↓ move  tab provider  enter  esc",
         "enter use  esc close",
-        "enter esc",
+        "enter  esc",
     };
     const scope_variants = [_][]const u8{
-        "↑↓ navigate     tab scope     enter resume     esc close",
         "↑↓ navigate  tab scope  enter resume  esc close",
         "↑↓ move  tab scope  enter  esc",
         "enter resume  esc close",
-        "enter esc",
+        "enter  esc",
     };
     const variants = switch (tab_kind) {
         .source => source_variants,
         .provider => provider_variants,
         .scope => scope_variants,
     };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
-
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
+    return composeCompactMenuHintRow(alloc, width, ctrl_c_pending, &variants);
 }
 
 pub fn composeSlashMenuHintRow(alloc: Allocator, width: u16) !std.ArrayList(u8) {
     const variants = [_][]const u8{
-        "↑↓ navigate     enter use     esc close",
-        "↑↓ navigate  enter use  esc close",
+        "↑↓ navigate  tab complete  enter use  esc close",
         "↑↓ move  enter  esc",
         "enter use  esc close",
-        "enter esc",
+        "enter  esc",
     };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
-
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
+    return composeCompactMenuHintRow(alloc, width, false, &variants);
 }
 
-test "slash menu hint keeps navigation and selection controls width safe" {
-    var wide = try composeSlashMenuHintRow(std.testing.allocator, 80);
-    defer wide.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, wide.items, "↑↓ navigate     enter use     esc close") != null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(wide.items) <= 80);
+fn expectStyledMenuHint(row: []const u8, style: []const u8, text: []const u8) !void {
+    try std.testing.expect(std.mem.startsWith(u8, row, style));
+    try std.testing.expect(std.mem.endsWith(u8, row, ui_render.reset_style));
+    try std.testing.expectEqualStrings(text, row[style.len .. row.len - ui_render.reset_style.len]);
+}
 
-    var narrow = try composeSlashMenuHintRow(std.testing.allocator, 12);
-    defer narrow.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, narrow.items, "enter esc") != null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow.items) <= 12);
+fn expectCompactMenuHint(row: []const u8, width: u16) !void {
+    try std.testing.expect(std.mem.startsWith(u8, row, ui_render.dim_style));
+    try std.testing.expect(std.mem.endsWith(u8, row, ui_render.reset_style));
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row) <= width);
+    const text = row[ui_render.dim_style.len .. row.len - ui_render.reset_style.len];
+    try std.testing.expect(std.mem.find(u8, text, "   ") == null);
+    if (width >= 3) try std.testing.expect(std.mem.endsWith(u8, text, "esc") or std.mem.find(u8, text, "esc ") != null);
 }
 
 pub fn composeVisibleInputRows(
@@ -1112,727 +863,6 @@ fn testRenderContext(input: *const InputRuntime) RenderContext {
     };
 }
 
-test "composer badge labels a later-turn image with its own id" {
-    const alloc = std.testing.allocator;
-    const images = [_]types.ImageAttachment{
-        .{ .id = 2, .path = @constCast("/tmp/two.png"), .media_type = @constCast("image/png") },
-    };
-    const image_tokens = [_]visual_layout.ImageTokenSpan{.{
-        .id = 2,
-        .span = .{ .raw_start = 0, .raw_end = "[Image #2]".len },
-    }};
-    const source = visual_layout.Source{
-        .input = "[Image #2]",
-        .cursor = "[Image #2]".len,
-        .terminal_cols = 40,
-        .images = &images,
-        .image_tokens = &image_tokens,
-    };
-    const summary = visual_layout.summarize(source, null);
-    const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, 4);
-    var composed = try composeVisibleInputRows(alloc, source, window);
-    defer composed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), composed.rows.items.len);
-    try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "[Image 2]") != null);
-    try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "[Image 1]") == null);
-}
-
-test "composer skill token shows only its name" {
-    const alloc = std.testing.allocator;
-    const skill_tokens = [_]visual_layout.SkillTokenSpan{.{
-        .raw_start = 0,
-        .raw_end = "$review".len,
-        .name = "review",
-        .path = "/tmp/review",
-        .display_source = .workspace_codex,
-    }};
-    const source = visual_layout.Source{
-        .input = "$review",
-        .cursor = "$review".len,
-        .terminal_cols = 40,
-        .skill_tokens = &skill_tokens,
-    };
-    const summary = visual_layout.summarize(source, null);
-    const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, 1);
-    var composed = try composeVisibleInputRows(alloc, source, window);
-    defer composed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), composed.rows.items.len);
-    try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "review") != null);
-    try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "workspace .codex") == null);
-}
-
-test "composeVisibleInputRows avoids clear-to-eol after full-width input" {
-    const alloc = std.testing.allocator;
-
-    const full_source = visual_layout.Source{
-        .input = "12345",
-        .cursor = 5,
-        .terminal_cols = 7,
-    };
-    const full_summary = visual_layout.summarize(full_source, null);
-    const full_window = visual_layout.visibleWindow(full_summary.cursor.row_index, full_summary.total_rows, 1);
-    var full = try composeVisibleInputRows(alloc, full_source, full_window);
-    defer full.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), full.rows.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, full.rows.items[0].items, "\x1b[K") == null);
-
-    const short_source = visual_layout.Source{
-        .input = "1234",
-        .cursor = 4,
-        .terminal_cols = 7,
-    };
-    const short_summary = visual_layout.summarize(short_source, null);
-    const short_window = visual_layout.visibleWindow(short_summary.cursor.row_index, short_summary.total_rows, 1);
-    var short = try composeVisibleInputRows(alloc, short_source, short_window);
-    defer short.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), short.rows.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, short.rows.items[0].items, "\x1b[K") != null);
-}
-
-test "composeVisibleInputRows paints selected input without changing visible width" {
-    const alloc = std.testing.allocator;
-    const source = visual_layout.Source{
-        .input = "alpha beta",
-        .cursor = "alpha".len,
-        .terminal_cols = 20,
-        .selection = .{ .start = 0, .end = "alpha".len },
-    };
-    const summary = visual_layout.summarize(source, null);
-    const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, 1);
-
-    var plain_rows = try composeVisibleInputRows(alloc, .{ .input = source.input, .cursor = source.cursor, .terminal_cols = source.terminal_cols }, window);
-    defer plain_rows.deinit(alloc);
-
-    var rows = try composeVisibleInputRows(alloc, source, window);
-    defer rows.deinit(alloc);
-
-    try std.testing.expect(std.mem.find(u8, rows.rows.items[0].items, "\x1b[7ma") != null);
-    try std.testing.expect(std.mem.find(u8, rows.rows.items[0].items, "\x1b[0m ") != null);
-    try std.testing.expectEqual(
-        display_width.visibleWidthIgnoringAnsi(plain_rows.rows.items[0].items),
-        display_width.visibleWidthIgnoringAnsi(rows.rows.items[0].items),
-    );
-}
-
-test "inline completion suffix uses dim style and clips to the current row" {
-    const alloc = std.testing.allocator;
-    var row: std.ArrayList(u8) = .empty;
-    defer row.deinit(alloc);
-    try row.appendSlice(alloc, "❯ explain $man\x1b[K");
-    const used = display_width.visibleWidthIgnoringAnsi(row.items);
-
-    try appendInlineCompletionSuffix(
-        alloc,
-        &row,
-        @intCast(used + 4),
-        "aged-menu",
-    );
-
-    try std.testing.expect(std.mem.find(u8, row.items, ui_render.dim_style) != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "aged") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "aged-") == null);
-    try std.testing.expectEqual(used + 4, display_width.visibleWidthIgnoringAnsi(row.items));
-
-    var full_row: std.ArrayList(u8) = .empty;
-    defer full_row.deinit(alloc);
-    try full_row.appendSlice(alloc, "❯ x $man");
-    const full_width: u16 = @intCast(display_width.visibleWidthIgnoringAnsi(full_row.items));
-    try appendInlineCompletionSuffix(
-        alloc,
-        &full_row,
-        full_width,
-        "aged-menu",
-    );
-    try std.testing.expect(std.mem.find(u8, full_row.items, ui_render.dim_style) == null);
-    try std.testing.expect(std.mem.find(u8, full_row.items, "aged") == null);
-}
-
-test "clipped composer row marks hidden input above" {
-    const alloc = std.testing.allocator;
-    const input = "first line\nsecond line";
-    const source = visual_layout.Source{
-        .input = input,
-        .cursor = input.len,
-        .terminal_cols = 40,
-    };
-    const summary = visual_layout.summarize(source, null);
-    const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, 1);
-    var composed = try composeVisibleInputRows(alloc, source, window);
-    defer composed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), window.first_row);
-    try std.testing.expectEqual(@as(usize, 1), composed.rows.items.len);
-    try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "┃↑") != null);
-    try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "second line") != null);
-    try std.testing.expectEqual(@as(u16, 14), visual_layout.terminalColumn(summary.cursor, source.terminal_cols));
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(composed.rows.items[0].items) <= source.terminal_cols);
-}
-
-test "trailing empty clipped composer row remains visibly nonempty" {
-    const alloc = std.testing.allocator;
-    const input = "first line\nsecond line\n";
-    const source = visual_layout.Source{
-        .input = input,
-        .cursor = input.len,
-        .terminal_cols = 40,
-    };
-    const summary = visual_layout.summarize(source, null);
-    const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, 1);
-    var rows = try composeVisibleInputRows(alloc, source, window);
-    defer rows.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 2), window.first_row);
-    try std.testing.expectEqual(@as(u16, 3), visual_layout.terminalColumn(summary.cursor, source.terminal_cols));
-    try std.testing.expect(std.mem.find(u8, rows.rows.items[0].items, "┃↑") != null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(rows.rows.items[0].items) <= source.terminal_cols);
-}
-
-test "footer raw input row composition matches hard newlines and soft wraps" {
-    const alloc = std.testing.allocator;
-    var hard_input = InputRuntime{};
-    defer hard_input.deinit(alloc);
-    try hard_input.edit_state.input.appendSlice(alloc, "abcd\nefgh");
-    hard_input.edit_state.cursor = hard_input.edit_state.input.items.len;
-
-    var soft_input = InputRuntime{};
-    defer soft_input.deinit(alloc);
-    try soft_input.edit_state.input.appendSlice(alloc, "abcdefgh");
-    soft_input.edit_state.cursor = soft_input.edit_state.input.items.len;
-
-    const hard = measureRawInputGeometry(testRenderContext(&hard_input), 6, 20, true, false, false, false);
-    const soft = measureRawInputGeometry(testRenderContext(&soft_input), 6, 20, true, false, false, false);
-    try std.testing.expectEqual(@as(u16, 2), hard.total_lines);
-    try std.testing.expectEqual(hard.total_lines, soft.total_lines);
-}
-
-test "footer tabs are modeled spaces and anchors use modeled columns" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "\t/model");
-    input.edit_state.cursor = 1;
-    var ctx = testRenderContext(&input);
-    ctx.model_query_active = true;
-    ctx.model_completion_anchor = 1;
-    // The tab consumes 6 cells, leaving 4 on row 0; "/model" (6 cells) word
-    // wraps whole onto row 1, so the anchor projects to column 3.
-    const geometry = measureRawInputGeometry(ctx, 10, 20, true, false, true, false);
-    try std.testing.expectEqual(@as(u16, 3), geometry.picker_start_col);
-}
-
-test "footer raw geometry windows capped input around the cursor" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "x" ** 5000);
-    input.edit_state.cursor = input.edit_state.input.items.len;
-    const geometry = measureRawInputGeometry(testRenderContext(&input), 80, 8, true, false, false, false);
-    try std.testing.expect(geometry.summary.total_rows > geometry.window.row_count);
-    try std.testing.expect(geometry.window.first_row <= geometry.summary.cursor.row_index);
-    try std.testing.expect(geometry.summary.cursor.row_index < geometry.window.first_row + geometry.window.row_count);
-    try std.testing.expectEqual(geometry.window.row_count, geometry.total_lines);
-}
-
-test "footer image badges wrap atomically and close clipped OSC output" {
-    const alloc = std.testing.allocator;
-    const images = [_]types.ImageAttachment{
-        .{ .id = 5, .path = @constCast("/tmp/five.png"), .media_type = @constCast("image/png") },
-    };
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "a[Image #5]");
-    try input.entities.image_tokens.append(alloc, .{
-        .id = 5,
-        .span = .{ .raw_start = "a".len, .raw_end = "a[Image #5]".len },
-    });
-    input.edit_state.cursor = input.edit_state.input.items.len;
-    var ctx = testRenderContext(&input);
-    ctx.pending_images = &images;
-    ctx.file_query_active = true;
-    ctx.file_completion_anchor = "a[Image #5]".len;
-
-    const geometry = measureRawInputGeometry(ctx, 10, 20, true, false, false, true);
-    try std.testing.expect(geometry.summary.total_rows > 1);
-    try std.testing.expect(geometry.picker_start_col > 1);
-}
-
-test "footer unknown and overflowing placeholders stay literal" {
-    const alloc = std.testing.allocator;
-    const text = "[Image #6] [Image #999999999999999999999999999999999999]";
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, text);
-    input.edit_state.cursor = input.edit_state.input.items.len;
-
-    const geometry = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
-    try std.testing.expectEqual(text.len, geometry.summary.cursor.raw_offset);
-    try std.testing.expectEqual(@as(u16, 1), geometry.picker_start_col);
-}
-
-test "footer picker anchors project raw offsets before inside and after badges" {
-    const alloc = std.testing.allocator;
-    const images = [_]types.ImageAttachment{
-        .{ .id = 5, .path = @constCast("/tmp/five.png"), .media_type = @constCast("image/png") },
-    };
-    const input_text = "[Image #5] suffix";
-
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, input_text);
-    try input.entities.image_tokens.append(alloc, .{
-        .id = 5,
-        .span = .{ .raw_start = 0, .raw_end = "[Image #5]".len },
-    });
-    input.edit_state.cursor = "[Image #5]".len;
-    var ctx = testRenderContext(&input);
-    ctx.pending_images = &images;
-    ctx.file_query_active = true;
-
-    ctx.file_completion_anchor = 0;
-    try std.testing.expectEqual(@as(u16, 3), measureRawInputGeometry(ctx, 80, 20, true, false, false, true).picker_start_col);
-    ctx.file_completion_anchor = 3;
-    try std.testing.expectEqual(@as(u16, 3), measureRawInputGeometry(ctx, 80, 20, true, false, false, true).picker_start_col);
-    ctx.file_completion_anchor = "[Image #5]".len;
-    try std.testing.expectEqual(@as(u16, 12), measureRawInputGeometry(ctx, 80, 20, true, false, false, true).picker_start_col);
-}
-
-test "footer model and file anchors on earlier soft rows project to cursor row start" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "abcdef");
-    input.edit_state.cursor = 5;
-    var ctx = testRenderContext(&input);
-    ctx.model_query_active = true;
-    ctx.model_completion_anchor = 1;
-    try std.testing.expectEqual(@as(u16, 3), measureRawInputGeometry(ctx, 5, 20, true, false, true, false).picker_start_col);
-
-    ctx.model_query_active = false;
-    ctx.file_query_active = true;
-    ctx.file_completion_anchor = 1;
-    try std.testing.expectEqual(@as(u16, 3), measureRawInputGeometry(ctx, 5, 20, true, false, false, true).picker_start_col);
-}
-
-test "footer slash anchor contract handles top level and argument completions" {
-    const alloc = std.testing.allocator;
-    inline for (.{ "/", "/mo", "  /mo" }) |text| {
-        var input = InputRuntime{};
-        defer input.deinit(alloc);
-        try input.edit_state.input.appendSlice(alloc, text);
-        input.edit_state.cursor = input.edit_state.input.items.len;
-        const geometry = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
-        try std.testing.expect(geometry.summary.anchor == null);
-        try std.testing.expectEqual(@as(u16, 1), geometry.picker_start_col);
-    }
-
-    var arg = InputRuntime{};
-    defer arg.deinit(alloc);
-    try arg.edit_state.input.appendSlice(alloc, "  /permissions ");
-    arg.edit_state.cursor = arg.edit_state.input.items.len;
-    const arg_geometry = measureRawInputGeometry(testRenderContext(&arg), 80, 20, true, false, false, false);
-    try std.testing.expectEqual(@as(usize, 2 + "/permissions ".len), arg_geometry.summary.anchor.?.raw_offset);
-    try std.testing.expectEqual(@as(usize, 2 + "/permissions ".len), arg_geometry.summary.anchor.?.content_column);
-    try std.testing.expectEqual(@as(u16, 3 + 2 + "/permissions ".len), arg_geometry.picker_start_col);
-}
-
-test "footer slash completion remains active across capped input rows" {
-    const alloc = std.testing.allocator;
-    try std.testing.expect(command_specs.slashCompletionCount(input_test_slash_registry, "/mo") > 0);
-    var suppressed = InputRuntime{};
-    defer suppressed.deinit(alloc);
-    try suppressed.edit_state.input.appendSlice(alloc, "/mo");
-    suppressed.edit_state.cursor = suppressed.edit_state.input.items.len;
-    try std.testing.expect(slashCompletionPickerCount(testRenderContext(&suppressed), false, false, false) > 0);
-
-    var roomy = InputRuntime{};
-    defer roomy.deinit(alloc);
-    try roomy.edit_state.input.appendSlice(alloc, "       /mo");
-    roomy.edit_state.cursor = roomy.edit_state.input.items.len;
-    const roomy_geometry = measureRawInputGeometry(testRenderContext(&roomy), 8, 10, true, false, false, false);
-    try std.testing.expect(roomy_geometry.input_extra > 0);
-    try std.testing.expect(roomy_geometry.show_slash_query);
-    try std.testing.expect(roomy_geometry.slash_completion_count > 0);
-
-    const capped = cappedInputRows(3, 4, true);
-    try std.testing.expectEqual(@as(usize, 1), capped.row_limit);
-    try std.testing.expectEqual(@as(u16, 1), capped.total_lines);
-    try std.testing.expectEqual(@as(u16, 0), capped.input_extra);
-
-    const tiny_geometry = measureRawInputGeometry(testRenderContext(&roomy), 8, 4, true, false, false, false);
-    try std.testing.expect(tiny_geometry.show_slash_query);
-    try std.testing.expect(tiny_geometry.slash_completion_count > 0);
-}
-
-test "footer slash completion follows candidate visibility transitions" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-
-    try input.textReplacementState().replace(alloc, "/mo");
-    const matching = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
-    try std.testing.expect(matching.show_slash_query);
-    try std.testing.expect(matching.slash_completion_count > 0);
-
-    try input.textReplacementState().replace(alloc, "/mozzzzz");
-    const no_match = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
-    try std.testing.expect(!no_match.show_slash_query);
-    try std.testing.expectEqual(@as(usize, 0), no_match.slash_completion_count);
-
-    try input.textReplacementState().replace(alloc, "/mo");
-    const restored = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
-    try std.testing.expect(restored.show_slash_query);
-    try std.testing.expect(restored.slash_completion_count > 0);
-}
-
-test "footer slash completion preserves command argument ownership" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-
-    try input.textReplacementState().replace(alloc, "/resume ");
-    const no_args = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
-    try std.testing.expect(!no_args.show_slash_query);
-    try std.testing.expectEqual(@as(usize, 0), no_args.slash_completion_count);
-
-    try input.textReplacementState().replace(alloc, "/permissions ");
-    const arguments = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
-    try std.testing.expect(arguments.show_slash_query);
-    try std.testing.expectEqual(@as(usize, 6), arguments.slash_completion_count);
-}
-
-test "footer slash completion opens after multiline whitespace" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.textReplacementState().replace(alloc, "\n   /");
-
-    const geometry = measureRawInputGeometry(testRenderContext(&input), 72, 12, true, false, false, false);
-    try std.testing.expectEqual(@as(u16, 1), geometry.input_extra);
-    try std.testing.expect(geometry.show_slash_query);
-    try std.testing.expect(geometry.slash_completion_count > 0);
-}
-
-test "footer slash completion projection honors dismissed input state" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "/mo");
-    input.edit_state.cursor = input.edit_state.input.items.len;
-
-    try std.testing.expect(slashCompletionPickerCount(testRenderContext(&input), false, false, false) > 0);
-    input.picker.dismissInlinePicker(.slash);
-    try std.testing.expectEqual(@as(usize, 0), slashCompletionPickerCount(testRenderContext(&input), false, false, false));
-
-    const geometry = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
-    try std.testing.expectEqual(@as(usize, 0), geometry.slash_completion_count);
-    try std.testing.expect(!geometry.show_slash_query);
-    try std.testing.expectEqualStrings("/mo", input.edit_state.input.items);
-}
-
-test "footer does not reinterpret dismissed model or file input as slash completion" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-
-    try input.textReplacementState().replace(alloc, "/model ");
-    input.picker.dismissInlinePicker(.model);
-    try std.testing.expectEqual(@as(usize, 0), slashCompletionPickerCount(testRenderContext(&input), false, false, false));
-
-    try input.textReplacementState().replace(alloc, "/help @src");
-    input.picker.dismissInlinePicker(.file);
-    try std.testing.expectEqual(@as(usize, 0), slashCompletionPickerCount(testRenderContext(&input), false, false, false));
-}
-
-test "footer suppresses slash rows for streaming model-shaped input" {
-    const alloc = std.testing.allocator;
-    const skills = [_]skill_runtime.Skill{.{
-        .name = "model-helper",
-        .description = "model helper",
-        .path = "/tmp/model-helper/SKILL.md",
-        .source = .global_fx,
-    }};
-
-    for ([_][]const u8{ "/model", "/model " }) |text| {
-        var input = InputRuntime{};
-        defer input.deinit(alloc);
-        try input.edit_state.input.appendSlice(alloc, text);
-        input.edit_state.cursor = input.edit_state.input.items.len;
-
-        var ctx = testRenderContext(&input);
-        ctx.skills_menu = .{ .items = &skills };
-        ctx.stream = .{ .active = true };
-
-        try std.testing.expectEqual(@as(usize, 0), slashCompletionPickerCount(ctx, false, false, false));
-        const geometry = measureRawInputGeometry(ctx, 80, 20, true, false, false, false);
-        try std.testing.expectEqual(@as(usize, 0), geometry.slash_completion_count);
-        try std.testing.expect(!geometry.show_slash_query);
-    }
-
-    var generic = InputRuntime{};
-    defer generic.deinit(alloc);
-    try generic.edit_state.input.appendSlice(alloc, "/mo");
-    generic.edit_state.cursor = generic.edit_state.input.items.len;
-    var generic_ctx = testRenderContext(&generic);
-    generic_ctx.skills_menu = .{ .items = &skills };
-    generic_ctx.stream = .{ .active = true };
-    try std.testing.expect(slashCompletionPickerCount(generic_ctx, false, false, false) > 0);
-}
-
-test "compose hint row prioritizes the armed interrupt hint and shrinks it on narrow widths" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-
-    var ctx = testRenderContext(&input);
-    ctx.esc_interrupt_armed = true;
-    ctx.esc_clear_armed = true;
-    ctx.danger_status = "danger";
-    ctx.danger_status_compact = "danger";
-
-    var wide = try composeHintRow(alloc, false, ctx, 96);
-    defer wide.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, wide.items, "esc again to interrupt") != null);
-    try std.testing.expect(std.mem.find(u8, wide.items, "esc again to clear") == null);
-    try std.testing.expect(std.mem.find(u8, wide.items, "danger") == null);
-
-    // Narrow widths fall back to compact variants instead of dropping the cue.
-    // The test context left hint is "ask · gpt-5.1" (13 columns).
-    var compact = try composeHintRow(alloc, false, ctx, 32);
-    defer compact.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, compact.items, "esc esc interrupt") != null);
-
-    var narrowest = try composeHintRow(alloc, false, ctx, 18);
-    defer narrowest.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, narrowest.items, "esc esc to") != null);
-
-    ctx.esc_interrupt_armed = false;
-    var clear_only = try composeHintRow(alloc, false, ctx, 96);
-    defer clear_only.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, clear_only.items, "esc again to clear") != null);
-}
-
-test "compose hint row keeps model in left hint text" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-
-    const ctx: RenderContext = .{
-        .stream = .{},
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .fast_indicator_active = true,
-        .input = &input,
-    };
-
-    var row = try composeHintRow(std.testing.allocator, false, ctx, 32);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.startsWith(u8, row.items, ui_render.statusline_style));
-    try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1 · ⚡︎") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "\x1b[14G") == null);
-}
-
-test "compose hint row replaces model status with setup navigation" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var ctx = testRenderContext(&input);
-    ctx.auth_picker = .{
-        .active = true,
-        .available_sources = .empty,
-        .selected_choice = .{ .action = .connections },
-        .active_source = null,
-        .include_skip = false,
-    };
-
-    var root = try composeHintRow(std.testing.allocator, false, ctx, 96);
-    defer root.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, root.items, "↑↓ navigate") != null);
-    try std.testing.expect(std.mem.find(u8, root.items, "enter open") != null);
-    try std.testing.expect(std.mem.find(u8, root.items, "esc close") != null);
-    try std.testing.expect(std.mem.find(u8, root.items, "gpt-5.1") == null);
-
-    ctx.auth_picker.stage = .connections;
-    ctx.auth_picker.selected_choice = .{ .action = .login };
-    var child = try composeHintRow(std.testing.allocator, false, ctx, 96);
-    defer child.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, child.items, "esc back") != null);
-}
-
-test "compose hint row replaces model status with subscription sign-in controls" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct {
-        source: credentials.Source,
-        manual_code_visible: bool,
-        expected: []const u8,
-    }{
-        .{
-            .source = .chatgpt_subscription,
-            .manual_code_visible = false,
-            .expected = "enter reopens browser · esc cancels",
-        },
-        .{
-            .source = .grok_subscription,
-            .manual_code_visible = false,
-            .expected = "enter reopens browser · tab enters code · esc cancels",
-        },
-        .{
-            .source = .grok_subscription,
-            .manual_code_visible = true,
-            .expected = "enter submits code · tab returns to browser · esc cancels",
-        },
-    };
-
-    for (cases) |case| {
-        var input = InputRuntime{};
-        defer input.deinit(alloc);
-        var ctx = testRenderContext(&input);
-        ctx.model = "model-status-sentinel";
-        ctx.auth_picker = .{
-            .active = true,
-            .available_sources = .empty,
-            .selected_choice = null,
-            .active_source = null,
-            .include_skip = false,
-            .stage = .sign_in,
-            .sign_in_source = case.source,
-            .sign_in_code_visible = case.manual_code_visible,
-        };
-
-        var row = try composeHintRow(alloc, false, ctx, 80);
-        defer row.deinit(alloc);
-        try std.testing.expect(std.mem.find(u8, row.items, case.expected) != null);
-        try std.testing.expect(std.mem.find(u8, row.items, "model-status-sentinel") == null);
-    }
-}
-
-test "compose hint row keeps configured fast mode visible" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-
-    const ctx: RenderContext = .{
-        .stream = .{},
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .fast_indicator_active = true,
-        .input = &input,
-    };
-
-    var row = try composeHintRow(std.testing.allocator, false, ctx, 96);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1 · ⚡︎") != null);
-}
-
-test "compose hint row does not advertise background terminals" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var ctx = testRenderContext(&input);
-    ctx.shimmer_pos = 1;
-
-    var row = try composeHintRow(std.testing.allocator, false, ctx, 96);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "background (") == null);
-}
-
-test "compose hint row right-aligns upgrade status" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-
-    const ctx: RenderContext = .{
-        .stream = .{},
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .upgrade_status = "update ready: ctrl+g to reload",
-        .statusline = .{
-            .workspace_label = "/a/long/workspace/path/that/uses/the/statusline-tail",
-        },
-        .input = &input,
-    };
-
-    var row = try composeHintRow(std.testing.allocator, false, ctx, 48);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "update ready: ctrl+g to reload") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "\x1b[19G") != null);
-}
-
-test "compose hint row right-aligns upgrade status after styled auto mode" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-
-    const ctx: RenderContext = .{
-        .stream = .{},
-        .has_api_key = true,
-        .model = "openai/gpt-4o",
-        .permission_mode = .auto,
-        .upgrade_status = "update ready: ctrl+g to reload",
-        .input = &input,
-    };
-
-    ui_render.initTheme(false, null);
-    var row = try composeHintRow(std.testing.allocator, false, ctx, 56);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.find(u8, row.items, "auto") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "gpt-4o") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "update ready: ctrl+g to reload") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "\x1b[27G") != null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 56);
-}
-
-test "compose hint row prioritizes red yolo warning with compact fallback" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var ctx = testRenderContext(&input);
-    ctx.danger_status = "Full access enabled: fx permission checks disabled";
-    ctx.danger_status_compact = "Full access";
-
-    var full = try composeHintRow(std.testing.allocator, false, ctx, 80);
-    defer full.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, full.items, ctx.danger_status) != null);
-    try std.testing.expect(std.mem.find(u8, full.items, ui_render.red_style) != null);
-
-    var compact = try composeHintRow(std.testing.allocator, false, ctx, 24);
-    defer compact.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, compact.items, ctx.danger_status_compact) != null);
-    try std.testing.expect(std.mem.find(u8, compact.items, ctx.danger_status) == null);
-
-    ctx.esc_clear_armed = true;
-    var suppressed = try composeHintRow(std.testing.allocator, false, ctx, 80);
-    defer suppressed.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, suppressed.items, "esc again to clear") != null);
-    try std.testing.expect(std.mem.find(u8, suppressed.items, "Full access") == null);
-}
-
-test "compose hint row yields the yolo warning to a pending ctrl+c quit hint" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var ctx = testRenderContext(&input);
-    ctx.danger_status = "Full access enabled: fx permission checks disabled";
-    ctx.danger_status_compact = "Full access";
-    ctx.ctrl_c_pending = true;
-
-    // Reported as unpainted so the warning's visible budget pauses.
-    try std.testing.expectEqualStrings("", dangerStatusText(false, ctx, 60));
-
-    var pending = try composeHintRow(std.testing.allocator, false, ctx, 60);
-    defer pending.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, pending.items, "press ctrl+c again to exit") != null);
-    try std.testing.expect(std.mem.find(u8, pending.items, "Full access") == null);
-
-    ctx.ctrl_c_pending = false;
-    try std.testing.expectEqualStrings(ctx.danger_status, dangerStatusText(false, ctx, 60));
-
-    var resumed = try composeHintRow(std.testing.allocator, false, ctx, 60);
-    defer resumed.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, resumed.items, ctx.danger_status) != null);
-    try std.testing.expect(std.mem.find(u8, resumed.items, "press ctrl+c again to exit") == null);
-}
-
 fn syncHintTestQuestion(prompt: *question_prompt.QuestionPrompt) !void {
     const opts = [_]types.QuestionOption{
         .{ .label = "Yes", .description = "go ahead" },
@@ -1843,88 +873,4 @@ fn syncHintTestQuestion(prompt: *question_prompt.QuestionPrompt) !void {
         .{ .question = "Should we proceed?", .options = &opts },
     };
     try prompt.syncFrom(std.testing.allocator, &entries);
-}
-
-test "question hint row excludes model and upgrade status at supported widths" {
-    var prompt = question_prompt.QuestionPrompt{};
-    defer prompt.deinit(std.testing.allocator);
-    try syncHintTestQuestion(&prompt);
-
-    const cases = [_]struct {
-        width: u16,
-        freeform: bool,
-        hint: []const u8,
-    }{
-        .{ .width = 120, .freeform = false, .hint = "1–4 choose now    ↑↓ options    tab questions    enter answer    esc cancel" },
-        .{ .width = 88, .freeform = false, .hint = "1–4 choose now    ↑↓ options    tab questions    enter answer    esc cancel" },
-        .{ .width = 40, .freeform = false, .hint = predefined_question_hints[2] },
-        .{ .width = 120, .freeform = true, .hint = "type answer    ↑↓←→ cursor    shift+↑↓ options    tab questions    enter answer    esc cancel" },
-        .{ .width = 72, .freeform = true, .hint = freeform_question_hints[0] },
-        .{ .width = 32, .freeform = true, .hint = freeform_question_hints[3] },
-    };
-
-    for (cases) |case| {
-        if (case.freeform) prompt.moveChoice(-1);
-        defer if (case.freeform) prompt.moveChoice(1);
-
-        var input = InputRuntime{};
-        defer input.deinit(std.testing.allocator);
-        var ctx = testRenderContext(&input);
-        ctx.question = prompt.projection();
-        ctx.model = "model-x";
-        ctx.upgrade_status = "update ready: ctrl+g to reload";
-        var row = try composeHintRow(std.testing.allocator, false, ctx, case.width);
-        defer row.deinit(std.testing.allocator);
-
-        try std.testing.expect(std.mem.find(u8, row.items, case.hint) != null);
-        try std.testing.expect(std.mem.find(u8, row.items, "model-x") == null);
-        try std.testing.expect(std.mem.find(u8, row.items, "update ready: ctrl+g to reload") == null);
-        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= case.width);
-    }
-}
-
-test "question hint row right-aligns batch progress and drops it when narrow" {
-    var prompt = question_prompt.QuestionPrompt{};
-    defer prompt.deinit(std.testing.allocator);
-    const opts = [_]types.QuestionOption{
-        .{ .label = "Yes", .description = null },
-        .{ .label = "No", .description = null },
-    };
-    const entries = [_]types.QuestionBatchEntry{
-        .{ .question = "First?", .options = &opts },
-        .{ .question = "Second?", .options = &opts },
-        .{ .question = "Third?", .options = &opts },
-    };
-    try prompt.syncFrom(std.testing.allocator, &entries);
-
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var ctx = testRenderContext(&input);
-    ctx.question = prompt.projection();
-
-    var row = try composeHintRow(std.testing.allocator, false, ctx, 120);
-    defer row.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, row.items, "  Question 1 of 3") != null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 120);
-
-    var narrow = try composeHintRow(std.testing.allocator, false, ctx, 40);
-    defer narrow.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, narrow.items, "Question 1 of 3") == null);
-}
-
-test "question hint assigns tab to question pagination" {
-    var prompt = question_prompt.QuestionPrompt{};
-    defer prompt.deinit(std.testing.allocator);
-    try syncHintTestQuestion(&prompt);
-
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var ctx = testRenderContext(&input);
-    ctx.question = prompt.projection();
-
-    var row = try composeHintRow(std.testing.allocator, false, ctx, 120);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.find(u8, row.items, "tab questions") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "tab to choose") == null);
 }

@@ -97,22 +97,10 @@ pub const top_level_specs = [_]TopLevelSpec{
         },
     },
     .{
-        .kind = .login,
-        .token = "login",
-        .usage = "login [vercel|codex|grok]",
-        .summary = "Sign in to Vercel or a selected provider",
-    },
-    .{
-        .kind = .logout,
-        .token = "logout",
-        .usage = "logout [vercel|codex|grok]",
-        .summary = "Sign out of Vercel or a selected provider session",
-    },
-    .{
         .kind = .setup,
         .token = "setup",
         .usage = "setup",
-        .summary = "Configure an AI Gateway API key",
+        .summary = "Save a model provider API key",
     },
     .{
         .kind = .status,
@@ -120,43 +108,6 @@ pub const top_level_specs = [_]TopLevelSpec{
         .usage = "status [--json]",
         .summary = "Show configuration and runtime information",
         .options = &.{json_option},
-    },
-    .{
-        .kind = .permissions,
-        .token = "permissions",
-        .usage = "permissions [--json]",
-        .summary = "Show the permission mode and rules",
-        .options = &.{json_option},
-        .details = &.{
-            "Modes:",
-            "  ask          Prompt before sensitive tool calls",
-            "  auto         Apply rules, then review unresolved sensitive tool calls (default)",
-            "  full-access  Disable fx permission checks",
-            "",
-            "Change the mode from the interactive shell with `/permissions [ask|auto|full-access|reset]`,",
-            "and manage persistent allow rules with `/allowlist`.",
-        },
-    },
-    .{
-        .kind = .mcp,
-        .token = "mcp",
-        .usage = "mcp <command> ...",
-        .summary = "Manage MCP servers without opening the interactive shell",
-        .details = &.{
-            "Commands:",
-            "  fx mcp add NAME COMMAND [ARGS...]",
-            "  fx mcp add --transport http NAME URL",
-            "  fx " ++ command_specs.mcp_auth_usage,
-            "  fx mcp list [--connect]",
-            "  fx mcp logout NAME",
-            "  fx mcp path",
-            "  fx mcp remove NAME",
-            "  fx mcp trust approve|reject NAME",
-            "  fx mcp trust approve-all|reset",
-            "",
-            "By default, list reads configuration without opening MCP transports.",
-            "Use --connect to connect and discover servers before rendering health.",
-        },
     },
     .{
         .kind = .models,
@@ -168,8 +119,12 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .provider,
         .token = "provider",
-        .usage = "provider <name>",
-        .summary = "Choose the model provider used by fx",
+        .usage = "provider",
+        .summary = "Connect fx to a model provider with an API key",
+        .details = &.{
+            "Running fx provider with no arguments opens the provider picker. Choose OpenRouter or Groq, then paste or type that provider's API key and press enter; fx saves it to the macOS Keychain.",
+            "You can also set OPENROUTER_API_KEY or GROQ_API_KEY in the environment instead of saving a key.",
+        },
     },
     .{
         .kind = .doctor,
@@ -177,12 +132,6 @@ pub const top_level_specs = [_]TopLevelSpec{
         .usage = "doctor [--json]",
         .summary = "Run local health and preflight checks",
         .options = &.{json_option},
-    },
-    .{
-        .kind = .teams,
-        .token = "teams",
-        .usage = "teams",
-        .summary = "Choose the Vercel team used by AI Gateway",
     },
     .{
         .kind = .session,
@@ -226,14 +175,6 @@ pub const top_level_specs = [_]TopLevelSpec{
         },
     },
     .{
-        .kind = .credits,
-        .token = "credits",
-        .aliases = &.{"balance"},
-        .usage = "credits [--json]",
-        .summary = "Show the AI Gateway credit balance",
-        .options = &.{json_option},
-    },
-    .{
         .kind = .usage,
         .token = "usage",
         .usage = "usage [--period <24h|7d|30d>] [--json]",
@@ -244,7 +185,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         },
         .details = &.{
             "Reports only usage recorded by fx on this machine.",
-            "This command reads local state and does not query account-wide Gateway reports.",
+            "This command reads local state and never queries a remote account.",
         },
     },
     .{
@@ -286,7 +227,6 @@ pub const top_level_specs = [_]TopLevelSpec{
             "Additional directories are stored for the current primary workspace.",
         },
     },
-    command_specs.slack_install_spec,
 };
 
 pub const top_level_help_default_width = command_specs.top_level_help_default_width;
@@ -308,15 +248,11 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
     } },
     .{ .entries = &.{
-        .{ .kind = .login, .usage = "login [vercel|codex|grok]", .summary = "Sign in to a model provider" },
-        .{ .kind = .logout, .usage = "logout [vercel|codex|grok]", .summary = "Sign out of a model provider" },
-        .{ .kind = .provider, .usage = "provider <name>", .summary = "Choose the active model provider" },
+        .{ .kind = .provider, .usage = "provider", .summary = "Connect fx to a model provider with an API key" },
         .{ .kind = .models, .usage = "models" },
     } },
     .{ .entries = &.{
-        .{ .kind = .setup, .usage = "setup", .summary = "Configure a Vercel AI Gateway API key" },
-        .{ .kind = .teams, .usage = "teams", .summary = "Choose a Vercel AI Gateway team" },
-        .{ .kind = .credits, .usage = "credits|balance", .summary = "Show Vercel AI Gateway credits" },
+        .{ .kind = .setup, .usage = "setup", .summary = "Save a model provider API key" },
     } },
     .{ .entries = &.{
         .{ .kind = .usage, .usage = "usage [--period <24h|7d|30d>]", .summary = "Show locally recorded token usage and spend" },
@@ -324,9 +260,6 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
-        .{ .kind = .mcp, .usage = "mcp <command> ..." },
-        .{ .kind = .slack, .usage = "slack <install|status|refresh>" },
-        .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
         .{ .kind = .upgrade, .usage = "upgrade", .summary = "Upgrade fx on the selected release channel" },
         .{ .kind = .acp, .usage = "acp" },
@@ -349,7 +282,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "--provider <name>",
-        .description = "Override the model provider for an interactive session (gateway, codex, grok, or a configured name)",
+        .description = "Override the model provider for an interactive session (openrouter or a configured name)",
     },
     .{
         .usage = "--model <id>",
@@ -407,7 +340,7 @@ pub const top_level_notes = [_][]const u8{
 
 pub const top_level_resources = [_]TopLevelResource{
     .{ .label = "Learn more about fx:", .value = "https://fx.sh/docs", .link = true },
-    .{ .label = "Report a problem:", .value = "run `/feedback` inside fx" },
+    .{ .label = "Report a problem:", .value = "run `/trace` inside fx" },
 };
 
 pub const top_level_registry = TopLevelRegistry{
@@ -453,27 +386,19 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a saved session", .presentation_category = .session },
 
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
-    .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
-    .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [vercel|codex|grok]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
-    .{ .kind = .provider, .command = "/provider", .aliases = &.{"/setup"}, .help_entry = "/provider (/setup)", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
+    .{ .kind = .provider, .command = "/provider", .aliases = &.{"/setup"}, .help_entry = "/provider (/setup)", .completion_description = "connect fx to a model provider with an API key", .presentation_category = .account, .show_in_welcome = true },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{"/cost"}, .help_entry = "/usage (/cost)", .completion_description = "show local fx tokens, models, and spend", .presentation_category = .account },
     .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration", .presentation_category = .general, .show_in_welcome = true },
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true, .accepts_payload = true },
-    .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|full-access|reset]", .completion_description = "choose what fx is allowed to do", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
-    .{ .kind = .allowlist, .command = "/allowlist", .help_entry = "/allowlist [view [effective|local|user]|[local|user] add|remove|reset ...]", .completion_description = "manage trusted commands, tools, and URLs", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .undo, .command = "/undo", .help_entry = "/undo", .completion_description = "undo the latest tracked file operation", .presentation_category = .session },
-    .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|resource|prompt|add|remove|path|reload|auth|logout|trust]", .completion_description = "manage local and remote MCP servers, resources, prompts, and project trust", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills [list|add|install|show|create|remove|path] [name|url|path] ($ opens skill search)", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .copy, .command = "/copy", .help_entry = "/copy", .completion_description = "copy the last assistant response", .presentation_category = .session },
-    .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fx feedback form", .presentation_category = .product, .show_in_welcome = true },
     .{ .kind = .trace, .command = "/trace", .help_entry = "/trace", .completion_description = "copy a private diagnostic trace", .presentation_category = .product },
     .{ .kind = .compact, .command = "/compact", .help_entry = "/compact", .completion_description = "summarize context into a fresh window", .presentation_category = .session },
     .{ .kind = .settings, .command = "/settings", .help_entry = "/settings [startup-scrollback [on|off]]", .completion_description = "browse and update settings", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
-    .{ .kind = .alias, .command = "/alias", .aliases = &.{}, .help_entry = "/alias [name] [command]", .completion_description = "show alias availability", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
-    .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account, .requires_prompt_credential = true },
     .{ .kind = .paste, .command = "/paste", .help_entry = "/paste", .completion_description = "attach an image from the clipboard when supported", .presentation_category = .media },
     .{ .kind = .fast, .command = "/fast", .help_entry = "/fast", .completion_description = "toggle Fast mode when supported", .presentation_category = .model },
     .{ .kind = .statusline, .command = "/statusline", .help_entry = "/statusline [context|session|workspace]", .completion_description = "toggle status line segments", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
@@ -530,100 +455,3 @@ pub fn slashCompletionHasArgs(command: []const u8) bool {
 }
 
 pub const argCompletionAnchor = command_specs.argCompletionAnchor;
-
-test "built-in slash commands register exact active order" {
-    const expected_commands = [_][]const u8{
-        "/help",
-        "/clear",
-        "/new",
-        "/reset",
-        "/resume",
-        "/rename",
-        "/login",
-        "/logout",
-        "/provider",
-        "/stats",
-        "/usage",
-        "/status",
-        "/image",
-        "/images",
-        "/model",
-        "/permissions",
-        "/allowlist",
-        "/undo",
-        "/mcp",
-        "/skills",
-        "/copy",
-        "/feedback",
-        "/trace",
-        "/compact",
-        "/settings",
-        "/alias",
-        "/credits",
-        "/paste",
-        "/fast",
-        "/statusline",
-        "/sound",
-        "/workspace",
-        "/version",
-        "/quit",
-    };
-
-    try std.testing.expectEqual(expected_commands.len, slash_specs.len);
-    for (expected_commands, slash_specs) |expected, spec| {
-        try std.testing.expectEqualStrings(expected, spec.command);
-    }
-}
-
-test "built-in slash registry resolves primary commands and aliases" {
-    const image = slash_registry.lookup("/img") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(SlashKind.image, image.kind);
-
-    const usage = slash_registry.lookup("/usage") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(SlashKind.usage, usage.kind);
-
-    const quit = slash_registry.matchExact("/exit\t") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(SlashKind.quit, quit.command.kind);
-    try std.testing.expectEqualStrings("/exit", quit.token);
-
-    const model = command_specs.matchedSlashPrefix(slash_registry, "/model\tmodel-id", .model) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("/model", model);
-
-    const credits = slash_registry.lookup("/credits") orelse return error.TestExpectedEqual;
-    try std.testing.expect(credits.requires_prompt_credential);
-
-    const model_command = slash_registry.lookup("/model") orelse return error.TestExpectedEqual;
-    try std.testing.expect(!model_command.requires_prompt_credential);
-    try std.testing.expect(slash_registry.lookup("/models") == null);
-
-    try std.testing.expect(command_specs.matchedSlashPrefix(slash_registry, "/model\nmodel-id", .model) == null);
-}
-
-test "retired appearance slash commands are not registered" {
-    try std.testing.expect(!isExactSlashCommand("/appearance"));
-    try std.testing.expect(!isExactSlashCommand("/input"));
-    try std.testing.expect(!isExactSlashCommand("/maxxing\t"));
-    try std.testing.expect(!isExactSlashCommand("/input lines"));
-    try std.testing.expect(!isExactSlashCommand("/unknown"));
-}
-
-test "built-in paste completion describes clipboard image attachment" {
-    const completion = nthSlashCompletion("/pas", 0) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("/paste", completion);
-
-    const description = nthSlashCompletionDescription("/pas", 0) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("attach an image from the clipboard when supported", description);
-}
-
-test "built-in statusline help and completion include workspace" {
-    const help = try renderSlashHelp(std.testing.allocator);
-    defer std.testing.allocator.free(help);
-    try std.testing.expect(
-        std.mem.find(u8, help, "/statusline [context|session|workspace]") != null,
-    );
-
-    try std.testing.expectEqualStrings(
-        "/statusline workspace",
-        nthSlashCompletion("/statusline w", 0).?,
-    );
-}

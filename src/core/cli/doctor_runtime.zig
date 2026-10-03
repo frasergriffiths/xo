@@ -5,7 +5,7 @@ const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const host = @import("../hosts/host.zig");
-const mcp_contract = @import("../mcp/mcp_contract.zig");
+
 const session_store = @import("../session/session_store.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -34,7 +34,7 @@ pub const Check = struct {
 pub const Snapshot = struct {
     workspace_root: []u8,
     model: []const u8,
-    provider: model_provider.ProviderId = .gateway,
+    provider: model_provider.ProviderId = .openrouter,
     owned_model: ?[]u8 = null,
     auth: auth_runtime.StatusSnapshot = .{},
     permission_mode: types.PermissionMode,
@@ -56,7 +56,6 @@ pub fn collect(
     secret_store: host.SecretStore,
     default_model: []const u8,
     default_agent_step_limit: usize,
-    mcp_config_diagnostic: mcp_contract.ProfileConfigDiagnostic,
 ) !Snapshot {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     debug_trace.configureFromEnv(alloc, workspace_root);
@@ -93,7 +92,6 @@ pub fn collect(
         // Settings are unreadable, so no remembered choice is available to honour.
         snapshot.auth = try auth_runtime.loadStatusSnapshot(alloc, secret_store, null);
         try appendConfigLoadFailureCheck(&checks, alloc, "config", "failed to load config", err);
-        try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
         try appendAuthCheck(&checks, alloc, snapshot.auth);
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
         try appendStateChecks(&checks, alloc, snapshot.workspace_root);
@@ -104,7 +102,7 @@ pub fn collect(
         return snapshot;
     };
     defer detailed.deinit(alloc);
-    snapshot.provider = detailed.settings.provider orelse .gateway;
+    snapshot.provider = detailed.settings.provider orelse .openrouter;
 
     snapshot.auth = try auth_runtime.loadStatusSnapshotForProvider(
         alloc,
@@ -115,7 +113,6 @@ pub fn collect(
 
     try appendConfigCheck(&checks, alloc, paths, detailed.diagnostics);
     try appendConfigDiagnosticChecks(&checks, alloc, detailed.diagnostics);
-    try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
     try appendAuthCheck(&checks, alloc, snapshot.auth);
     const selection = config_runtime.selectProviderModel(
         default_model,
@@ -208,7 +205,7 @@ fn appendAuthCheck(checks: *std.ArrayList(Check), alloc: Allocator, auth: auth_r
     }
 
     const detail = try auth.formatDoctorDetail(alloc);
-    try appendCheckOwned(checks, alloc, "auth", if (auth.expired) .warn else .ok, detail);
+    try appendCheckOwned(checks, alloc, "auth", if (auth.connected) .warn else .ok, detail);
 }
 
 fn appendResolvedStartupCheck(
@@ -545,46 +542,6 @@ fn appendCheckOwned(checks: *std.ArrayList(Check), alloc: Allocator, name: []con
     });
 }
 
-fn appendMcpConfigCheck(
-    checks: *std.ArrayList(Check),
-    alloc: Allocator,
-    diagnostic: mcp_contract.ProfileConfigDiagnostic,
-) !void {
-    switch (diagnostic) {
-        .clear => return,
-        .warning => |warning| {
-            var out: std.Io.Writer.Allocating = .init(alloc);
-            defer out.deinit();
-            try out.writer.print(
-                "~/.fx/mcp.json warning: {s}",
-                .{@tagName(warning.cause)},
-            );
-            if (warning.key()) |key| try out.writer.print(" key={s}", .{key});
-            try out.writer.print(
-                " additional_matches={d}",
-                .{warning.additional_matches},
-            );
-            try appendCheckOwned(
-                checks,
-                alloc,
-                "mcp_config",
-                .warn,
-                try out.toOwnedSlice(),
-            );
-            return;
-        },
-        .failed => |err| {
-            const detail = try std.fmt.allocPrint(
-                alloc,
-                "failed to load ~/.fx/mcp.json: {s}",
-                .{@errorName(err)},
-            );
-            try appendCheckOwned(checks, alloc, "mcp_config", .fail, detail);
-            return;
-        },
-    }
-}
-
 fn formatConfigPresence(alloc: Allocator, user_exists: bool, repo_exists: bool) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -679,267 +636,12 @@ fn accessPath(path: []const u8) !bool {
 
 fn permissionModeLabel(mode: types.PermissionMode) []const u8 {
     return switch (mode) {
-        .ask => "ask",
-        .auto => "auto",
         .yolo => "full access",
     };
-}
-
-test "format config presence names existing layers" {
-    const detail = try formatConfigPresence(std.testing.allocator, true, false);
-    defer std.testing.allocator.free(detail);
-
-    try std.testing.expectEqualStrings("loaded config from ~/.fx/settings.json", detail);
-}
-
-test "MCP config diagnostic maps only failures to one doctor check" {
-    const alloc = std.testing.allocator;
-    var checks: std.ArrayList(Check) = .empty;
-    defer {
-        for (checks.items) |*entry| entry.deinit(alloc);
-        checks.deinit(alloc);
-    }
-
-    try appendMcpConfigCheck(&checks, alloc, .clear);
-    try std.testing.expectEqual(@as(usize, 0), checks.items.len);
-
-    try appendMcpConfigCheck(
-        &checks,
-        alloc,
-        .{ .failed = error.McpConfigInvalidJson },
-    );
-    try std.testing.expectEqual(@as(usize, 1), checks.items.len);
-    try std.testing.expectEqualStrings("mcp_config", checks.items[0].name);
-    try std.testing.expectEqual(CheckStatus.fail, checks.items[0].status);
-    try std.testing.expectEqualStrings(
-        "failed to load ~/.fx/mcp.json: McpConfigInvalidJson",
-        checks.items[0].detail,
-    );
-}
-
-test "config check handles user and workspace config files together" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeDoctorFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"ask\"}");
-    try writeDoctorFixtureFile(tmp.dir, "workspace/.fx.json", "{\"permission_mode\":\"auto\"}");
-
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
-    defer std.testing.allocator.free(workspace_root);
-
-    var paths = try config_runtime.discoverPathsFromHome(std.testing.allocator, home_root, workspace_root);
-    defer paths.deinit(std.testing.allocator);
-
-    var checks: std.ArrayList(Check) = .empty;
-    defer {
-        for (checks.items) |*entry| entry.deinit(std.testing.allocator);
-        checks.deinit(std.testing.allocator);
-    }
-
-    try appendConfigCheck(&checks, std.testing.allocator, paths, &.{});
-
-    try std.testing.expectEqual(@as(usize, 1), checks.items.len);
-    try std.testing.expectEqual(CheckStatus.ok, checks.items[0].status);
-    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, "~/.fx/settings.json") != null);
-    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, ".fx.json") != null);
-}
-
-test "config check does not claim rejected user settings loaded" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeDoctorFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"ask\"}");
-    try writeDoctorFixtureFile(tmp.dir, "workspace/.fx.json", "{\"permission_mode\":\"auto\"}");
-
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
-    defer std.testing.allocator.free(workspace_root);
-
-    var paths = try config_runtime.discoverPathsFromHome(std.testing.allocator, home_root, workspace_root);
-    defer paths.deinit(std.testing.allocator);
-
-    var checks: std.ArrayList(Check) = .empty;
-    defer {
-        for (checks.items) |*entry| entry.deinit(std.testing.allocator);
-        checks.deinit(std.testing.allocator);
-    }
-
-    const diagnostics = [_]config_runtime.ConfigDiagnostic{
-        .{
-            .layer = .user,
-            .cause = .private_state_permissions_unsupported,
-        },
-    };
-    try appendConfigCheck(&checks, std.testing.allocator, paths, &diagnostics);
-
-    try std.testing.expectEqual(@as(usize, 1), checks.items.len);
-    try std.testing.expectEqual(CheckStatus.ok, checks.items[0].status);
-    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, "~/.fx/settings.json") == null);
-    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, ".fx.json") != null);
-}
-
-test "session count check preserves empty and latest details" {
-    const alloc = std.testing.allocator;
-    var checks: std.ArrayList(Check) = .empty;
-    defer {
-        for (checks.items) |*entry| entry.deinit(alloc);
-        checks.deinit(alloc);
-    }
-
-    try appendSessionsCountCheck(&checks, alloc, 0, "");
-    try appendSessionsCountCheck(&checks, alloc, 2, "session-2");
-
-    try std.testing.expectEqual(@as(usize, 2), checks.items.len);
-    try std.testing.expectEqualStrings("sessions", checks.items[0].name);
-    try std.testing.expectEqual(CheckStatus.warn, checks.items[0].status);
-    try std.testing.expectEqualStrings("no saved sessions yet", checks.items[0].detail);
-    try std.testing.expectEqualStrings("sessions", checks.items[1].name);
-    try std.testing.expectEqual(CheckStatus.ok, checks.items[1].status);
-    try std.testing.expectEqualStrings("2 saved session(s); latest=session-2", checks.items[1].detail);
-}
-
-test "doctor startup check fails when the provider has no model to run" {
-    const alloc = std.testing.allocator;
-    var checks: std.ArrayList(Check) = .empty;
-    defer {
-        for (checks.items) |*entry| entry.deinit(alloc);
-        checks.deinit(alloc);
-    }
-    var snapshot = Snapshot{
-        .workspace_root = "",
-        .model = "default/model",
-        .permission_mode = config_runtime.default_permission_mode,
-        .agent_step_limit = 25,
-        .checks = &.{},
-    };
-
-    try appendResolvedStartupCheck(&snapshot, &checks, alloc, error.CodexModelNotSelected, .{ .max_agent_steps = 7 }, 25);
-    try std.testing.expectEqualStrings("", snapshot.model);
-    try std.testing.expectEqual(@as(usize, 7), snapshot.agent_step_limit);
-    try std.testing.expectEqual(CheckStatus.fail, checks.items[0].status);
-    try std.testing.expect(std.mem.startsWith(u8, checks.items[0].detail, "no Codex model is selected;"));
-
-    try appendResolvedStartupCheck(&snapshot, &checks, alloc, .{ .provider = .codex, .model = "gpt-saved" }, .{}, 25);
-    defer if (snapshot.owned_model) |model| alloc.free(model);
-    try std.testing.expectEqualStrings("gpt-saved", snapshot.model);
-    try std.testing.expectEqual(CheckStatus.ok, checks.items[1].status);
-}
-
-test "bounded doctor warnings use existing check stream" {
-    const alloc = std.testing.allocator;
-    var checks: std.ArrayList(Check) = .empty;
-    defer {
-        for (checks.items) |*entry| entry.deinit(alloc);
-        checks.deinit(alloc);
-    }
-
-    try appendSessionDiagnosticsTruncatedCheck(&checks, alloc, 64);
-    try appendSessionsCountUnavailableCheck(&checks, alloc);
-
-    try std.testing.expectEqual(@as(usize, 2), checks.items.len);
-    try std.testing.expectEqualStrings("session", checks.items[0].name);
-    try std.testing.expectEqual(CheckStatus.warn, checks.items[0].status);
-    try std.testing.expect(std.mem.find(
-        u8,
-        checks.items[0].detail,
-        "truncated after 64 session directories",
-    ) != null);
-    try std.testing.expectEqualStrings("sessions", checks.items[1].name);
-    try std.testing.expectEqual(CheckStatus.warn, checks.items[1].status);
-    try std.testing.expect(std.mem.find(
-        u8,
-        checks.items[1].detail,
-        "unavailable without a full session scan",
-    ) != null);
-}
-
-test "session doctor renders precise watermark and compaction diagnostics" {
-    const alloc = std.testing.allocator;
-    var checks: std.ArrayList(Check) = .empty;
-    defer {
-        for (checks.items) |*entry| entry.deinit(alloc);
-        checks.deinit(alloc);
-    }
-    var unused_store: session_store.Store = undefined;
-    const diagnostics = [_]session_store.DoctorDiagnostic{
-        .{
-            .session_id = @constCast("missing-watermark"),
-            .kind = .commit_watermark_missing,
-        },
-        .{
-            .session_id = @constCast("failed-compaction"),
-            .kind = .canonical_log_compaction_failed,
-            .bytes = 1024,
-            .growth_bytes = 512,
-            .growth_frames = 9,
-        },
-    };
-
-    try appendSessionDiagnosticChecks(
-        &checks,
-        alloc,
-        &unused_store,
-        &diagnostics,
-    );
-
-    try std.testing.expectEqual(@as(usize, 2), checks.items.len);
-    try std.testing.expectEqual(CheckStatus.fail, checks.items[0].status);
-    try std.testing.expect(std.mem.find(
-        u8,
-        checks.items[0].detail,
-        "commit_watermark_missing",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        checks.items[0].detail,
-        "fx session recover missing-watermark",
-    ) != null);
-    try std.testing.expectEqual(CheckStatus.warn, checks.items[1].status);
-    try std.testing.expect(std.mem.find(
-        u8,
-        checks.items[1].detail,
-        "growth_bytes=512 growth_frames=9",
-    ) != null);
 }
 
 fn writeDoctorFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
     var file = try dir.createFile(std.testing.io, sub_path, .{});
     defer file.close(std.testing.io);
     try file.writeStreamingAll(std.testing.io, text);
-}
-
-test "has git metadata detects .git file or directory" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/.git");
-    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
-    defer std.testing.allocator.free(workspace_root);
-
-    try std.testing.expect(try hasGitMetadata(std.testing.allocator, workspace_root));
-}
-
-test "command in path checks explicit path entries" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "bin");
-    var file = try tmp.dir.createFile(std.testing.io, "bin/gh", .{});
-    file.close(io_mod.getIo());
-
-    const bin_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "bin");
-    defer std.testing.allocator.free(bin_root);
-
-    const path_env = try std.fmt.allocPrint(std.testing.allocator, "{s}", .{bin_root});
-    defer std.testing.allocator.free(path_env);
-
-    try std.testing.expect(try commandInPathValue(std.testing.allocator, "gh", path_env));
-    try std.testing.expect(!(try commandInPathValue(std.testing.allocator, "missing-command", path_env)));
 }

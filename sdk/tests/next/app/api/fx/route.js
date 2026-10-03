@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { createFxAgent, getBackendInfo } from "libfx";
-import { createMcpAdapter } from "libfx/mcp";
 
 export const runtime = "nodejs";
 
@@ -18,12 +17,10 @@ export async function GET(request) {
   const url = new URL(request.url);
   const backend = url.searchParams.get("backend") ?? "auto";
   const scenario = url.searchParams.get("scenario") ?? "host";
-  if (!["host", "mcp", "error", "cancel", "resume", "startup"].includes(scenario)) {
+  if (!["host", "error", "cancel", "resume", "startup"].includes(scenario)) {
     return Response.json({ error: "Unknown scenario" }, { status: 400 });
   }
   let agent;
-  let adapter;
-  let closedMcp = false;
   let toolCalls = 0;
   let modelRequests = 0;
   let observedValue;
@@ -52,31 +49,6 @@ export async function GET(request) {
         return expectedValue;
       },
     }];
-    if (scenario === "mcp") {
-      let id = 0;
-      const rpc = async (method, params, signal) => {
-        const response = await fetch(new URL("/api/mcp", request.url), {
-          method: "POST", signal,
-          headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
-          body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params }),
-        });
-        if (!response.ok) throw new Error(`MCP HTTP ${response.status}`);
-        const message = await response.json();
-        if (message.error) throw new Error(message.error.message);
-        return message.result;
-      };
-      adapter = await createMcpAdapter({
-        listTools: (params) => rpc("tools/list", params, controller.signal),
-        async callTool(params, _schema, options) {
-          toolCalls++;
-          const result = await rpc("tools/call", params, options.signal);
-          observedValue = result.content[0].text;
-          return result;
-        },
-        async close() { closedMcp = true; },
-      });
-      tools = adapter.tools;
-    }
     const options = {
       backend,
       apiKey: live ? process.env.AI_GATEWAY_API_KEY : "fixture-unused-key",
@@ -133,15 +105,12 @@ export async function GET(request) {
       await agent.close();
       agent = null;
     }
-    await adapter?.close();
-    adapter = null;
     return Response.json({ ok: true, scenario, probe, toolCalls, modelRequests, events, result, checkpointBytes: checkpoint.length,
-      closedMcp, node: process.version, arch: process.arch, glibc: process.report.getReport().header.glibcVersionRuntime ?? null });
+      node: process.version, arch: process.arch, glibc: process.report.getReport().header.glibcVersionRuntime ?? null });
   } catch (error) {
     return Response.json({ ok: false, code: error.code, message: error.message }, { status: 500 });
   } finally {
     clearTimeout(timeout);
     await agent?.close();
-    await adapter?.close();
   }
 }
