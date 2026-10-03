@@ -1,3 +1,4 @@
+const threshold = @import("core/compactor/threshold.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -435,6 +436,7 @@ const App = struct {
     permission_engine: PermissionEngine = .{},
     permission_state: app_permission_runtime.State = .{},
     agent_step_limit: usize = default_max_agent_steps,
+    auto_compact_percent: u8 = threshold.default_percent,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
         .provider = if (host_profile.web_search) builtin_providers.native.openrouter.fx_search else null,

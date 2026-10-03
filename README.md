@@ -113,6 +113,31 @@ and it is what fx persists. The former `ask` and `auto` modes no longer exist,
 and the `full-access` and `full access` spellings are no longer recognized. Any
 unrecognized value is ignored and full access still applies.
 
+## Context compaction
+
+When a conversation approaches the model's context window, fx summarizes the
+earlier turns into a handoff and continues from that. The summary keeps the goal,
+constraints, decisions, completed work, failures, and unfinished work, and keeps
+recent user messages verbatim.
+
+Two settings control it:
+
+- `auto_compact_percent` in `~/.fx/settings.json` sets the share of usable input
+  at which automatic compaction fires. It accepts 10 through 80 and defaults to
+  80. `FX_AUTO_COMPACT_PERCENT` overrides it for one launch. A value outside the
+  range is ignored and the default applies, so a typo can never disable
+  compaction.
+- `/compact` runs compaction on demand, regardless of how much context is in use.
+
+Compacted turns and tool results get short names, `M1` and `T1` and up, which
+`read_tool_result` accepts in place of the long handles the handoff also carries.
+Both spellings work, so nothing depends on the short names being available.
+
+The summary is written by the lowest reasoning effort the model supports, since
+writing a summary is a compression task rather than a reasoning one. When a
+second provider family is configured, one availability failure retries the
+summary there, so a single provider outage does not cost a long session.
+
 ## Themes
 
 fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with the `theme` setting or `FX_THEME=<name>` per launch. Without an explicitly selected theme, diff markers and edit counts stay monochrome; selecting any theme adds its diff marker colors. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.

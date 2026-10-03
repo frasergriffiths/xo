@@ -5,6 +5,8 @@ const diagnostics = @import("../../workspace/diagnostics.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
+const model_provider = @import("../../config/model_provider.zig");
+const summary_model = @import("../../compactor/summary_model.zig");
 const result_store = @import("../../session/result_store.zig");
 const session_usage = @import("../../session/session_usage.zig");
 const io_mod = @import("../../shared/io.zig");
@@ -43,6 +45,21 @@ pub const Request = struct {
     policy: enum { legacy, assistant_first } = .legacy,
     result_storage: compaction_policy.Storage = .unavailable,
     trace_ctx: debug_trace.TraceContext,
+    /// Provider and capabilities of the summary model. Used to ask for the
+    /// lowest reasoning effort the model supports, since writing a summary is
+    /// a compression task rather than a reasoning one.
+    provider: model_provider.ProviderId = .openrouter,
+    capabilities: model_capabilities.Capabilities = .{},
+    /// An optional second summary model on a different provider family. When
+    /// supplied, the summary is retried once against it if the primary endpoint
+    /// fails outright, so a single provider outage does not lose the session.
+    /// The credential is required, because a different provider means a
+    /// different key and silently reusing the primary one would only fail later.
+    fallback_provider: ?model_provider.ProviderId = null,
+    fallback_model: ?[]const u8 = null,
+    fallback_api_key: ?[]const u8 = null,
+    fallback_credential_source: ?types.CredentialSource = null,
+    fallback_capabilities: model_capabilities.Capabilities = .{},
 };
 
 pub const Result = struct {
@@ -419,129 +436,186 @@ fn runSummaryCall(
     defer alloc.free(summary_input);
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = summary_input }};
     const deadline = request.deadline;
-    const credential: agent_stream_provider.CredentialLease = if (request.credential_source == .host_managed)
-        .host_managed
-    else
-        .{ .direct = .{
-            .secret_bytes = request.api_key,
-            .source = request.credential_source,
-            .account_id = request.account_id,
-            .tenant_context = request.gateway_team,
-        } };
     var usage: types.ToolUsage = .{};
-    for (0..2) |attempt| {
-        if (request.cancel_flag.load(.seq_cst)) {
-            diagnostics.traceCompactionEvent(request.trace_ctx, .summary_cancelled, "phase=pre_stream attempt={d}", .{attempt});
-            return error.Cancelled;
-        }
-        var capture = StreamCapture{ .alloc = alloc, .max_bytes = max_bytes };
-        defer capture.deinit();
-        var delivery = runtime_gateway_step.DeliveryCertainty.init();
-        var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
-        var streamed = try runtime_gateway_step.streamModelCompletion(
-            request.stream_provider,
-            alloc,
-            .{
-                .credential = credential,
-                .session_id = request.session_id,
-                .model = request.model,
-                .retry_count = if (attempt == 0) request.retry_count else 1,
-                .instructions = &instructions,
-                .messages = &messages,
-                .tools = .{},
-                .tool_choice = .none,
-                .provider_options = request.provider_options,
-                .max_output_tokens = request.max_output_tokens,
-                .budget = .{ .cancel_flag = request.cancel_flag, .deadline = deadline },
-                .deadline = deadline,
-                .content_capture_limit = max_bytes,
-                .delivery = &delivery,
-                .attempt_evidence = &attempt_evidence,
-                .events = .{ .context = &capture, .emit_fn = onEvent },
-                .admission = .{},
-                .cancel_flag = request.cancel_flag,
-                .trace_ctx = request.trace_ctx,
-                .cooperative_pulse = request.cooperative_transport_pulse,
-            },
-            request.usage,
-            request.usage_allocator,
-        );
-        defer streamed.deinit(alloc);
-        if (request.cancel_flag.load(.seq_cst)) {
-            diagnostics.traceCompactionEvent(request.trace_ctx, .summary_cancelled, "phase=post_stream attempt={d}", .{attempt});
-            return error.Cancelled;
-        }
-        const completion = switch (streamed) {
-            .failed => |failure| {
-                // Provider error bodies are third-party text: mask secrets and
-                // neutralize control bytes before the detail reaches the ring or
-                // the shareable /trace report.
-                const masked_detail = try text_utils.maskSecrets(alloc, failure.detail orelse "");
-                var detail_buf: [512]u8 = undefined;
-                const safe_detail = debug_trace.preview(debug_trace.terminalPreview(&detail_buf, masked_detail), 240);
+    // One or two summary models, and each is retried at most once for empty
+    // output. The cap is deliberately small: a summary that cannot be written
+    // should surface as a failed compaction, not as an open-ended retry loop.
+    const plan_value = summary_model.plan(
+        request.provider,
+        request.model,
+        request.api_key,
+        request.credential_source,
+        request.fallback_provider,
+        request.fallback_model,
+        request.fallback_api_key,
+        request.fallback_credential_source,
+    );
+    var plan_index: usize = 0;
+    outer: while (plan_index < plan_value.len) : (plan_index += 1) {
+        const target = plan_value.attempts[plan_index];
+        const target_capabilities = if (plan_index == 0) request.capabilities else request.fallback_capabilities;
+        const lowest_reasoning = summary_model.lowestEffort(target_capabilities);
+        for (0..2) |retry| {
+            const attempt = plan_index * 2 + retry;
+            if (request.cancel_flag.load(.seq_cst)) {
+                diagnostics.traceCompactionEvent(request.trace_ctx, .summary_cancelled, "phase=pre_stream attempt={d}", .{attempt});
+                return error.Cancelled;
+            }
+            const credential: agent_stream_provider.CredentialLease = if (target.credential_source == .host_managed)
+                .host_managed
+            else
+                .{ .direct = .{
+                    .secret_bytes = target.api_key orelse request.api_key,
+                    .source = target.credential_source,
+                    .account_id = if (plan_index == 0) request.account_id else null,
+                    .tenant_context = if (plan_index == 0) request.gateway_team else null,
+                } };
+            var capture = StreamCapture{ .alloc = alloc, .max_bytes = max_bytes };
+            defer capture.deinit();
+            var delivery = runtime_gateway_step.DeliveryCertainty.init();
+            var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
+            var streamed = try runtime_gateway_step.streamModelCompletion(
+                request.stream_provider,
+                alloc,
+                .{
+                    .credential = credential,
+                    .session_id = request.session_id,
+                    .model = target.model,
+                    .retry_count = if (attempt == 0) request.retry_count else 1,
+                    .instructions = &instructions,
+                    .messages = &messages,
+                    .tools = .{},
+                    .tool_choice = .none,
+                    // The summary asks for the lowest reasoning effort the model
+                    // supports, but otherwise keeps the caller's own options, so a
+                    // custom endpoint that needs a specific setting still gets it.
+                    .provider_options = .{
+                        .reasoning = lowest_reasoning orelse request.provider_options.reasoning,
+                        .fast = request.provider_options.fast,
+                        .parallel_tool_calls = request.provider_options.parallel_tool_calls,
+                        .prompt_caching = request.provider_options.prompt_caching,
+                        .provider_order = request.provider_options.provider_order,
+                        .provider_strict = request.provider_options.provider_strict,
+                    },
+                    .max_output_tokens = request.max_output_tokens,
+                    .budget = .{ .cancel_flag = request.cancel_flag, .deadline = deadline },
+                    .deadline = deadline,
+                    .content_capture_limit = max_bytes,
+                    .delivery = &delivery,
+                    .attempt_evidence = &attempt_evidence,
+                    .events = .{ .context = &capture, .emit_fn = onEvent },
+                    .admission = .{},
+                    .cancel_flag = request.cancel_flag,
+                    .trace_ctx = request.trace_ctx,
+                    .cooperative_pulse = request.cooperative_transport_pulse,
+                },
+                request.usage,
+                request.usage_allocator,
+            );
+            defer streamed.deinit(alloc);
+            if (request.cancel_flag.load(.seq_cst)) {
+                diagnostics.traceCompactionEvent(request.trace_ctx, .summary_cancelled, "phase=post_stream attempt={d}", .{attempt});
+                return error.Cancelled;
+            }
+            const completion = switch (streamed) {
+                .failed => |failure| {
+                    // Provider error bodies are third-party text: mask secrets and
+                    // neutralize control bytes before the detail reaches the ring or
+                    // the shareable /trace report.
+                    const masked_detail = try text_utils.maskSecrets(alloc, failure.detail orelse "");
+                    var detail_buf: [512]u8 = undefined;
+                    const safe_detail = debug_trace.preview(debug_trace.terminalPreview(&detail_buf, masked_detail), 240);
+                    diagnostics.traceCompactionFailure(
+                        request.trace_ctx,
+                        .summary_transport_failed,
+                        "model={s} attempt={d} kind={s} detail={s}",
+                        .{ target.model, attempt, @tagName(failure.kind), safe_detail },
+                    );
+                    // An availability failure is the one outcome a second provider
+                    // family can fix. A rejected request would fail identically on
+                    // the fallback, so retrying it would only double the latency.
+                    if (plan_index + 1 < plan_value.len and isAvailabilityFailure(failure.kind)) {
+                        diagnostics.traceCompactionEvent(
+                            request.trace_ctx,
+                            .summary_transport_failed,
+                            "model={s} attempt={d} falling_back_to={s}",
+                            .{ target.model, attempt, plan_value.attempts[plan_index + 1].model },
+                        );
+                        continue :outer;
+                    }
+                    return error.ContextCompactionUnavailable;
+                },
+                .completed => |completed| completed.completion,
+            };
+            addUsage(&usage, .{
+                .input_tokens = completion.usage.input_tokens orelse 0,
+                .output_tokens = completion.usage.output_tokens orelse 0,
+            });
+            if (completion.finish_reason != .stop) {
                 diagnostics.traceCompactionFailure(
                     request.trace_ctx,
-                    .summary_transport_failed,
-                    "model={s} attempt={d} kind={s} detail={s}",
-                    .{ request.model, attempt, @tagName(failure.kind), safe_detail },
+                    .summary_incomplete,
+                    "model={s} attempt={d} finish_reason={s} content_bytes={d}",
+                    .{ target.model, attempt, if (completion.finish_reason) |reason| @tagName(reason) else "missing", capture.text.items.len },
                 );
-                return error.ContextCompactionUnavailable;
-            },
-            .completed => |completed| completed.completion,
-        };
-        addUsage(&usage, .{
-            .input_tokens = completion.usage.input_tokens orelse 0,
-            .output_tokens = completion.usage.output_tokens orelse 0,
-        });
-        if (completion.finish_reason != .stop) {
-            diagnostics.traceCompactionFailure(
-                request.trace_ctx,
-                .summary_incomplete,
-                "model={s} attempt={d} finish_reason={s} content_bytes={d}",
-                .{ request.model, attempt, if (completion.finish_reason) |reason| @tagName(reason) else "missing", capture.text.items.len },
-            );
-            return error.IncompleteCompactionHandoff;
+                return error.IncompleteCompactionHandoff;
+            }
+            if (capture.failed) return error.OutOfMemory;
+            if (!capture.saw_content) {
+                if (completion.content) |content| try capture.append(content);
+            }
+            if (capture.saw_tool_call or completion.tool_calls.len > 0) {
+                diagnostics.traceCompactionFailure(
+                    request.trace_ctx,
+                    .summary_tool_call_rejected,
+                    "model={s} attempt={d} streamed_tool_call={} tool_calls={d}",
+                    .{ target.model, attempt, capture.saw_tool_call, completion.tool_calls.len },
+                );
+                return error.CompactionToolCallRejected;
+            }
+            if (capture.observed_bytes > capture.text.items.len) {
+                diagnostics.traceCompactionFailure(
+                    request.trace_ctx,
+                    .summary_truncated,
+                    "model={s} attempt={d} observed_bytes={d} captured_bytes={d} limit_bytes={d}",
+                    .{ target.model, attempt, capture.observed_bytes, capture.text.items.len, max_bytes },
+                );
+                return error.CompactionHandoffTooLarge;
+            }
+            const trimmed = std.mem.trim(u8, capture.text.items, " \t\r\n");
+            if (!std.unicode.utf8ValidateSlice(trimmed)) {
+                diagnostics.traceCompactionFailure(
+                    request.trace_ctx,
+                    .summary_invalid_utf8,
+                    "model={s} attempt={d} captured_bytes={d}",
+                    .{ target.model, attempt, trimmed.len },
+                );
+                return error.InvalidCompactionHandoff;
+            }
+            if (trimmed.len == 0) {
+                if (attempt == 0) diagnostics.traceCompactionEvent(request.trace_ctx, .empty_summary_retry, "attempt=2 model={s}", .{target.model});
+                continue;
+            }
+            return .{ .text = try alloc.dupe(u8, trimmed), .usage = usage };
         }
-        if (capture.failed) return error.OutOfMemory;
-        if (!capture.saw_content) {
-            if (completion.content) |content| try capture.append(content);
-        }
-        if (capture.saw_tool_call or completion.tool_calls.len > 0) {
-            diagnostics.traceCompactionFailure(
-                request.trace_ctx,
-                .summary_tool_call_rejected,
-                "model={s} attempt={d} streamed_tool_call={} tool_calls={d}",
-                .{ request.model, attempt, capture.saw_tool_call, completion.tool_calls.len },
-            );
-            return error.CompactionToolCallRejected;
-        }
-        if (capture.observed_bytes > capture.text.items.len) {
-            diagnostics.traceCompactionFailure(
-                request.trace_ctx,
-                .summary_truncated,
-                "model={s} attempt={d} observed_bytes={d} captured_bytes={d} limit_bytes={d}",
-                .{ request.model, attempt, capture.observed_bytes, capture.text.items.len, max_bytes },
-            );
-            return error.CompactionHandoffTooLarge;
-        }
-        const trimmed = std.mem.trim(u8, capture.text.items, " \t\r\n");
-        if (!std.unicode.utf8ValidateSlice(trimmed)) {
-            diagnostics.traceCompactionFailure(
-                request.trace_ctx,
-                .summary_invalid_utf8,
-                "model={s} attempt={d} captured_bytes={d}",
-                .{ request.model, attempt, trimmed.len },
-            );
-            return error.InvalidCompactionHandoff;
-        }
-        if (trimmed.len == 0) {
-            if (attempt == 0) diagnostics.traceCompactionEvent(request.trace_ctx, .empty_summary_retry, "attempt=2 model={s}", .{request.model});
-            continue;
-        }
-        return .{ .text = try alloc.dupe(u8, trimmed), .usage = usage };
     }
     diagnostics.traceCompactionFailure(request.trace_ctx, .summary_empty_exhausted, "model={s}", .{request.model});
     return error.InvalidCompactionHandoff;
+}
+
+/// True for failures that mean "this endpoint could not answer", as opposed to
+/// "this request was refused". Only the former is worth a second provider.
+fn isAvailabilityFailure(kind: agent_stream_provider.FailureKind) bool {
+    return switch (kind) {
+        .unavailable, .bad_gateway, .gateway_timeout, .server_error => true,
+        .invalid_request,
+        .unauthorized,
+        .forbidden,
+        .request_too_large,
+        .rate_limited,
+        .provider_error,
+        => false,
+    };
 }
 
 fn addUsage(total: *types.ToolUsage, item: types.ToolUsage) void {

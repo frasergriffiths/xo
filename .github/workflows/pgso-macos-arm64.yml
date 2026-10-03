@@ -378,6 +378,32 @@ jobs:
             --startup-dir "$RUNNER_TEMP/fx-pgso-startup" \
             --output-dir "$RUNNER_TEMP/fx-pgso-aggregate"
 
+      - name: Confirm release eligibility
+        run: python3 -m scripts.pgso report --output-dir "$RUNNER_TEMP/fx-pgso-aggregate" >/dev/null
+
+      # The release job downloads `fx-*` artifacts, so the macOS arm64 package is
+      # produced here, once the aggregate evidence has cleared eligibility. This
+      # is unsigned: fx ships no Apple Developer ID and gates Gatekeeper on first
+      # launch rather than on a signature.
+      - name: Package stable release candidate
+        run: |
+          archive="$RUNNER_TEMP/fx-macos-aarch64.tar.gz"
+          package_dir="$RUNNER_TEMP/fx-release-package"
+          mkdir -p "$package_dir"
+          cp "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx" LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf "$archive" -C "$package_dir" fx LICENSE THIRD_PARTY_NOTICES.md
+          cd "$RUNNER_TEMP"
+          shasum -a 256 fx-macos-aarch64.tar.gz > fx-macos-aarch64.tar.gz.sha256
+
+      - name: Upload stable release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fx-macos-aarch64
+          path: |
+            ${{ runner.temp }}/fx-macos-aarch64.tar.gz
+            ${{ runner.temp }}/fx-macos-aarch64.tar.gz.sha256
+          if-no-files-found: error
+
       - name: Upload aggregate evidence
         id: upload
         if: always()

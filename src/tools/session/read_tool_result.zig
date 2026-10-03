@@ -4,6 +4,8 @@ const command_replay_store = @import("../../core/session/command_replay_store.zi
 const session_child_store = @import("../../core/session/session_child_store.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const aliases = @import("../../core/compactor/aliases.zig");
+const identifiers = @import("../../core/compactor/identifiers.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -21,6 +23,10 @@ pub const Input = struct {
         },
         query: []u8,
     } = .{ .range = .{} },
+    /// Whether the model chose a byte range itself. A short `M` name names one
+    /// contiguous piece of the source archive, so its own range wins over the
+    /// default but not over a range the model asked for.
+    range_explicit: bool = false,
 
     pub fn deinit(self: *Input, alloc: Allocator) void {
         alloc.free(self.handle);
@@ -58,6 +64,9 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     input.* = .{ .handle = try ctx.allocator.dupe(u8, handle_value.string) };
     errdefer input.deinit(ctx.allocator);
 
+    if (args.get("start_byte") != null or args.get("byte_count") != null) {
+        input.range_explicit = true;
+    }
     if (args.get("start_byte")) |value| {
         const start_byte = parsePositiveInteger(value) orelse {
             return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"start_byte\" must be a positive integer") };
@@ -112,7 +121,62 @@ pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolIn
         ctx.allocator.free(input.handle);
         input.handle = owned;
     }
-    return null;
+    return try resolveAlias(ctx, input);
+}
+
+/// Replaces a short `M1` or `T1` name with the real handle and, for a message
+/// name, the byte range that name stands for.
+///
+/// A short name is only resolved when the session has actually recorded one, so
+/// a handle that merely looks like an alias still fails the ordinary way rather
+/// than being silently reinterpreted. Returns a failure message for an alias
+/// shape the session cannot answer, and null when nothing had to change.
+fn resolveAlias(ctx: tool_dispatch.DispatchContext, input: *Input) tool_dispatch.DispatchError!?[]u8 {
+    if (!identifiers.isAlias(input.handle)) return null;
+    const capability = ctx.session_child_capability orelse return try ctx.allocator.dupe(
+        u8,
+        "Short names like M1 and T1 are only available in a session that has compacted context. Use the original handle.",
+    );
+    var index = (aliases.loadManaged(ctx.allocator, capability) catch null) orelse return try ctx.allocator.dupe(
+        u8,
+        "This session has no compacted-context short names. Use the original handle.",
+    );
+    defer index.deinit(ctx.allocator);
+
+    if (try index.resolveTool(ctx.allocator, input.handle)) |handle| {
+        defer ctx.allocator.free(handle);
+        const owned = try ctx.allocator.dupe(u8, handle);
+        ctx.allocator.free(input.handle);
+        input.handle = owned;
+        // A tool alias names one stored result, so a range the model invented for
+        // it would address the wrong bytes.
+        input.selector = .{ .range = .{
+            .start_byte = 1,
+            .byte_count = result_store.read_max_bytes,
+        } };
+        return null;
+    }
+    if (index.resolveMessage(input.handle)) |range| {
+        const source = index.source_handle orelse return try ctx.allocator.dupe(
+            u8,
+            "That short name refers to a user message from an earlier handoff and is not readable from this one. Use the original handle.",
+        );
+        if (input.selector == .query) return try ctx.allocator.dupe(
+            u8,
+            "A short user name names one contiguous message. Read it without a query.",
+        );
+        if (!input.range_explicit) {
+            input.selector = .{ .range = .{
+                .start_byte = range.start_byte,
+                .byte_count = range.byte_count,
+            } };
+        }
+        const owned = try ctx.allocator.dupe(u8, source);
+        ctx.allocator.free(input.handle);
+        input.handle = owned;
+        return null;
+    }
+    return try std.fmt.allocPrint(ctx.allocator, "Short name {s} is not one this compaction recorded.", .{input.handle});
 }
 
 pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {

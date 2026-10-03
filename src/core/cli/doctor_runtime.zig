@@ -1,3 +1,4 @@
+const threshold = @import("../compactor/threshold.zig");
 const std = @import("std");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -39,6 +40,7 @@ pub const Snapshot = struct {
     auth: auth_runtime.StatusSnapshot = .{},
     permission_mode: types.PermissionMode,
     agent_step_limit: usize,
+    auto_compact_percent: u8 = threshold.default_percent,
     checks: []Check,
 
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
@@ -111,6 +113,7 @@ pub fn collect(
         detailed.settings.credential_source,
     );
 
+    try appendCredentialSourceCoherenceCheck(&checks, alloc, snapshot.provider, detailed.settings);
     try appendConfigCheck(&checks, alloc, paths, detailed.diagnostics);
     try appendConfigDiagnosticChecks(&checks, alloc, detailed.diagnostics);
     try appendAuthCheck(&checks, alloc, snapshot.auth);
@@ -123,6 +126,7 @@ pub fn collect(
     try appendResolvedStartupCheck(&snapshot, &checks, alloc, selection, .{
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,
+        .auto_compact_percent = detailed.settings.auto_compact_percent,
     }, default_agent_step_limit);
     try appendStateChecks(&checks, alloc, snapshot.workspace_root);
     try appendGitCheck(&checks, alloc, snapshot.workspace_root);
@@ -198,6 +202,29 @@ fn configLayerRejected(
     return false;
 }
 
+/// Reports a saved provider and credential source that disagree. The session
+/// ignores the remembered key in that state, so the profile is working but is
+/// not doing what the file says.
+fn appendCredentialSourceCoherenceCheck(
+    checks: *std.ArrayList(Check),
+    alloc: Allocator,
+    provider: model_provider.ProviderId,
+    settings: config_runtime.Settings,
+) !void {
+    if (!config_runtime.credentialSourceIsIncoherent(provider, settings.credential_source)) return;
+    try appendCheck(
+        checks,
+        alloc,
+        "credential source",
+        .warn,
+        try std.fmt.allocPrint(
+            alloc,
+            "saved credential_source={s} cannot be used by provider {s}; it was ignored. Run /provider to set a matching key.",
+            .{ @tagName(settings.credential_source.?), provider.label() },
+        ),
+    );
+}
+
 fn appendAuthCheck(checks: *std.ArrayList(Check), alloc: Allocator, auth: auth_runtime.StatusSnapshot) !void {
     if (auth.missingHelp(.cli)) |help| {
         try appendCheck(checks, alloc, "auth", .fail, help);
@@ -218,6 +245,7 @@ fn appendResolvedStartupCheck(
 ) !void {
     snapshot.permission_mode = try resolvePermissionMode(settings.permission_mode);
     snapshot.agent_step_limit = try resolveAgentStepLimit(default_agent_step_limit, settings.max_agent_steps);
+    snapshot.auto_compact_percent = resolveAutoCompactPercent(settings.auto_compact_percent);
     if (snapshot.owned_model) |model| alloc.free(model);
     snapshot.owned_model = null;
     const selected = selection catch |err| {
@@ -232,8 +260,8 @@ fn appendResolvedStartupCheck(
 
     const detail = try std.fmt.allocPrint(
         alloc,
-        "resolved model={s}, permission_mode={s}, agent_step_limit={d}",
-        .{ snapshot.model, permissionModeLabel(snapshot.permission_mode), snapshot.agent_step_limit },
+        "resolved model={s}, permission_mode={s}, agent_step_limit={d}, auto_compact_percent={d}",
+        .{ snapshot.model, permissionModeLabel(snapshot.permission_mode), snapshot.agent_step_limit, snapshot.auto_compact_percent },
     );
     try appendCheckOwned(checks, alloc, "startup", .ok, detail);
 }
@@ -522,6 +550,12 @@ fn resolveAgentStepLimit(fallback: usize, configured: ?usize) !usize {
         fallback,
         io_mod.getenv("FX_MAX_AGENT_STEPS"),
     );
+}
+
+/// Share of usable input at which automatic compaction fires, so the effective
+/// value is observable exactly as the step limit is.
+fn resolveAutoCompactPercent(configured: ?u8) u8 {
+    return threshold.resolvePercent(configured, io_mod.getenv(threshold.env_var));
 }
 
 fn appendCheck(checks: *std.ArrayList(Check), alloc: Allocator, name: []const u8, status: CheckStatus, detail: []const u8) !void {

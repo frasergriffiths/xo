@@ -1,3 +1,4 @@
+const threshold = @import("../../compactor/threshold.zig");
 const std = @import("std");
 const skill_runtime = @import("../../skills/skill_runtime.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
@@ -4644,6 +4645,9 @@ pub const ContextCompactionTransactionRequest = struct {
     trace_ctx: TraceContext,
     removed_turn_count: usize,
     compaction_count: usize,
+    /// Share of usable input at which automatic compaction fires. Resolved by
+    /// the caller so the transaction never re-reads configuration.
+    auto_compact_percent: u8 = threshold.default_percent,
 };
 
 pub const ContextCompactionTransactionResult = struct {
@@ -4686,6 +4690,7 @@ pub fn compactContextTransaction(
         .request_tokens = request.request_tokens,
         .source_tokens = request.source_tokens,
         .newest_exchange_tokens = request.newest_exchange_tokens,
+        .compact_percent = request.auto_compact_percent,
     };
     const initial_plan = runtime_prompt_context.planCompaction(plan_input);
     if (initial_plan.decision == .no_op) {
@@ -4773,6 +4778,11 @@ pub fn compactContextTransaction(
             .policy = if (request.result_storage == .unavailable) .legacy else .assistant_first,
             .result_storage = request.result_storage,
             .trace_ctx = request.trace_ctx,
+            // The summary is written by the same provider and model as the turn,
+            // which is what makes a single availability failure worth retrying
+            // rather than a different answer.
+            .provider = request.provider,
+            .capabilities = compactor_capabilities,
         },
     );
     errdefer compacted.deinit(alloc);
@@ -5603,6 +5613,7 @@ fn processQueuedPromptLoop(
                                 .working_capabilities = request_capabilities,
                                 .request_tokens = request_cost.estimated_input_tokens,
                                 .source_tokens = request_cost.estimated_input_tokens,
+                                .auto_compact_percent = config.auto_compact_percent,
                                 .continuation = continuation,
                                 .active_prefix = active_prefix,
                                 .retained_from = window.cut,

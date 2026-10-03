@@ -1,3 +1,4 @@
+const threshold = @import("../compactor/threshold.zig");
 const std = @import("std");
 const agent_steps = @import("agent_steps.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -45,6 +46,7 @@ pub const Settings = struct {
     credential_source: ?types.CredentialSource = null,
     yolo_acknowledged: ?bool = null,
     max_agent_steps: ?usize = null,
+    auto_compact_percent: ?u8 = null,
     max_tool_result_bytes: ?usize = null,
     context_limits: context_limits.Overrides = .{},
     first_call_tool_choice: ?types.ToolChoice = null,
@@ -103,6 +105,7 @@ pub const StartupStatusSettings = struct {
     model: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
     max_agent_steps: ?usize = null,
+    auto_compact_percent: ?u8 = null,
 
     pub fn deinit(self: *StartupStatusSettings, alloc: Allocator) void {
         if (self.model) |value| alloc.free(value);
@@ -285,6 +288,35 @@ pub fn providerEnvOverride() ?[]const u8 {
 }
 
 /// Trimmed FX_MODEL, or null when unset or blank. Borrows process environment storage.
+/// A saved credential preference only means something for a provider that
+/// authorizes it.
+///
+/// A settings file can name a provider and a credential source that belong to
+/// different providers, usually after a provider is switched without clearing
+/// the remembered key. Honoring that pair would select a key the provider then
+/// refuses, which surfaces as a permanent request failure rather than a missing
+/// key. Treating it as absent lets ordinary precedence resolve the provider,
+/// and reporting it lets the profile be repaired.
+pub fn coherentCredentialSource(
+    provider: ?model_provider.ProviderId,
+    source: ?types.CredentialSource,
+) ?types.CredentialSource {
+    const selected = source orelse return null;
+    const selected_provider = provider orelse return selected;
+    return if (model_provider.authorizesCredential(selected_provider, selected)) selected else null;
+}
+
+/// True when a saved provider and credential source disagree, which means the
+/// remembered key can never be used.
+pub fn credentialSourceIsIncoherent(
+    provider: ?model_provider.ProviderId,
+    source: ?types.CredentialSource,
+) bool {
+    if (source == null) return false;
+    const selected_provider = provider orelse return false;
+    return !model_provider.authorizesCredential(selected_provider, source);
+}
+
 pub fn modelEnvOverride() ?[]const u8 {
     const raw = io_mod.getenv("FX_MODEL") orelse return null;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
@@ -1276,6 +1308,7 @@ fn startupStatusSettingsFromSettings(alloc: Allocator, settings: Settings) !Star
         .model = if (settings.models.get(.openrouter)) |model| try alloc.dupe(u8, model) else null,
         .permission_mode = settings.permission_mode,
         .max_agent_steps = settings.max_agent_steps,
+        .auto_compact_percent = settings.auto_compact_percent,
     };
 }
 
@@ -1287,6 +1320,7 @@ fn mergeStartupStatusSettings(target: *StartupStatusSettings, incoming: *Startup
     }
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
+    if (incoming.auto_compact_percent) |value| target.auto_compact_percent = value;
 }
 
 fn mergeWorkspaceOverridesFromValue(target: *Settings, alloc: Allocator, root_value: std.json.Value, workspace_root: []const u8) !void {
@@ -1402,6 +1436,8 @@ fn parseStartupStatusObject(
                     settings.permission_mode = try readStartupStatusPermissionMode(scanner);
                 } else if (std.mem.eql(u8, key.text, "max_agent_steps")) {
                     settings.max_agent_steps = try readStartupStatusUsize(scanner);
+                } else if (std.mem.eql(u8, key.text, "auto_compact_percent")) {
+                    settings.auto_compact_percent = try readStartupStatusCompactPercent(scanner);
                 } else {
                     try scanner.skipValue();
                 }
@@ -1470,6 +1506,20 @@ fn readStartupStatusPermissionMode(scanner: *std.json.Scanner) !types.Permission
     switch (token) {
         .string => |value| return parsePermissionMode(value) orelse .yolo,
         else => return .yolo,
+    }
+}
+
+/// Reads the compaction share. An out of range value is refused here rather
+/// than stored, so a bad profile cannot quietly change when compaction fires.
+fn readStartupStatusCompactPercent(scanner: *std.json.Scanner) !u8 {
+    const token = try scanner.next();
+    switch (token) {
+        .number => |raw| {
+            var buffer: [24]u8 = undefined;
+            const text = std.fmt.bufPrint(&buffer, "{s}", .{raw}) catch return error.InvalidAutoCompactPercentValue;
+            return threshold.parsePercent(text) orelse error.InvalidAutoCompactPercentValue;
+        },
+        else => return error.InvalidAutoCompactPercentValue,
     }
 }
 
@@ -1822,6 +1872,13 @@ fn parseProjectSafeFields(settings: *Settings, alloc: Allocator, root: std.json.
         settings.provider_strict = strict_value.bool;
     }
 
+    if (root.object.get("auto_compact_percent")) |auto_compact_percent_value| {
+        const value = auto_compact_percent_value;
+        if (value != .integer) return error.InvalidAutoCompactPercentValue;
+        settings.auto_compact_percent = threshold.parsePercent(
+            try std.fmt.allocPrint(alloc, "{d}", .{value.integer}),
+        ) orelse return error.InvalidAutoCompactPercentValue;
+    }
     if (root.object.get("max_agent_steps")) |max_agent_steps_value| {
         const value = max_agent_steps_value;
         if (value != .integer) return error.InvalidMaxAgentStepsType;
@@ -1843,6 +1900,13 @@ fn parseProjectSafeFields(settings: *Settings, alloc: Allocator, root: std.json.
     }
 }
 
+/// Exposed for the core test suite, which pins that every configurable field
+/// survives a merge. A field parsed but not merged is the exact defect this
+/// guards: it looks correct in the file and silently does nothing.
+pub fn mergeSettingsForTesting(target: *Settings, incoming: *Settings, alloc: Allocator) !void {
+    return mergeSettings(target, incoming, alloc);
+}
+
 fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void {
     try target.models.mergeOwnedFrom(alloc, &incoming.models);
     if (incoming.providers) |providers| {
@@ -1855,6 +1919,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.credential_source) |value| target.credential_source = value;
     if (incoming.yolo_acknowledged) |value| target.yolo_acknowledged = value;
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
+    if (incoming.auto_compact_percent) |value| target.auto_compact_percent = value;
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
     target.context_limits.merge(incoming.context_limits);
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;

@@ -1,3 +1,4 @@
+const threshold = @import("../compactor/threshold.zig");
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
@@ -121,6 +122,9 @@ pub const StartupState = struct {
     credential_load_failure: ?credentials.LoadFailure = null,
     auth_mode: credentials.AuthMode = .local,
     credential_source_preference: ?credentials.Source = null,
+    /// The saved provider and credential source disagreed, so the remembered key
+    /// was ignored. Surfaced by `fx doctor`.
+    credential_source_incoherent: bool = false,
     credential_onboarding_skipped: bool = false,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
     configured_providers: @import("../config/configured_provider.zig").Registry = .{},
@@ -133,6 +137,7 @@ pub const StartupState = struct {
     yolo_acknowledged: bool = false,
     permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize,
+    auto_compact_percent: u8 = threshold.default_percent,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     context_limits: config_runtime.context_limits.Values = .{},
     context_enabled: bool = true,
@@ -188,7 +193,7 @@ pub const StartupState = struct {
         }
         if (self.theme) |value| alloc.free(value);
         if (self.openai_compatible_base_url.len > 0) alloc.free(self.openai_compatible_base_url);
-        self.* = .{ .agent_step_limit = self.agent_step_limit };
+        self.* = .{ .agent_step_limit = self.agent_step_limit, .auto_compact_percent = self.auto_compact_percent };
     }
 
     pub fn takeWorkspaceRoot(self: *StartupState) []u8 {
@@ -615,7 +620,17 @@ fn loadStartupStateFromOwnedWorkspace(
     detailed.diagnostics = &.{};
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
-    state.credential_source_preference = settings.credential_source;
+    // An incoherent pair is dropped rather than carried forward, so the session
+    // resolves the provider normally instead of pinning a key that provider
+    // refuses. `fx doctor` reports it so the profile can be repaired.
+    state.credential_source_preference = config_runtime.coherentCredentialSource(
+        state.provider,
+        settings.credential_source,
+    );
+    state.credential_source_incoherent = config_runtime.credentialSourceIsIncoherent(
+        state.provider,
+        settings.credential_source,
+    );
     if (auth_mode == .local and !state.model_requests_blocked) {
         if (credential_mode) |mode| {
             const resolution = try credentials.resolveForProvider(
@@ -634,6 +649,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.yolo_acknowledged = settings.yolo_acknowledged orelse false;
     state.permission_rules = try types.dupePermissionRuleSet(alloc, settings.permission_rules);
     state.agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps);
+    state.auto_compact_percent = loadAutoCompactPercent(settings.auto_compact_percent);
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
     state.context_enabled = settings.context orelse true;
@@ -1409,6 +1425,12 @@ fn loadAgentStepLimit(fallback: usize, configured: ?usize) usize {
         fallback,
         io_mod.getenv("FX_MAX_AGENT_STEPS"),
     );
+}
+
+/// Share of usable input at which automatic compaction fires, with the
+/// per-process override applied on top of the resolved profile value.
+fn loadAutoCompactPercent(configured: ?u8) u8 {
+    return threshold.resolvePercent(configured, io_mod.getenv(threshold.env_var));
 }
 
 fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {

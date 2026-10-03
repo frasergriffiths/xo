@@ -1,3 +1,4 @@
+const threshold = @import("../compactor/threshold.zig");
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -1721,6 +1722,14 @@ fn validateKnownSettingsObject(
     }
     if (object.get("max_agent_steps")) |value| {
         if (value != .integer or value.integer < 0) return error.InvalidSettingsFormat;
+    }
+    if (object.get("auto_compact_percent")) |value| {
+        if (value != .integer or
+            value.integer < threshold.min_percent or
+            value.integer > threshold.max_percent)
+        {
+            return error.InvalidSettingsFormat;
+        }
     }
     if (object.get("max_tool_result_bytes")) |value| {
         if (value != .integer or value.integer < tool_result_limits.min_configured_tool_result_bytes) {

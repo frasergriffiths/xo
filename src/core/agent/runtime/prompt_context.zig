@@ -4,14 +4,13 @@ const token_estimate = @import("../../shared/token_estimate.zig");
 const types = @import("../../shared/types.zig");
 const session_runtime = @import("../../session/session.zig");
 const stream_provider = @import("../stream_provider.zig");
+const threshold = @import("../../compactor/threshold.zig");
 const model_provider = @import("../../config/model_provider.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 const HistoryTurn = types.HistoryTurn;
 
-const compaction_high_water_numerator: usize = 4;
-const compaction_ratio_denominator: usize = 5;
 const compaction_target_denominator: usize = 10;
 const compaction_recent_denominator: usize = 20;
 const compaction_soft_ceiling_denominator: usize = 4;
@@ -34,6 +33,9 @@ pub const CompactionPlanInput = struct {
     source_tokens: usize,
     protected_tokens: usize = 0,
     newest_exchange_tokens: usize = 0,
+    /// Share of usable input at which automatic compaction fires. Defaults to
+    /// the ratio this codebase has always used, so omitting it changes nothing.
+    compact_percent: u8 = threshold.default_percent,
 };
 
 pub const CompactionPlan = struct {
@@ -47,7 +49,7 @@ pub const CompactionPlan = struct {
 pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
     const usable = usableInputTokens(input.capabilities);
     const high_water = if (usable) |tokens|
-        tokens * compaction_high_water_numerator / compaction_ratio_denominator
+        threshold.highWaterTokens(tokens, input.compact_percent)
     else
         null;
     const session_target = if (usable) |tokens|

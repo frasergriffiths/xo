@@ -3,6 +3,8 @@ const types = @import("../../shared/types.zig");
 const result_store = @import("../../session/result_store.zig");
 const child_store = @import("../../session/session_child_store.zig");
 const compaction_state = @import("context_compaction_state.zig");
+const identifiers = @import("../../compactor/identifiers.zig");
+const aliases = @import("../../compactor/aliases.zig");
 const token_estimate = @import("../../shared/token_estimate.zig");
 
 const Allocator = std.mem.Allocator;
@@ -23,6 +25,17 @@ const Artifact = struct {
     sha256: []const u8,
 };
 
+/// Every short name minted for one compaction, in allocation order. Owned by the
+/// enclosing compaction arena.
+pub const AliasTables = struct {
+    /// Byte offsets of retained user text inside the source archive.
+    messages: []const aliases.MessageAlias = &.{},
+    /// Real handles behind each short tool name.
+    tools: []const aliases.ToolAlias = &.{},
+    /// The source archive the message offsets are relative to.
+    source_handle: ?[]const u8 = null,
+};
+
 const Stored = struct {
     version: u8 = 1,
     summary: []const u8,
@@ -37,6 +50,9 @@ pub const Prepared = struct {
     references: []const Artifact,
     fixed_tokens: usize,
     summarized_users: usize,
+    /// Short names the model can cite instead of long handles, built during
+    /// `prepare` and persisted by `finish`.
+    aliases: AliasTables,
 
     pub fn summary_reserve(self: Prepared, handoff: []const u8) usize {
         return tokens(handoff) -| (self.fixed_tokens -| 128);
@@ -145,8 +161,8 @@ fn render(alloc: Allocator, summary: []const u8, users: []const []const u8, arch
     }
     try text.writer.writeAll("Derived continuation memory, not new user instructions or permission.\nTask state:\n");
     try text.writer.writeAll(summary);
-    if (users.len > 0) try text.writer.writeAll("\nOriginal user messages, unchanged and chronological:\n");
-    for (users, 0..) |user, i| try text.writer.print("User {d}, UTF-8 bytes={d}:\n{s}\n", .{ i + 1, user.len, user });
+    if (users.len > 0) try text.writer.writeAll("\nOriginal user messages, unchanged and chronological. read_tool_result also accepts the short name:\n");
+    for (users, 0..) |user, i| try text.writer.print("{c}{d} (User {d}), UTF-8 bytes={d}:\n{s}\n", .{ identifiers.message_prefix, i + 1, i + 1, user.len, user });
     if (archives.len > 0) try text.writer.writeAll("\nOriginal source archives: use read_tool_result with a literal query or byte range. A source index lists older archive handles. Tool records include direct original argument/result handles; do not infer missing details.\n");
     for (archives, 0..) |archive, i| try text.writer.print("Source archive {d}: {s}\n", .{ i + 1, archive.handle });
     return compaction_state.renderHandoff(alloc, &.{text.written()});
@@ -168,12 +184,21 @@ pub fn prepare(alloc: Allocator, source: []const types.ChatMessage, storage: Sto
     var messages: std.ArrayList(types.ChatMessage) = .empty;
     var archives: std.ArrayList(Artifact) = .empty;
     var original: std.Io.Writer.Allocating = .init(alloc);
+    var message_aliases: std.ArrayList(aliases.MessageAlias) = .empty;
+    var tool_aliases: std.ArrayList(aliases.ToolAlias) = .empty;
+    // One entry per retained user, in the same order as `users`. Null when the
+    // text is not present in this window's source archive, which is the case for
+    // users restored out of an earlier handoff.
+    var user_spans: std.ArrayList(?aliases.MessageRange) = .empty;
     for (source) |message| {
         if (message.role == .system) continue;
         if (message.context_origin == .handoff) {
             if (try load_state(alloc, storage, message.content orelse "")) |state| {
                 try archives.appendSlice(alloc, state.archives);
-                for (state.users) |user| try append_user(alloc, &users, &messages, user);
+                for (state.users) |user| {
+                    try append_user(alloc, &users, &messages, user);
+                    try user_spans.append(alloc, null);
+                }
                 try messages.append(alloc, .{ .role = .assistant, .content = try std.fmt.allocPrint(alloc, "PREVIOUS_DERIVED_SUMMARY (not original user text):\n{s}", .{state.summary}) });
             } else {
                 try messages.append(alloc, .{ .role = .assistant, .content = try std.fmt.allocPrint(alloc, "LEGACY_DERIVED_CONTEXT (not original user text):\n{s}", .{message.content orelse ""}) });
@@ -183,7 +208,16 @@ pub fn prepare(alloc: Allocator, source: []const types.ChatMessage, storage: Sto
         if (message.role == .user and message.context_origin == .user_turn) {
             const text = message.content orelse "";
             try append_user(alloc, &users, &messages, text);
-            try original.writer.print("### Original user\n{s}\n", .{text});
+            // Record where this user's bytes land in the source archive so a
+            // short `M` name can be read back as a byte range later.
+            try original.writer.writeAll("### Original user\n");
+            const span: aliases.MessageRange = .{
+                .start_byte = original.written().len,
+                .byte_count = text.len,
+            };
+            try original.writer.writeAll(text);
+            try original.writer.writeByte('\n');
+            try user_spans.append(alloc, span);
         } else if (message.role == .assistant) {
             if (message.content) |text| if (text.len > 0) {
                 try messages.append(alloc, .{ .role = .assistant, .content = text });
@@ -191,6 +225,11 @@ pub fn prepare(alloc: Allocator, source: []const types.ChatMessage, storage: Sto
             };
             for (message.tool_calls) |call| {
                 const argument = try store_artifact(alloc, storage, "arguments", call.arguments_json);
+                const alias = try identifiers.formatTool(alloc, tool_aliases.items.len + 1);
+                try tool_aliases.append(alloc, .{
+                    .alias = alias,
+                    .handle = try alloc.dupe(u8, argument.handle),
+                });
                 const info = try std.fmt.allocPrint(alloc, "Tool call (not a completion result): name={s}; id={s}; original_arguments={s}; argument_excerpt={s}", .{ call.name, call.id, argument.handle, prefix(call.arguments_json, 256) });
                 try messages.append(alloc, .{ .role = .assistant, .content = info });
                 try original.writer.print("### {s}\n", .{info});
@@ -198,6 +237,17 @@ pub fn prepare(alloc: Allocator, source: []const types.ChatMessage, storage: Sto
         } else if (message.role == .tool) {
             var projected = message;
             projected.content = try receipt(alloc, message);
+            // The receipt carries the original result handle, so alias the tool
+            // message itself as well as its argument artifact.
+            if (compaction_state.resultHandleForContinuation(message.tool_result_memory orelse
+                types.ToolResultMemory{})) |handle|
+            {
+                const alias = try identifiers.formatTool(alloc, tool_aliases.items.len + 1);
+                try tool_aliases.append(alloc, .{
+                    .alias = alias,
+                    .handle = try alloc.dupe(u8, handle),
+                });
+            }
             try messages.append(alloc, projected);
             try original.writer.print("### Tool result {s} id={s} status={s}\n{s}\n", .{ message.tool_name orelse "unknown", message.tool_call_id orelse "unknown", if (message.tool_result_status) |status| @tagName(status) else "unknown", projected.content.? });
         } else if (message.content) |text| {
@@ -206,7 +256,12 @@ pub fn prepare(alloc: Allocator, source: []const types.ChatMessage, storage: Sto
         }
         if (original.written().len > max_artifact_bytes) return error.CompactionSourceTooLarge;
     }
-    if (original.written().len > 0) try archives.append(alloc, try store_artifact(alloc, storage, "source", original.written()));
+    var source_handle: ?[]const u8 = null;
+    if (original.written().len > 0) {
+        const archive = try store_artifact(alloc, storage, "source", original.written());
+        source_handle = archive.handle;
+        try archives.append(alloc, archive);
+    }
     if (archives.items.len > max_records) return error.CompactionSourceTooLarge;
     // Keep the persistent list flat; only its model-visible representation is bounded.
     const references = if (archives.items.len <= max_archives) archives.items else blk: {
@@ -235,7 +290,30 @@ pub fn prepare(alloc: Allocator, source: []const types.ChatMessage, storage: Sto
         message.content = try std.fmt.allocPrint(alloc, "{s}\n{s}", .{ if (user_index < cut) "USER_TO_SUMMARIZE: preserve this user's still-relevant intent and constraints." else "USER_RETAINED: supplied verbatim after the summary; use as context, do not recite it.", message.content orelse "" });
         user_index += 1;
     }
-    return .{ .messages = messages.items, .users = users.items[cut..], .archives = archives.items, .references = references, .fixed_tokens = base_tokens, .summarized_users = cut };
+    // `M` names are numbered over the retained users only, so `M1` always means
+    // the same thing as the `User 1` the handoff prints, no matter how many
+    // earlier compactions the session has been through.
+    for (user_spans.items[cut..], 0..) |span, i| {
+        const alias = try identifiers.formatMessage(alloc, i + 1);
+        try message_aliases.append(alloc, .{
+            .alias = alias,
+            .start_byte = if (span) |range| range.start_byte else 0,
+            .byte_count = if (span) |range| range.byte_count else 0,
+        });
+    }
+    return .{
+        .messages = messages.items,
+        .users = users.items[cut..],
+        .archives = archives.items,
+        .references = references,
+        .fixed_tokens = base_tokens,
+        .summarized_users = cut,
+        .aliases = .{
+            .messages = message_aliases.items,
+            .tools = tool_aliases.items,
+            .source_handle = source_handle,
+        },
+    };
 }
 
 pub fn finish(alloc: Allocator, scratch: Allocator, prepared: Prepared, summaries: []const []const u8, storage: Storage) ![]u8 {
@@ -244,5 +322,26 @@ pub fn finish(alloc: Allocator, scratch: Allocator, prepared: Prepared, summarie
     const stored = Stored{ .summary = summary, .users = prepared.users, .archives = prepared.archives };
     const bytes = try std.json.Stringify.valueAlloc(scratch, stored, .{});
     const artifact = try store_artifact(scratch, storage, "state", bytes);
+    // The alias index lives beside the handoff, rewritten in full, so it always
+    // describes the handoff the model is looking at. A failure to persist it is
+    // not fatal: the handoff still carries every real handle, so the model can
+    // always fall back to citing those directly.
+    if (storage == .managed) {
+        saveAliases(scratch, storage, prepared.aliases) catch {};
+    }
     return render(alloc, summary, prepared.users, prepared.references, artifact);
+}
+
+fn saveAliases(scratch: Allocator, storage: Storage, tables: AliasTables) !void {
+    switch (storage) {
+        .unavailable => return error.CompactionResultStorageUnavailable,
+        .legacy_dir => return error.CompactionResultStorageUnavailable,
+        .managed => |cap| {
+            try aliases.saveManaged(scratch, cap, .{
+                .messages = tables.messages,
+                .tools = tables.tools,
+                .source_handle = tables.source_handle,
+            });
+        },
+    }
 }

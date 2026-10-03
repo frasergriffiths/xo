@@ -1,3 +1,4 @@
+const threshold = @import("../../compactor/threshold.zig");
 const std = @import("std");
 const skill_invocation = @import("../../skills/skill_invocation.zig");
 const types = @import("../../shared/types.zig");
@@ -42,6 +43,8 @@ pub const Config = struct {
     },
     custom_tool_guidance: []const u8 = "",
     agent_step_limit: usize,
+    /// Share of usable input at which automatic compaction fires.
+    auto_compact_percent: u8 = threshold.default_percent,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     step_limit_notice: []const u8 = default_step_limit_notice,
     cancel_flag: *std.atomic.Value(bool),
