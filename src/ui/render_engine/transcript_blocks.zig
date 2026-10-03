@@ -1387,8 +1387,13 @@ fn renderBoxedGrid(alloc: Allocator, table: assistant_presentation.TablePayload,
         alloc.free(cell_lines);
     }
 
+    // A header row with no text in any cell carries no information, so it is
+    // drawn as a normal row instead of an empty emphasized band.
+    const has_header = table.rows.len > 0 and tableHeaderHasText(table.rows[0]);
+
     try appendTableBorder(alloc, out, "┌", "┬", "┐", widths);
     for (table.rows, 0..) |row, row_index| {
+        const is_header = has_header and row_index == 0;
         var row_height: usize = 1;
         for (widths, cell_lines, 0..) |width, *lines, col| {
             const cell: []const u8 = if (col < row.cells.len) row.cells[col] else "";
@@ -1402,14 +1407,14 @@ fn renderBoxedGrid(alloc: Allocator, table: assistant_presentation.TablePayload,
                 if (line_index < lines.items.len) {
                     const line = lines.items[line_index];
                     const pad = width -| line.width;
-                    const alignment: assistant_presentation.TableColumnAlign = if (row_index == 0) .left else table.alignments[col];
+                    const alignment: assistant_presentation.TableColumnAlign = if (is_header) .left else table.alignments[col];
                     const left_pad = switch (alignment) {
                         .left => 0,
                         .right => pad,
                         .center => pad / 2,
                     };
                     try out.appendNTimes(alloc, ' ', left_pad);
-                    try appendTableCellLine(alloc, out, line, row_index == 0);
+                    try appendTableCellLine(alloc, out, line, is_header);
                     try out.appendNTimes(alloc, ' ', pad - left_pad);
                 } else {
                     try out.appendNTimes(alloc, ' ', width);
@@ -1418,10 +1423,24 @@ fn renderBoxedGrid(alloc: Allocator, table: assistant_presentation.TablePayload,
             }
             try out.append(alloc, '\n');
         }
-        if (row_index == 0 and table.rows.len > 1) try appendTableBorder(alloc, out, "├", "┼", "┤", widths);
-        if (row_index > 0 and row_index + 1 < table.rows.len) try appendTableBorder(alloc, out, "├", "┼", "┤", widths);
+        const last_row = row_index + 1 == table.rows.len;
+        if (!last_row) {
+            // The rule under the header separates headings; otherwise every
+            // interior rule does.
+            if (is_header or row_index > 0) {
+                try appendTableBorder(alloc, out, "├", "┼", "┤", widths);
+            }
+        }
     }
     try appendTableBorder(alloc, out, "└", "┴", "┘", widths);
+}
+
+/// True when any cell in a header row carries visible text.
+fn tableHeaderHasText(row: assistant_presentation.TableRow) bool {
+    for (row.cells) |cell| {
+        if (hasTableCellText(cell)) return true;
+    }
+    return false;
 }
 
 /// One physical line of a wrapped cell. `text` borrows the cell bytes; the

@@ -27,53 +27,6 @@ pub const top_level_specs = [_]TopLevelSpec{
         .summary = "Show this help",
     },
     .{
-        .kind = .ask,
-        .token = "ask",
-        .usage = "ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
-        .summary = "Run one noninteractive request",
-        .options = &.{
-            .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
-            .{ .flag = "--full-access", .description = "Disable fx permission checks" },
-            .{ .flag = "--yolo", .description = "Alias for --full-access" },
-            .{ .flag = "--model <id>", .description = "Override the model for this request" },
-            .{ .flag = "--effort <level>", .description = "Override the reasoning effort for this request" },
-            .{ .flag = "--fast", .description = "Enable Fast mode for this request when the model supports it" },
-            .{ .flag = "--no-fast", .description = "Disable Fast mode for this request" },
-            .{ .flag = "--provider-order <a,b,...>", .description = "Prefer these gateway providers in order for this request" },
-            .{ .flag = "--provider-strict", .description = "Restrict this request to only the providers in --provider-order" },
-            .{ .flag = "--no-provider-strict", .description = "Clear the provider restriction for this request" },
-            .{ .flag = "--image PATH", .description = "Attach an image file; repeat for multiple images" },
-            .{ .flag = "--system TEXT", .description = "Replace the built-in system prompt for this request" },
-            json_option,
-            .{ .flag = "--quiet", .description = "Suppress assistant output" },
-            .{ .flag = "--prompt-permissions", .description = "Prompt for Y/N permission approval when stdin is a TTY" },
-            .{ .flag = "--no-save", .description = "Do not save the session; incompatible with --resume and --resume-id" },
-            .{ .flag = "--no-color", .description = "Render TTY output without colors or hyperlinks" },
-            .{ .flag = "--resume <last|id>", .description = "Continue the last session or a session by id" },
-            .{ .flag = "--resume-id <id>", .description = "Continue a session by exact id" },
-            .{ .flag = "--continue-recovery", .description = "Resume the paused model response in the selected session" },
-            .{ .flag = "--", .description = "Treat every following argument as prompt text" },
-        },
-        .details = &.{
-            "The prompt may be passed as arguments or piped on stdin when no prompt args are given.",
-            "TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.",
-            "Operational progress and diagnostics are written to stderr. JSON `output` keeps accumulated assistant Markdown; `final_output` contains only the completed final response, or an empty string when absent.",
-            "JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. Nested usage and dollar spend are excluded.",
-            "--system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.",
-            "With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.",
-        },
-    },
-    .{
-        .kind = .acp,
-        .token = "acp",
-        .usage = "acp [--model <id>] [--log-file <path>]",
-        .summary = "Start an ACP server over stdio",
-        .options = &.{
-            .{ .flag = "--model <id>", .description = "Override the default model" },
-            .{ .flag = "--log-file <path>", .description = "Write ACP logs to a file" },
-        },
-    },
-    .{
         .kind = .pr,
         .token = "pr",
         .usage = "pr [--auto] [--create] [context]",
@@ -234,9 +187,6 @@ pub const top_level_help_fast_buffer_bytes: usize = 32 * 1024;
 
 pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
-        .{ .kind = .ask, .usage = "ask <prompt>" },
-    } },
-    .{ .entries = &.{
         .{ .kind = .pr, .usage = "pr [context]" },
         .{ .kind = .issue, .usage = "issue [context]" },
     } },
@@ -262,7 +212,6 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .doctor, .usage = "doctor" },
         .{ .kind = .workspace, .usage = "workspace" },
         .{ .kind = .upgrade, .usage = "upgrade", .summary = "Upgrade fx on the selected release channel" },
-        .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .help, .usage = "help" },
     } },
 };
@@ -328,7 +277,6 @@ pub const top_level_flags = [_]TopLevelFlag{
 
 pub const top_level_examples = [_]TopLevelExample{
     .{ .command = "fx", .description = "Start a fresh interactive session" },
-    .{ .command = "fx ask \"Explain the changes in this repository\"", .description = "Run one request and exit" },
     .{ .command = "fx session resume last", .description = "Continue the latest session for this workspace" },
     .{ .command = "fx status --json", .description = "Inspect the current configuration as JSON" },
 };
@@ -346,7 +294,7 @@ pub const top_level_resources = [_]TopLevelResource{
 pub const top_level_registry = TopLevelRegistry{
     .specs = top_level_specs[0..],
     .description = "Fast, native coding agent for the terminal.",
-    .interactive_hint = "fx starts an interactive session by default. Use `fx ask` to run one noninteractive request.",
+    .interactive_hint = "fx starts an interactive session. Type your request at the prompt.",
     .help_groups = top_level_help_groups[0..],
     .flags = top_level_flags[0..],
     .examples = top_level_examples[0..],

@@ -1389,7 +1389,6 @@ pub fn validate_checkpoint_anchor(
 pub const TransportRole = enum {
     interactive,
     headless,
-    acp,
 };
 
 pub const TerminalLifetime = enum {

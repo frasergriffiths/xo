@@ -52,6 +52,8 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run fx");
     run_step.dependOn(&run_cmd.step);
 
+    const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this text");
+
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
@@ -61,7 +63,7 @@ pub fn build(b: *std.Build) void {
         "FX_TEST_PRODUCT_EXE",
         b.getInstallPath(.bin, "fx"),
     );
-    if (b.option([]const u8, "test-filter", "Only run tests whose name contains this text")) |filter| {
+    if (test_filter) |filter| {
         const arena = b.allocator.create(std.heap.ArenaAllocator) catch @panic("OOM");
         arena.* = std.heap.ArenaAllocator.init(b.allocator);
         const owned = arena.allocator().dupe([]const u8, &.{filter}) catch @panic("OOM");
@@ -70,6 +72,29 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+
+    // The core suite under tests/ links the same modules the binary uses, so
+    // a passing run is evidence about shipped behaviour rather than a copy.
+    const suite_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    // Some modules under test read build metadata, so the suite gets the same
+    // options module the binary is compiled with.
+    suite_tests.root_module.addImport("build_options", build_options.createModule());
+    // The same `-Dtest-filter` the in-source suite honors applies here.
+    if (test_filter) |filter| {
+        const suite_allocator = b.allocator.create(std.heap.ArenaAllocator) catch @panic("OOM");
+        suite_allocator.* = std.heap.ArenaAllocator.init(b.allocator);
+        const owned = suite_allocator.allocator().dupe([]const u8, &.{filter}) catch @panic("OOM");
+        @field(suite_tests, "filters") = owned;
+    }
+    const run_suite_tests = b.addRunArtifact(suite_tests);
+    test_step.dependOn(&run_suite_tests.step);
 
     const pgso_ir_step = b.step(
         "pgso-ir",

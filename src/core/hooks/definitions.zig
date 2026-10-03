@@ -62,7 +62,6 @@ pub const all_hooks = [_]HookDefinition{
 pub const ScopeKind = enum {
     interactive,
     ask,
-    acp,
     subagent,
 };
 

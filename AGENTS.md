@@ -72,7 +72,6 @@ Key rules:
 
 * `src/gateway/` owns provider transport. It must not absorb product-state logic.
 
-* `src/acp/` owns the ACP (Agent Client Protocol) JSON-RPC 2.0 server.
 
 ### Adding a Feature
 
@@ -86,8 +85,9 @@ Before implementing, answer in order:
 If unclear, define the contract first.
 
 Deterministic coverage belongs beside the source it exercises, as a Zig unit
-test. Terminal rendering and resize behavior belong in `src/ui/resize_tests.zig`,
-which drives `TranscriptRuntime` in process against the shared terminal engine.
+test. Behavior that spans modules belongs in the `tests/` suite. Terminal
+rendering and resize behavior belong in `src/ui/resize_tests.zig`, which drives
+`TranscriptRuntime` in process against the shared terminal engine.
 
 ### Adding a Command
 
@@ -118,7 +118,7 @@ Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `backg
 
 Security is permission-first. All sensitive tool behavior must integrate with `src/core/permissions/permissions.zig`.
 
-fx has a single permission mode: full access, accepted as `full-access`, `full access`, or `yolo`. `permission_mode` accepts no other value; an unrecognized or legacy value is ignored and full access still applies. Every tool call is allowed without a human permission prompt, and full access uses an effective sandbox of `none`.
+fx has a single permission mode: full access, spelled `yolo`. That is the only value `permission_mode` and `FX_PERMISSION_MODE` accept, and it is what fx persists. There are no aliases and no legacy values: `full-access`, `full access`, `ask`, and `auto` are all unrecognized, and an unrecognized value is ignored so full access still applies. Never reject a whole settings file over a retired label. Every tool call is allowed without a human permission prompt, and full access uses an effective sandbox of `none`.
 
 Do not bypass the permission system for new tools.
 
@@ -148,7 +148,7 @@ Do not bypass the permission system for new tools.
 
 * For JSON serialization, use `std.json.Stringify.value` with an allocating writer (`std.Io.Writer.Allocating`).
 
-* For JSON string escaping (writing raw JSON), use the project's `writeJsonStr` helper in `src/acp/jsonrpc.zig` rather than assuming `std.json.encodeJsonString` exists.
+* For JSON string escaping (writing raw JSON), use the project's `writeJsonStr` helper in `src/core/shared/json_str.zig` rather than assuming `std.json.encodeJsonString` exists.
 
 * Zig 0.16 uses `std.Io.File.stdin()` / `.stdout()` / `.stderr()`, not `std.io.getStdIn()`.
 
@@ -192,15 +192,24 @@ Do not bypass the permission system for new tools.
 
 ## Testing
 
-The complete test suite is Zig and lives beside the source it covers. Run the
-narrowest relevant test while developing:
+Both test suites are Zig and run through one command:
 
 ```bash
-zig build test                        # every unit test
+zig build test                        # everything
 zig build test -Dtest-filter=resume   # only tests whose name contains "resume"
 ```
 
-Terminal rendering and resize behavior are also covered in process by
+* **In-source** unit tests live beside the code they cover.
+* **`tests/`** holds the core suite: cross-cutting behavior such as credential
+  resolution, the provider surface, permission-mode parsing, JSON escaping,
+  command surface, table rendering, and text measurement. These link the same
+  modules the binary links, so a green run is evidence about shipped behavior.
+
+`tests.zig` at the repository root is the suite entry point. It must stay there:
+Zig scopes `@import` to a module's root directory, so a file inside `tests/`
+can only reach `src/` when both belong to the same module.
+
+Terminal rendering and resize behavior are covered in process by
 `src/ui/resize_tests.zig`, which needs no fd, no tmux, and no timing luck.
 
 ## Pull Request Classification

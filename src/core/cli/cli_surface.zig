@@ -3,8 +3,7 @@ const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
-const acp_runner = @import("acp_runner.zig");
-const cli_ask = @import("cli_ask.zig");
+const one_shot = @import("one_shot.zig");
 const cli_replay = @import("cli_replay.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
@@ -50,8 +49,6 @@ const TopLevelKind = command_specs.TopLevelKind;
 pub const Command = union(enum) {
     interactive,
     help,
-    ask: []const [:0]const u8,
-    acp: []const [:0]const u8,
     pr: []const [:0]const u8,
     issue: []const [:0]const u8,
     setup: []const [:0]const u8,
@@ -203,7 +200,6 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
-    acp_runner: acp_runner.Runner,
 };
 
 const LocalSurfaceOptions = struct {
@@ -286,11 +282,6 @@ const SessionRecoveryOptions = struct {
         alloc.free(self.session_id);
         self.* = undefined;
     }
-};
-
-const AcpOptions = struct {
-    model: ?[]const u8 = null,
-    log_file: ?[]const u8 = null,
 };
 
 const WorkflowOptions = struct {
@@ -519,10 +510,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
                 } };
             }
         },
-        'a' => {
-            if (command_specs.matchesTopLevel(command_catalog, command, .ask)) return .{ .ask = args[1..] };
-            if (command_specs.matchesTopLevel(command_catalog, command, .acp)) return .{ .acp = args[1..] };
-        },
+        'a' => {},
         'd' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .doctor)) return .{ .doctor = args[1..] };
         },
@@ -978,45 +966,6 @@ fn runNonInteractiveWithDeps(
         .interactive, .resume_session => unreachable,
         .help => {
             try writeTopLevelHelp(alloc, cfg.command_catalog, deps, cfg.version, .stdout);
-            return .handled_success;
-        },
-        .ask => |rest| {
-            const exit_code = try cli_ask.run(alloc, rest, workflowConfigWithLaunchModifiers(cfg, global_args.modifiers), cfg.context_registry, cfg.tool_set);
-            return if (exit_code == 0) .handled_success else .handled_failure;
-        },
-        .acp => |rest| {
-            const acp_opts = parseAcpArgs(rest) catch {
-                try writeStderr(deps, "usage: fx acp [--model <id>] [--log-file <path>]\n");
-                return .handled_failure;
-            };
-            try cfg.acp_runner.run(alloc, .{
-                .auth_mode = cfg.auth_mode,
-                .default_model = cfg.default_model,
-                .default_agent_step_limit = cfg.default_agent_step_limit,
-                .gateway_retry_count = cfg.gateway_retry_count,
-                .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
-                .gateway_models_path = cfg.models_path,
-                .gateway_provider = cfg.gateway_provider,
-                .provider_set = cfg.provider_set,
-                .process_provider = cfg.process_provider,
-                .secret_store = cfg.secret_store,
-                .prompt_policy = cfg.prompt_policy,
-                .ignored_list_entries = cfg.ignored_list_entries,
-                .max_list_entries = cfg.max_list_entries,
-                .max_read_file_bytes = cfg.max_read_file_bytes,
-                .max_read_file_lines = cfg.max_read_file_lines,
-                .max_read_file_line_len = cfg.max_read_file_line_len,
-                .max_command_output_bytes = cfg.max_command_output_bytes,
-                .max_tool_result_bytes = cfg.max_tool_result_bytes,
-                .max_history_turns = cfg.max_history_turns,
-                .context_registry = cfg.context_registry,
-                .mode_registry = cfg.mode_registry,
-                .context_limit_overrides = global_args.modifiers.context_limit_overrides,
-                .additional_directories = global_args.modifiers.additional_directories,
-                .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
-                .model_override = acp_opts.model,
-                .log_file = acp_opts.log_file,
-            });
             return .handled_success;
         },
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
@@ -1598,11 +1547,11 @@ fn runGithubWorkflow(
 
     const workflow_cfg = workflowConfigWithLaunchModifiers(cfg, launch_modifiers);
     if (!opts.create) {
-        const exit_code = try cli_ask.runPrompt(alloc, prompt, opts.auto_permission, workflow_cfg, cfg.context_registry, cfg.tool_set);
+        const exit_code = try one_shot.runPrompt(alloc, prompt, opts.auto_permission, workflow_cfg, cfg.context_registry, cfg.tool_set);
         return if (exit_code == 0) .handled_success else .handled_failure;
     }
 
-    const run_result = try cli_ask.runPromptCapture(alloc, prompt, opts.auto_permission, workflow_cfg, cfg.context_registry, cfg.tool_set);
+    const run_result = try one_shot.runPromptCapture(alloc, prompt, opts.auto_permission, workflow_cfg, cfg.context_registry, cfg.tool_set);
     defer run_result.deinit(alloc);
     if (run_result.exit_code != 0) return .handled_failure;
 
@@ -1636,7 +1585,7 @@ fn runGithubWorkflow(
 
 /// Parses the draft from the completed final response only, so text the model
 /// wrote before a tool call never becomes the title or body.
-fn draftFromRun(alloc: Allocator, run_result: cli_ask.PromptRunResult) !github_publish.Draft {
+fn draftFromRun(alloc: Allocator, run_result: one_shot.PromptRunResult) !github_publish.Draft {
     return github_publish.parseDraft(alloc, run_result.final_source);
 }
 
@@ -2376,10 +2325,9 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
     };
 }
 
-fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
+fn workflowConfig(cfg: Config) @import("one_shot.zig").Config {
     return .{
         .auth_mode = cfg.auth_mode,
-        .command_usage = command_specs.topLevelUsage(cfg.command_catalog, .ask),
         .default_model = cfg.default_model,
         .default_agent_step_limit = cfg.default_agent_step_limit,
         .gateway_retry_count = cfg.gateway_retry_count,
@@ -2406,7 +2354,7 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
 fn workflowConfigWithLaunchModifiers(
     cfg: Config,
     modifiers: LaunchModifiers,
-) @import("cli_ask.zig").Config {
+) @import("one_shot.zig").Config {
     var result = workflowConfig(cfg);
     result.context_limit_overrides = modifiers.context_limit_overrides;
     result.additional_directories = modifiers.additional_directories;
@@ -2416,7 +2364,7 @@ fn workflowConfigWithLaunchModifiers(
 
 fn commandSupportsWorkspaceModifiers(command: Command) bool {
     return switch (command) {
-        .interactive, .ask, .acp, .pr, .issue, .resume_session => true,
+        .interactive, .pr, .issue, .resume_session => true,
         else => false,
     };
 }
@@ -2424,14 +2372,14 @@ fn commandSupportsWorkspaceModifiers(command: Command) bool {
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --add-dir and --no-additional-dirs are only supported for interactive, resume, ask, ACP, PR, and issue launches\n",
+        "fx: --add-dir and --no-additional-dirs are only supported for interactive, resume, ask, PR, and issue launches\n",
     );
 }
 
 fn writeModelModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --provider, --model, --effort, --fast, --provider-order, and --provider-strict apply to interactive sessions; for one-shot runs pass model flags after `fx ask`\n",
+        "fx: --provider, --model, --effort, --fast, --provider-order, and --provider-strict apply to interactive sessions\n",
     );
 }
 
@@ -2450,25 +2398,6 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.ConflictingProviderStrictFlags => "--provider-strict and --no-provider-strict cannot be used together",
         else => null,
     };
-}
-
-fn parseAcpArgs(args: []const [:0]const u8) !AcpOptions {
-    var opts = AcpOptions{};
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--model")) {
-            if (opts.model != null or i + 1 >= args.len) return error.InvalidAcpArgs;
-            i += 1;
-            opts.model = args[i];
-        } else if (std.mem.eql(u8, args[i], "--log-file")) {
-            if (opts.log_file != null or i + 1 >= args.len) return error.InvalidAcpArgs;
-            i += 1;
-            opts.log_file = args[i];
-        } else {
-            return error.InvalidAcpArgs;
-        }
-    }
-    return opts;
 }
 
 fn parseLocalSurfaceArgs(args: []const [:0]const u8) !LocalSurfaceOptions {
@@ -2980,10 +2909,6 @@ fn stableCliTestEnviron() !*const std.process.Environ.Map {
     return map;
 }
 
-fn unexpectedAcpRunForTest(_: ?*anyopaque, _: Allocator, _: acp_runner.Config) anyerror!void {
-    return error.TestUnexpectedAcpRun;
-}
-
 fn testSurfaceChatUrlResolve(_: ?*anyopaque, fallback: []const u8) []const u8 {
     return fallback;
 }
@@ -3013,7 +2938,6 @@ fn testConfig() Config {
         .max_history_turns = 8,
         .context_registry = test_surface_context_registry,
         .mode_registry = .{ .default_mode_id = "surface" },
-        .acp_runner = .{ .run_fn = unexpectedAcpRunForTest },
         .tool_set = .{
             .registry = .{ .tools = &.{} },
             .order = &.{},

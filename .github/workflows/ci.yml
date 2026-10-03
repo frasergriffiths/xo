@@ -103,7 +103,6 @@ jobs:
       - name: Shellcheck Fx scripts
         run: |
           scripts=(
-            benchmarks/startup.sh
             scripts/check-public-surface.sh
           )
           bash -n "${scripts[@]}"

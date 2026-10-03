@@ -1,6 +1,6 @@
 //! The session index: the single derived owner of "which saved sessions exist
 //! and how they summarize". Every listing surface (the resume picker,
-//! `fx sessions`, `fx session last`, ACP listing, and latest-session resume)
+//! `fx sessions`, `fx session last`, and latest-session resume)
 //! reads it through `listActionableCatalog`, so no listing surface scans
 //! session directories on its own.
 //!

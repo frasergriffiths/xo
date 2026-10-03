@@ -973,6 +973,22 @@ pub fn parsePermissionMode(raw: []const u8) ?types.PermissionMode {
     return types.PermissionMode.parse(raw);
 }
 
+test "permission mode accepts only yolo" {
+    // `yolo` is the only spelling, and it is what fx persists.
+    for ([_][]const u8{ "yolo", "YOLO", "Yolo" }) |raw| {
+        try std.testing.expectEqual(types.PermissionMode.yolo, parsePermissionMode(raw).?);
+    }
+
+    // Retired labels are not aliases. They must not come back.
+    for ([_][]const u8{
+        "full-access", "full_access", "full access", "fullaccess",
+        "ask",         "auto",        "none",        "default",
+        "",            " yolo",       "yolo ",
+    }) |raw| {
+        try std.testing.expectEqual(@as(?types.PermissionMode, null), parsePermissionMode(raw));
+    }
+}
+
 pub fn parsePermissionAction(raw: []const u8) ?types.PermissionAction {
     if (std.ascii.eqlIgnoreCase(raw, "allow")) return .allow;
     if (std.ascii.eqlIgnoreCase(raw, "ask")) return .ask;

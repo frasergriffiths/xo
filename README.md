@@ -16,7 +16,7 @@ fx is a coding agent CLI written in Zig: a small native binary that is open sour
 ## Highlights
 
 - **OpenRouter:** every model fx can reach through one OpenRouter API key, plus your own OpenAI-compatible endpoints such as Ollama
-- **Any interface:** interactive shell, one-shot `fx ask` for scripts, or `fx acp` for editors that speak the Agent Client Protocol
+- **Terminal only:** one interactive shell, plus one-shot commands for scripts
 - **Shell-like output:** inline rendering that preserves your terminal scrollback
 - **Extensible:** skills and subagents
 
@@ -49,13 +49,8 @@ cd your_project
 fx
 ```
 
-Or make a one-shot request:
-
-```bash
-fx ask "explain the changes in this repository"
-```
-
-Inside the shell, run `/help` to browse interactive commands.
+Type your request at the prompt. Inside the shell, run `/help` to browse
+interactive commands.
 
 In tmux, use your usual prefix bindings to switch sessions or enter copy mode.
 fx preserves those tmux views while resizing, including when the switcher zooms a split pane.
@@ -77,7 +72,7 @@ Add named connections for any OpenAI Chat Completions endpoint, including local 
 
 ```bash
 fx provider local
-FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 fx ask "review this change"
+FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 fx
 ```
 
 See [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) for connection JSON, model metadata, and behavior details.
@@ -100,7 +95,6 @@ Both keys also work in a committed project `.fx.json`, and per launch:
 
 ```bash
 fx --provider-order azure,openai --provider-strict
-fx ask --provider-order bedrock "review this change"
 FX_PROVIDER_ORDER=vertex FX_PROVIDER_STRICT=1 fx
 ```
 
@@ -114,19 +108,14 @@ to OpenRouter requests only; custom model connections ignore it.
 fx runs with a single permission mode: full access. Tool calls execute without a
 human permission prompt and the effective sandbox is `none`.
 
-The former `ask` and `auto` modes no longer exist. A saved or environment value
-of `ask`, `auto`, `full-access`, or `yolo` is read as full access for backward
-compatibility; any other value is ignored and full access still applies.
+`yolo` is the only accepted value for `permission_mode` and `FX_PERMISSION_MODE`,
+and it is what fx persists. The former `ask` and `auto` modes no longer exist,
+and the `full-access` and `full access` spellings are no longer recognized. Any
+unrecognized value is ignored and full access still applies.
 
 ## Themes
 
 fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with the `theme` setting or `FX_THEME=<name>` per launch. Without an explicitly selected theme, diff markers and edit counts stay monochrome; selecting any theme adds its diff marker colors. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.
-
-## Editors
-
-fx builds as a single native binary and runs in your terminal. `fx acp` starts
-the native Agent Client Protocol server over stdio, so editors that speak ACP,
-such as Zed, can drive the agent directly.
 
 ## Build from source
 

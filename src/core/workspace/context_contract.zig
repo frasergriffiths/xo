@@ -424,14 +424,12 @@ pub const Fragment = enum {
 pub const EntryPoint = enum {
     interactive,
     ask,
-    acp,
     subagent,
 
     fn label(self: EntryPoint) []const u8 {
         return switch (self) {
             .interactive => "interactive",
-            .ask => "fx ask",
-            .acp => "ACP",
+            .ask => "one-shot run",
             .subagent => "subagent",
         };
     }
@@ -485,7 +483,7 @@ const current_inventory = [_]EntrypointInventory{
     },
     .{
         .entrypoint = .ask,
-        .assembly_path = "cli_ask.runPromptInternal -> agent_runtime dependencies",
+        .assembly_path = "one_shot.runPromptInternal -> agent_runtime dependencies",
         .static_context = "builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot before the prompt, then adds scoped deltas from effective structured tool targets",
         .transient_context = "tool_runtime transient context each model step with captured permission mode, noninteractive output callbacks, and no live user question path",
         .tools = "mode-filtered paired tool advertisement and included custom-provider guidance with permission rules",
@@ -493,17 +491,6 @@ const current_inventory = [_]EntrypointInventory{
         .session = "fresh headless SessionRuntime, optional persisted session id, empty prior history, no local approval grants",
         .drift_status = .intentional,
         .drift = "noninteractive permission blockers and absent live clarification UI differ from interactive by design",
-    },
-    .{
-        .entrypoint = .acp,
-        .assembly_path = "acp.prompt.handlePrompt -> agent_runtime dependencies",
-        .static_context = "builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot from accepted local resources before each ACP prompt, then adds scoped tool-target deltas",
-        .transient_context = "tool_runtime transient context each model step using the prompt-captured permission mode, ACP session state, and noninteractive tool/update callbacks",
-        .tools = "mode-filtered paired tool advertisement and included custom-provider guidance with ACP session permission rules",
-        .permission = "ACP session mode ask/auto; approval-required actions map to refusal or policy decisions instead of terminal prompts",
-        .session = "active ACP session id, selected model, mode, persisted history on load, and session runtime history",
-        .drift_status = .intentional,
-        .drift = "ACP JSON-RPC session updates and refusal mapping differ from terminal output by protocol contract",
     },
     .{
         .entrypoint = .subagent,
@@ -561,20 +548,13 @@ pub fn writeEntrypointLayoutSnapshot(writer: *std.Io.Writer) !void {
         \\  per_step_overlay_order: explicit_skill_chunks, transient_runtime_context
         \\  user_prompt_position: after stable system context and history
         \\  intentional_difference: live terminal approvals and clarification UI
-        \\- entrypoint: fx ask
+        \\- entrypoint: one-shot run
         \\  static_context_refresh: one applicable snapshot before the prompt; scoped deltas attach before affected tool execution
         \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, optional_prepared_parent_turn_delivery_context
         \\  stable_prefix_later_additions: applicable_project_context_deltas committed mid-turn when a tool batch has applicable targets
         \\  per_step_overlay_order: explicit_skill_chunks, transient_runtime_context
         \\  user_prompt_position: after stable system context and empty or saved history
         \\  intentional_difference: approval-required actions become noninteractive blockers
-        \\- entrypoint: ACP
-        \\  static_context_refresh: one applicable snapshot per ACP prompt including accepted local resource targets; scoped deltas attach before affected tool execution
-        \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, optional_prepared_parent_turn_delivery_context
-        \\  stable_prefix_later_additions: applicable_project_context_deltas committed mid-turn when a tool batch has applicable targets
-        \\  per_step_overlay_order: explicit_skill_chunks, transient_runtime_context
-        \\  user_prompt_position: after stable system context and ACP session history
-        \\  intentional_difference: ACP protocol maps prompts, refusals, and updates to JSON-RPC session messages
         \\- entrypoint: subagent
         \\  static_context_refresh: the launching surface's snapshot with empty child delivery state; scoped deltas attach before affected tool execution
         \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, optional_prepared_parent_turn_delivery_context

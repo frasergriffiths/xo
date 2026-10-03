@@ -217,7 +217,6 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
 
 pub const Config = struct {
     auth_mode: credentials.AuthMode = .local,
-    command_usage: []const u8,
     default_model: []const u8,
     default_agent_step_limit: usize,
     gateway_retry_count: usize,
@@ -320,7 +319,7 @@ noinline fn failPromptRunResultDynamic(err: anyerror) anyerror!PromptRunResult {
     return err;
 }
 
-/// Resume selector parsed from fx ask --resume.
+/// Resume selector parsed from the one-shot resume flags.
 const ResumeTarget = session_store.ResumeTarget;
 
 const AskOptions = struct {
@@ -871,7 +870,7 @@ const AskContext = struct {
                 "event=ask_session_store_unavailable error={s}",
                 .{@errorName(err)},
             );
-            try self.writeStderr("fx ask: warning: session persistence unavailable; error=");
+            try self.writeStderr("fx: warning: session persistence unavailable; error=");
             try self.writeStderr(@errorName(err));
             try self.writeStderr("; continuing without saving\n");
             return;
@@ -1158,237 +1157,6 @@ fn freshAskState(
     };
 }
 
-pub fn run(alloc: Allocator, args: []const [:0]const u8, cfg: Config, context_registry: context_contract.Registry, tool_set: tool_set_contract.ToolSet) !u8 {
-    return runWithDeps(alloc, args, cfg, .{
-        .load_startup_state = loadStartupStateDefault,
-        .context_registry = context_registry,
-        .tool_set = tool_set,
-        .install_headless_interrupt = true,
-    });
-}
-
-fn selectOutputMode(quiet: bool, json: bool, stdout_is_tty: bool, no_color: bool) OutputMode {
-    if (json) return .json;
-    if (quiet) return .quiet;
-    if (!stdout_is_tty) return .raw;
-    return if (no_color) .terminal_no_color else .terminal;
-}
-
-fn checkHeadlessCancellation(deps: RunDeps) !void {
-    if (comptime supports_headless_interrupt) {
-        if (deps.install_headless_interrupt and
-            headless_interrupt.cancel_requested.load(.seq_cst))
-        {
-            return error.Cancelled;
-        }
-    }
-}
-
-fn writeAskUsage(deps: RunDeps, usage: []const u8) !void {
-    try deps.write_stderr(deps.stderr_ctx, "usage: fx ");
-    try deps.write_stderr(deps.stderr_ctx, usage);
-    try deps.write_stderr(deps.stderr_ctx, "\n");
-}
-
-fn askErrorNotice(err: anyerror) ?[]const u8 {
-    if (auth_runtime.preparationFailureNotice(err)) |notice| return notice;
-    if (config_runtime.modelNotSelectedMessage(err)) |message| return message;
-    return switch (err) {
-        error.ImagePreparationFailed => image_attachments.image_preparation_failed_notice,
-        error.ModelImageCapabilityUnavailable => image_attachments.model_image_capability_unavailable_notice,
-        else => null,
-    };
-}
-
-fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !u8 {
-    var interrupt_scope = try headless_interrupt.Scope.install(
-        deps.install_headless_interrupt,
-    );
-    defer interrupt_scope.restoreAndRedeliver();
-
-    var options = parseOptionsWithStdin(alloc, args, deps.stdin_source) catch |err| switch (err) {
-        error.MissingPrompt => {
-            if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, @errorName(err));
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
-                return 1;
-            }
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: missing prompt\n");
-            try writeAskUsage(deps, cfg.command_usage);
-            return 1;
-        },
-        error.NoSaveResumeConflict => {
-            if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, "InvalidAskArgs");
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
-                return 1;
-            }
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: --no-save cannot be used with --resume or --resume-id\n");
-            try writeAskUsage(deps, cfg.command_usage);
-            return 1;
-        },
-        error.PromptResourceLimitExceeded => {
-            if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, @errorName(err));
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
-                return 1;
-            }
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: prompt exceeds the local input safety limit\n");
-            return 1;
-        },
-        error.PromptInputReadFailed => {
-            if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, @errorName(err));
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
-                return 1;
-            }
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: failed to read prompt from stdin\n");
-            return 1;
-        },
-        error.InvalidAskArgs => {
-            if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, @errorName(err));
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
-                return 1;
-            }
-            try writeAskUsage(deps, cfg.command_usage);
-            return 1;
-        },
-        error.InvalidPromptText => {
-            if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, @errorName(err));
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
-                return 1;
-            }
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: prompt must be valid UTF-8 and contain no NUL bytes\n");
-            return 1;
-        },
-        else => return err,
-    };
-    defer options.deinit(alloc);
-
-    if (interrupt_scope.requested()) return headless_interrupt.exitCode();
-    if (options.image_paths.items.len > 0) {
-        const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-        defer alloc.free(workspace_root);
-        if (!try preflightAskImages(alloc, workspace_root, &options, deps)) return 1;
-    }
-    if (interrupt_scope.requested()) return headless_interrupt.exitCode();
-
-    var effective_cfg = cfg;
-    if (options.system_prompt_override) |sp| {
-        effective_cfg.prompt_policy.system_prompt = sp;
-    }
-
-    const output_mode = selectOutputMode(
-        options.quiet,
-        options.json_output,
-        deps.stdout_is_tty(deps.stdout_ctx),
-        options.no_color,
-    );
-    const result = runPromptInternal(alloc, options.prompt, options.permission_override, effective_cfg, .{
-        .output_mode = output_mode,
-        .prompt_permissions = options.prompt_permissions,
-        .images = if (options.images.items.len > 0) options.images.items else &.{},
-        .command_timeout_ms = options.timeout_ms,
-        .save_session = !options.no_save,
-        .resume_target = options.resume_target,
-        .color_enabled = !options.no_color,
-        .continue_recovery = options.continue_recovery,
-        .model_override = options.model_override,
-        .effort_override = options.effort_override,
-        .fast_override = options.fast_override,
-        .provider_order_override = options.provider_order_override,
-        .provider_strict_override = options.provider_strict_override,
-        .deps = deps,
-    }) catch |err| {
-        if (interrupt_scope.requested()) return headless_interrupt.exitCode();
-        if (err == error.OutOfMemory) return err;
-        if (err == error.OneOffSessionNotResumable and !options.json_output) {
-            try deps.write_stderr(
-                deps.stderr_ctx,
-                "fx ask: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n",
-            );
-            return 1;
-        }
-        if (!options.json_output) {
-            const notice = askErrorNotice(err) orelse return err;
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: ");
-            try deps.write_stderr(deps.stderr_ctx, notice);
-            try deps.write_stderr(deps.stderr_ctx, "\n");
-            return 1;
-        }
-        const json = try renderErrorJsonResult(alloc, @errorName(err));
-        defer alloc.free(json);
-        try deps.write_stdout(deps.stdout_ctx, json);
-        return 1;
-    };
-    defer result.deinit(alloc);
-
-    if (result.interrupted or interrupt_scope.requested()) {
-        return headless_interrupt.exitCode();
-    }
-
-    if (options.json_output) {
-        const json = try renderFinalJsonResult(alloc, result);
-        defer alloc.free(json);
-        if (interrupt_scope.requested()) return headless_interrupt.exitCode();
-        try deps.write_stdout(deps.stdout_ctx, json);
-    }
-
-    return if (interrupt_scope.requested())
-        headless_interrupt.exitCode()
-    else
-        result.exit_code;
-}
-
-fn preflightAskImages(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    options: *AskOptions,
-    deps: RunDeps,
-) !bool {
-    for (options.image_paths.items) |image_path| {
-        const attachment = image_attachments.loadUserImageAttachment(
-            alloc,
-            workspace_root,
-            image_path,
-        ) catch |err| {
-            if (err == error.OutOfMemory) return err;
-            const reason = switch (err) {
-                error.FileNotFound => "image file not found",
-                error.UnsupportedImageType => "unsupported image type",
-                error.ImageTooLarge => image_attachments.image_too_large_notice,
-                else => @errorName(err),
-            };
-            if (options.json_output) {
-                const detail = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ @errorName(err), image_path });
-                defer alloc.free(detail);
-                const json = try renderErrorJsonResult(alloc, detail);
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
-            } else {
-                var message: std.Io.Writer.Allocating = .init(alloc);
-                defer message.deinit();
-                try message.writer.print("fx ask: failed to attach image \"{s}\": {s}\n", .{ image_path, reason });
-                try deps.write_stderr(deps.stderr_ctx, message.written());
-            }
-            return false;
-        };
-        var attachment_owned = true;
-        errdefer if (attachment_owned) types.freeImageAttachment(alloc, attachment);
-        try options.images.append(alloc, attachment);
-        attachment_owned = false;
-    }
-    return true;
-}
-
 pub fn runPrompt(alloc: Allocator, prompt: []const u8, auto_permission: bool, cfg: Config, context_registry: context_contract.Registry, tool_set: tool_set_contract.ToolSet) !u8 {
     _ = auto_permission;
     const result = try runPromptInternal(alloc, prompt, null, cfg, .{
@@ -1425,7 +1193,7 @@ fn missingCredentialResult(
         .required_source = auth_runtime.requestedSource(provider, preferred),
     };
     const message = status.missingHelp(.cli).?;
-    try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: ");
+    try options.deps.write_stderr(options.deps.stderr_ctx, "fx: ");
     try options.deps.write_stderr(options.deps.stderr_ctx, message);
     try options.deps.write_stderr(options.deps.stderr_ctx, "\n");
     return .{
@@ -1433,6 +1201,16 @@ fn missingCredentialResult(
         .assistant_output = try alloc.dupe(u8, ""),
         .error_code = "MissingCredentials",
     };
+}
+
+fn checkHeadlessCancellation(deps: RunDeps) !void {
+    if (comptime supports_headless_interrupt) {
+        if (deps.install_headless_interrupt and
+            headless_interrupt.cancel_requested.load(.seq_cst))
+        {
+            return error.Cancelled;
+        }
+    }
 }
 
 fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: ?PermissionMode, initial_cfg: Config, options: RunOptions) !PromptRunResult {
@@ -1490,7 +1268,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         var notice_writer: std.Io.Writer.Allocating = .init(alloc);
         defer notice_writer.deinit();
         try notice_writer.writer.print(
-            "fx ask: config {s}: {s}",
+            "fx: config {s}: {s}",
             .{ @tagName(diagnostic.layer), @tagName(diagnostic.cause) },
         );
         try config_runtime.writeDiagnosticMetadata(&notice_writer.writer, diagnostic);
@@ -2419,17 +2197,17 @@ fn finishCliPermissionOutcome(
     switch (outcome.requirement orelse .approval_required) {
         .configured_rule => try writeBlockedActionGuidance(
             ctx,
-            "fx ask: permission required by configured rule",
+            "fx: permission required by configured rule",
             label,
             "noninteractive_permission_prompt_unavailable",
-            "fx ask: rerun in the interactive shell to approve this action, or add a narrow matching permission rule before retrying\n",
+            "fx: rerun in the interactive shell to approve this action, or add a narrow matching permission rule before retrying\n",
         ),
         .approval_required => try writeBlockedActionGuidance(
             ctx,
-            "fx ask: permission required for tool execution in noninteractive mode",
+            "fx: permission required for tool execution in noninteractive mode",
             label,
             "noninteractive_permission_prompt_unavailable",
-            "fx ask: rerun with --auto to review this exact action automatically, or use the interactive shell to approve it\n",
+            "fx: rerun with --auto to review this exact action automatically, or use the interactive shell to approve it\n",
         ),
     }
     try recordToolCallRejected(
@@ -2472,9 +2250,9 @@ fn writeBlockedActionGuidance(
     hint: []const u8,
 ) !void {
     try ctx.writeLine(headline);
-    try ctx.writeStderr("fx ask: blocked action: ");
+    try ctx.writeStderr("fx: blocked action: ");
     try ctx.writeStderr(label);
-    try ctx.writeStderr("\nfx ask: reason=");
+    try ctx.writeStderr("\nfx: reason=");
     try ctx.writeStderr(reason);
     try ctx.writeStderr("\n");
     try ctx.writeStderr(hint);
@@ -2522,7 +2300,7 @@ fn emitAskNotificationBell(raw: *anyopaque) void {
     ctx.writeStderr("\x07") catch |err| {
         debug_trace.logf(
             "notifications",
-            "fx ask terminal bell write failed err={s}",
+            "fx terminal bell write failed err={s}",
             .{@errorName(err)},
         );
     };
@@ -2735,7 +2513,7 @@ fn appendToolCallRecordBestEffort(
         error_code,
     ) catch |err| {
         debug_trace.logf(
-            "cli_ask",
+            "one_shot",
             "tool-call capture dropped name={s} status={s} err={s}",
             .{ call.name, status, @errorName(err) },
         );
@@ -3372,7 +3150,7 @@ fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u
     else
         try gateway_error_format.formatHttpErrorMessage(ctx.alloc, status, detail);
     defer ctx.alloc.free(message);
-    try ctx.writeStderr("fx ask: ");
+    try ctx.writeStderr("fx: ");
     try ctx.writeStderr(message);
     try ctx.writeStderr("\n");
     if (ctx.output_mode.capturesJson()) {
@@ -3425,7 +3203,7 @@ fn resolveAskSubagentAuthority(
     );
 }
 
-/// Parses one `--provider-order` value for `fx ask`, replacing any earlier
+/// Parses one `--provider-order` value for a one-shot run, replacing any earlier
 /// occurrence. The returned slice is owned by `alloc`.
 fn parseAskProviderOrder(alloc: Allocator, raw: []const u8, previous: ?[][]const u8) ![][]const u8 {
     const parsed: [][]const u8 = switch (config_runtime.parseProviderOrderList(alloc, raw)) {
@@ -3568,7 +3346,7 @@ fn emitHeadlessYoloWarning(alloc: Allocator, options: RunOptions) !void {
             var message: std.Io.Writer.Allocating = .init(alloc);
             defer message.deinit();
             try message.writer.print(
-                "fx ask: failed to save full access acknowledgment: {s}\n",
+                "fx: failed to save full access acknowledgment: {s}\n",
                 .{@errorName(failure.err)},
             );
             try options.deps.write_stderr(options.deps.stderr_ctx, message.written());
@@ -4017,7 +3795,6 @@ fn testGatewayChatUrlResolve(_: ?*anyopaque, fallback: []const u8) []const u8 {
 
 fn testConfig() Config {
     return .{
-        .command_usage = "ask [--auto|--full-access] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--] <prompt>",
         .default_model = "model",
         .default_agent_step_limit = 4,
         .gateway_retry_count = 1,

@@ -1704,9 +1704,9 @@ fn validateKnownSettingsObject(
         }
     }
     if (object.get("permission_mode")) |value| {
-        if (value != .string or types.PermissionMode.parse(value.string) == null) {
-            return error.InvalidSettingsFormat;
-        }
+        // Full access is the only mode and unrecognized values resolve to it,
+        // so a retired label must not invalidate the rest of the file.
+        if (value != .string) return error.InvalidSettingsFormat;
     }
     if (object.get("theme")) |value| {
         if (value != .string) return error.InvalidSettingsFormat;

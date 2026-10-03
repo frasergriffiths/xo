@@ -22,7 +22,7 @@ const render_request = @import("../../ui/render_request.zig");
 
 const freeStringList = collections.freeStringList;
 const containsIgnoreCase = text_utils.containsIgnoreCase;
-const permissions_usage = "usage: /permissions [full-access|reset]\n       /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>";
+const permissions_usage = "usage: /permissions [yolo|reset]\n       /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>";
 
 pub fn reportUserSettingsCommit(
     app: anytype,

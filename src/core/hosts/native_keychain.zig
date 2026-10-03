@@ -119,7 +119,7 @@ fn userDefaultKeychainAvailableForCommand(
 }
 
 /// Returns a slice borrowing `buf`. `USER` stays authoritative when set, because it
-/// is the only way to target a non-login account. ACP clients launched by GUI editors
+/// is the only way to target a non-login account. Processes launched by GUI editors
 /// inherit a thinner environment than a shell, so the operating system supplies the
 /// account when `USER` is absent instead of failing the read.
 fn accountName(buf: *AccountBuffer) Error![]const u8 {

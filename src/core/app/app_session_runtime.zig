@@ -4882,8 +4882,8 @@ pub fn Runtime(comptime App: type) type {
 
         /// A fresh interactive session that never received durable work has
         /// nothing to resume. Discarding it on close keeps each launch from
-        /// leaving an empty session directory behind, matching `fx ask` and
-        /// ACP. A user-chosen title is durable intent, so a renamed session stays.
+        /// leaving an empty session directory behind, matching one-shot runs.
+        /// A user-chosen title is durable intent, so a renamed session stays.
         fn discardableOnClose(
             app: *App,
             loaded: *session_store.LoadedWritableSession,

@@ -352,19 +352,32 @@ fn resolveWithProvider(
     _ = mode;
     const env_source = envSourceFor(provider) orelse return .{};
     const stored_source = storedSourceFor(provider) orelse return .{};
+    // A remembered source only speaks for the provider that owns it. Honoring
+    // another provider's key here would adopt a credential the selected route
+    // then refuses, which surfaces as a permanent request failure rather than
+    // a missing key. Such a preference is ignored so normal precedence for
+    // this provider runs instead.
     if (preferred) |source| {
-        if (isStoredSource(source) and secret_store.isDisabled()) {
-            debug_trace.logf("auth", "explicit source unavailable source={t} reason=disabled", .{source});
-            return .{};
+        if (!model_provider.authorizesCredential(provider, source)) {
+            debug_trace.logf(
+                "auth",
+                "preferred source not authorized for provider source={t} provider={t}",
+                .{ source, provider },
+            );
+        } else {
+            if (isStoredSource(source) and secret_store.isDisabled()) {
+                debug_trace.logf("auth", "explicit source unavailable source={t} reason=disabled", .{source});
+                return .{};
+            }
+            const chosen = loadSource(alloc, secret_store, source) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                debug_trace.logf("auth", "explicit source load failed source={t} err={s}", .{ source, @errorName(err) });
+                return .{ .failure = .{ .source = source, .err = err } };
+            };
+            if (chosen) |credential| return .{ .credential = credential };
+            debug_trace.logf("auth", "explicit source unavailable source={t}", .{source});
+            return missingExplicitResolution(source);
         }
-        const chosen = loadSource(alloc, secret_store, source) catch |err| {
-            if (err == error.OutOfMemory) return err;
-            debug_trace.logf("auth", "explicit source load failed source={t} err={s}", .{ source, @errorName(err) });
-            return .{ .failure = .{ .source = source, .err = err } };
-        };
-        if (chosen) |credential| return .{ .credential = credential };
-        debug_trace.logf("auth", "explicit source unavailable source={t}", .{source});
-        return missingExplicitResolution(source);
     }
 
     if (try loadSource(alloc, secret_store, env_source)) |credential| return .{ .credential = credential };

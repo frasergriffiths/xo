@@ -1798,15 +1798,15 @@ pub const FinishedPrompt = struct {
     snapshot_file_ownership: ?SnapshotFileOwnership = null,
 };
 
-/// fx always runs with full access. `full-access`, `full access`, and `yolo`
-/// are the only recognized labels; every other value is unrecognized.
+/// fx always runs with full access. `yolo` is the only recognized value, and
+/// it is also the persisted and wire spelling. Every other value, including
+/// the former `full-access`, `full access`, `ask`, and `auto` labels, is
+/// unrecognized and resolves to full access.
 pub const PermissionMode = enum {
     yolo,
 
     pub fn parse(raw: []const u8) ?PermissionMode {
-        if (std.ascii.eqlIgnoreCase(raw, "full-access") or
-            std.ascii.eqlIgnoreCase(raw, "full access") or
-            std.ascii.eqlIgnoreCase(raw, "yolo")) return .yolo;
+        if (std.ascii.eqlIgnoreCase(raw, "yolo")) return .yolo;
         return null;
     }
 };

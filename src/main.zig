@@ -15,8 +15,6 @@ const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
 const usage_dashboard_runtime = @import("core/app/usage_dashboard_runtime.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
-const acp_runner = @import("core/cli/acp_runner.zig");
-const acp_server = @import("acp/server.zig");
 const app_input_runtime = @import("core/app/app_input_runtime.zig");
 const input_full_transcript_runtime = @import("core/app/input_full_transcript_runtime.zig");
 const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
@@ -2942,7 +2940,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
     // The compiled provider set carries the OpenAI-compatible route only once
     // its endpoint is known. The interactive session resolves that from the
     // profile during bootstrap, so the noninteractive commands have to do the
-    // same or `fx ask` reports the provider as unavailable.
+    // same or a one-shot command reports the provider as unavailable.
     var entry_cfg = cfg;
     applyOpenAiCompatibleEndpointFromSettings(alloc, &entry_cfg);
 
@@ -3134,9 +3132,7 @@ fn hasPosixArgVector() bool {
 
 fn needsFullEntryConfig(args: []const [:0]const u8) bool {
     const command = cli_surface.commandAfterGlobalLaunchArgs(args) orelse return false;
-    return std.mem.eql(u8, command, "ask") or
-        std.mem.eql(u8, command, "acp") or
-        std.mem.eql(u8, command, "pr") or
+    return std.mem.eql(u8, command, "pr") or
         std.mem.eql(u8, command, "issue");
 }
 
@@ -3157,7 +3153,7 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
 }
 
 /// Gives the noninteractive provider set the OpenAI-compatible endpoint the
-/// profile has saved, so commands like `fx ask` reach the same endpoint the
+/// profile has saved, so commands reach the same endpoint the
 /// interactive session uses. A failure here only means the endpoint stays
 /// unresolved, which is the state those commands already handled.
 fn applyOpenAiCompatibleEndpointFromSettings(
@@ -3211,8 +3207,6 @@ fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .context_registry = default_context_registry,
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
-
-        .acp_runner = .{ .run_fn = runAcpServer },
     };
 }
 
@@ -3246,8 +3240,6 @@ fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .context_registry = default_context_registry,
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
-
-        .acp_runner = .{ .run_fn = runAcpServer },
     };
 }
 
@@ -3281,13 +3273,7 @@ fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .context_registry = default_context_registry,
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
-
-        .acp_runner = .{ .run_fn = runAcpServer },
     };
-}
-
-fn runAcpServer(_: ?*anyopaque, alloc: Allocator, cfg: acp_runner.Config) anyerror!void {
-    return acp_server.run(alloc, cfg);
 }
 
 fn handleSigWinchNative(_: std.posix.SIG) callconv(.c) void {

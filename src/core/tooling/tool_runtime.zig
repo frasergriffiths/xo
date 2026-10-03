@@ -147,7 +147,7 @@ pub const Context = struct {
     worker: *WorkerRuntime,
     /// Sole prompt capability admission consults. When null, admission never
     /// prompts: it resolves by rule, automatic review, or fail-closed denial
-    /// (e.g. ACP hosts prompt over JSON-RPC by setting this).
+    /// (e.g. a noninteractive host sets this explicitly).
     permission_prompter: ?permission_prompter.Prompter = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     session: *SessionRuntime,
@@ -191,7 +191,7 @@ pub const Context = struct {
     host_sandbox_default: tool_admission.HostSandboxDefault = .none,
     model_capability_resolver: ?model_capabilities.Resolver = null,
     model_override_resolver: ?subagent_tool_host.ModelOverrideResolver = null,
-    /// False when running outside an interactive TUI (e.g. ACP). Tools
+    /// False when running outside an interactive TUI (e.g. headless runs). Tools
     /// that require a live user (like `ask_user_question`) short-circuit
     /// in that case.
     interactive: bool = true,
@@ -243,7 +243,6 @@ pub const Context = struct {
             .transport_role = switch (self.lifecycle_scope.kind) {
                 .interactive, .subagent => .interactive,
                 .ask => .headless,
-                .acp => .acp,
             },
             .max_output_bytes = self.max_command_output_bytes,
             .cancel_flag = runtimeCancelFlag(self),
@@ -834,7 +833,6 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .terminal_transport_role = switch (ctx.lifecycle_scope.kind) {
             .interactive, .subagent => .interactive,
             .ask => .headless,
-            .acp => .acp,
         },
         .lifecycle_allocator = ctx.session_allocator,
         .cancel_flag = runtimeCancelFlag(ctx),

@@ -170,7 +170,7 @@ message attribution are not deterministic tests.
 
 Security is permission-first.
 
-* `permission_mode` controls baseline behavior (`ask`, `auto`, or `full-access`; `yolo` remains an alias)
+* `permission_mode` records the baseline mode. Full access is the only mode and `yolo` is its only spelling
 
 * `permission` config applies OpenCode-style wildcard rules
 
