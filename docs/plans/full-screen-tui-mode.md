@@ -435,8 +435,15 @@ write is worse than one that does not exist:
    rather than telling the user the mode is saved. The existing handlers use
    `persistUserPreferences` and `persistUserPreferencesSilently` (`app_commands.zig:2962`).
 2. **An invalid stored value must not brick startup.** `parseProfileOnlyFields` rejects a
-   non-bool with a typed error, and that error path has to resolve to "fall back to inline"
-   rather than refusing to launch. A display preference is not worth a failed startup.
+   non-bool with a typed error, and that error path has to resolve to something the user can
+   act on rather than refusing to launch silently.
+
+   Measured correction: fx does **not** fall back to inline for a malformed value. Every
+   bool preference behaves the same way. With `{"startup_scrollback": "nonsense"}` or
+   `{"fast_mode": 1}` in `~/.fx/settings.json`, fx exits 0 and writes
+   `fx: config user: malformed_settings` to stderr, naming the problem instead of quietly
+   ignoring it. `/fullscreen` matches that existing behavior rather than inventing a second,
+   inconsistent one.
 3. **The stored value is a launch default, and the toggle wins.** If `/fullscreen off` writes
    `false`, the next launch starts inline. A mid-session toggle already reconciled terminal
    state, so it needs no second write.

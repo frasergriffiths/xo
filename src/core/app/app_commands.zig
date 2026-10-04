@@ -277,6 +277,7 @@ pub fn Handlers(comptime App: type) type {
                 .ctx = @ptrCast(app),
                 .quit = commandQuit,
                 .clear_screen = commandClearScreen,
+                .fullscreen = commandFullscreen,
                 .new_session = commandNewSession,
                 .reset_session = commandResetSession,
                 .resume_session = commandResumeSession,
@@ -1025,6 +1026,11 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             try handleStatuslineCommand(app, rest);
+        }
+
+        fn commandFullscreen(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try handleFullscreenCommand(app, rest);
         }
 
         fn commandHandleNotifications(ctx: *anyopaque, rest: []const u8) !void {
@@ -2603,6 +2609,84 @@ fn parseSoundLevel(value: []const u8) ?SoundLevel {
     if (std.mem.eql(u8, value, "on")) return .on;
     if (std.mem.eql(u8, value, "max")) return .max;
     return null;
+}
+
+/// Resolves `/fullscreen` to an explicit on or off. Bare invocation toggles
+/// against the current launch default rather than an in-session runtime flag,
+/// because the first release changes the next launch rather than swapping the
+/// buffer mid-session.
+fn resolveFullscreenTarget(app: anytype, rest: []const u8) ?bool {
+    const trimmed = std.mem.trim(u8, rest, " \t");
+    if (trimmed.len == 0) return !currentFullscreenPreference(app);
+    if (std.ascii.eqlIgnoreCase(trimmed, "on")) return true;
+    if (std.ascii.eqlIgnoreCase(trimmed, "off")) return false;
+    return null;
+}
+
+fn currentFullscreenPreference(app: anytype) bool {
+    if (comptime @hasField(std.meta.Child(@TypeOf(app)), "fullscreen")) return app.fullscreen;
+    if (comptime @hasDecl(std.meta.Child(@TypeOf(app)), "fullscreenPreference")) {
+        return app.fullscreenPreference();
+    }
+    return false;
+}
+
+fn handleFullscreenCommand(app: anytype, rest: []const u8) !void {
+    const target = resolveFullscreenTarget(app, rest) orelse {
+        try app.writeDomainNotice(.{
+            .topic = "fullscreen",
+            .tone = .@"error",
+            .body = "usage: /fullscreen [on|off]",
+        }, true);
+        return;
+    };
+
+    const runtime_changed = if (comptime @hasField(std.meta.Child(@TypeOf(app)), "fullscreen"))
+        target != app.fullscreen
+    else
+        false;
+    if (comptime @hasField(std.meta.Child(@TypeOf(app)), "fullscreen")) app.fullscreen = target;
+
+    const patch: config_runtime.UserSettingsPatch = .{ .fullscreen = target };
+    var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
+    defer attempt.deinit(app.alloc);
+    switch (attempt) {
+        .failure => |failure| {
+            try session_commands.reportUserSettingsFailure(
+                app,
+                "fullscreen",
+                failure.err,
+                failure.cleanup,
+                runtime_changed,
+            );
+            return;
+        },
+        .outcome => |outcome| _ = try session_commands.reportUserSettingsCommit(
+            app,
+            "fullscreen",
+            patch,
+            outcome,
+            null,
+            false,
+        ),
+    }
+
+    var message: std.Io.Writer.Allocating = .init(app.alloc);
+    defer message.deinit();
+    if (target) {
+        message.writer.writeAll("full screen display: on. It applies the next time you start fx.") catch return;
+    } else {
+        message.writer.writeAll("full screen display: off. fx starts inline next time.") catch return;
+    }
+    const body = message.written();
+    try app.writeDomainNotice(.{
+        .topic = "fullscreen",
+        .tone = .neutral,
+        .body = body,
+    }, true);
+    if (comptime @hasField(std.meta.Child(@TypeOf(app)), "shell")) {
+        app.shell.render_requests.request(.footer);
+    }
 }
 
 fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {

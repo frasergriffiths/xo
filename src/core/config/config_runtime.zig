@@ -58,6 +58,9 @@ pub const Settings = struct {
     provider_order: ?[][]const u8 = null,
     provider_strict: ?bool = null,
     slash_menu_categories: ?bool = null,
+    /// Launch the shell in the full-screen chat surface. Null inherits the
+    /// built-in default, which is inline.
+    fullscreen: ?bool = null,
     collapse_tool_calls: ?bool = null,
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
@@ -797,6 +800,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "openai_compatible_base_url",
         "session_titles",
         "startup_scrollback",
+        "fullscreen",
         "prompt_history",
         "statusLine",
         "notifications",
@@ -1670,6 +1674,12 @@ fn parseProfileOnlyFields(
         }
     }
 
+    if (root.object.get("fullscreen")) |fullscreen_value| {
+        const value = fullscreen_value;
+        if (value != .bool) return error.InvalidFullscreenType;
+        settings.fullscreen = value.bool;
+    }
+
     if (root.object.get("fast_mode")) |fast_mode_value| {
         const value = fast_mode_value;
         if (value != .bool) return error.InvalidFastModeType;
@@ -1924,6 +1934,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     target.context_limits.merge(incoming.context_limits);
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
     if (incoming.context) |value| target.context = value;
+    if (incoming.fullscreen) |value| target.fullscreen = value;
     if (incoming.fast_mode) |value| target.fast_mode = value;
     if (incoming.fast_mode_model_bound) |value| target.fast_mode_model_bound = value;
     if (incoming.provider_order) |value| {

@@ -265,7 +265,9 @@ A Full CI result is valid only when it belongs to the exact current commit and e
 
 ## Reproducing Render Bugs
 
-fx's rendering is inline by default and deliberately emits a small ANSI subset. Three owner classes are the narrow exceptions, and each takes the alternate buffer exclusively through `AlternateScreenOwner` in `src/ui/shell_runtime.zig`: interactive permission review, the full-transcript screen, and catalog menus. Only one class may own the buffer at a time, and each must leave it and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes when it closes. Transcript rendering, question prompts, command-output expansion, and subagent delegation remain inline. Three tools exist for reproducing and regression-proofing render bugs:
+fx's rendering is inline by default and deliberately emits a small ANSI subset. Three owner classes are the narrow exceptions, and each takes the alternate buffer exclusively through `AlternateScreenOwner` in `src/ui/shell_runtime.zig`: interactive permission review, the full-screen chat surface, and catalog menus. Only one class may own the buffer at a time, and each must leave it and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes when it closes. Transcript rendering, question prompts, command-output expansion, and subagent delegation remain inline.
+
+The full-screen chat surface is toggleable through `/fullscreen`, and it replaces the former Ctrl+O full-transcript reader rather than adding a fourth owner class. It reuses the same owner slot and the same alternate-screen enter path that reader used. While it holds the buffer the composer lives inside the frame, so the surface stays live: the user composes, sends, watches a response stream, and answers permission prompts without leaving it. The full-screen surface is the ordinary chat layout with the composer and footer pinned to the bottom of the frame, not an expanded or detail view, and it shows no more than inline does. Inline remains the default. Three tools exist for reproducing and regression-proofing render bugs:
 
 ### Debug terminal recording and replay
 

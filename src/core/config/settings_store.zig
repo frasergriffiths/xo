@@ -101,6 +101,7 @@ pub const UserSettingsPatch = struct {
     collapse_tool_calls: ?bool = null,
     update_channel: ?update_target.Channel = null,
     startup_scrollback: ?bool = null,
+    fullscreen: ?bool = null,
     prompt_history_enabled: ?bool = null,
     statusline_item: ?StatuslineItemPatch = null,
     session_titles: ?bool = null,
@@ -125,6 +126,7 @@ pub const UserSettingsPatch = struct {
             self.collapse_tool_calls == null and
             self.update_channel == null and
             self.startup_scrollback == null and
+            self.fullscreen == null and
             self.prompt_history_enabled == null and
             self.statusline_item == null and
             self.session_titles == null and
@@ -221,6 +223,7 @@ const UserPreferenceField = enum(u4) {
     collapse_tool_calls,
     update_channel,
     startup_scrollback,
+    fullscreen,
     prompt_history_enabled,
     statusline_context,
     statusline_session,
@@ -240,6 +243,7 @@ const UserPreferenceField = enum(u4) {
             .collapse_tool_calls => "settings.json.preference-migration.collapse_tool_calls.json",
             .update_channel => "settings.json.preference-migration.update_channel.json",
             .startup_scrollback => "settings.json.preference-migration.startup_scrollback.json",
+            .fullscreen => "settings.json.preference-migration.fullscreen.json",
             .prompt_history_enabled => "settings.json.preference-migration.prompt_history_enabled.json",
             .statusline_context => "settings.json.preference-migration.statusline_context.json",
             .statusline_session => "settings.json.preference-migration.statusline_session.json",
@@ -289,7 +293,7 @@ const SettingsMutation = union(enum) {
 
     fn mutationMode(self: SettingsMutation) []const u8 {
         return switch (self) {
-            .user => |patch| if (patch.prompt_history_enabled != null)
+            .user => |patch| if (patch.prompt_history_enabled != null or patch.fullscreen != null)
                 "commit_first"
             else
                 "runtime_first",
@@ -948,6 +952,7 @@ fn applyUserPatchToRoot(
     if (patch.collapse_tool_calls) |value| application.changed = try putBool(arena, &root.object, "collapse_tool_calls", value) or application.changed;
     if (patch.update_channel) |value| application.changed = try putString(arena, &root.object, "update_channel", value.label()) or application.changed;
     if (patch.startup_scrollback) |value| application.changed = try putBool(arena, &root.object, "startup_scrollback", value) or application.changed;
+    if (patch.fullscreen) |value| application.changed = try putBool(arena, &root.object, "fullscreen", value) or application.changed;
     if (patch.session_titles) |value| application.changed = try putBool(arena, &root.object, "session_titles", value) or application.changed;
 
     if (patch.prompt_history_enabled) |enabled| {
@@ -1756,7 +1761,7 @@ fn validateKnownSettingsObject(
             }
         }
     }
-    inline for (&.{ "context", "fast_mode", "auto_upgrade", "slash_menu_categories", "startup_scrollback", "yolo_acknowledged", "provider_strict" }) |key| {
+    inline for (&.{ "context", "fast_mode", "auto_upgrade", "slash_menu_categories", "startup_scrollback", "fullscreen", "yolo_acknowledged", "provider_strict" }) |key| {
         if (object.get(key)) |value| {
             if (value != .bool) return error.InvalidSettingsFormat;
         }

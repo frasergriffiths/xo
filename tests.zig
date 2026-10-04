@@ -22,6 +22,7 @@ pub const summary_model_selection = @import("tests/summary_model_selection.zig")
 pub const table_rendering = @import("tests/table_rendering.zig");
 pub const text_measurement = @import("tests/text_measurement.zig");
 pub const vt_engine = @import("tests/vt_engine.zig");
+pub const fullscreen_setting = @import("tests/fullscreen_setting.zig");
 
 test {
     std.testing.refAllDecls(@This());

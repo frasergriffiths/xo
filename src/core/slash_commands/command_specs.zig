@@ -50,6 +50,7 @@ pub const SlashKind = enum {
     statusline,
     notifications,
     workspace,
+    fullscreen,
     version,
 };
 

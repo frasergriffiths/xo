@@ -219,7 +219,8 @@ Check in the golden file and add a Zig test that re-runs `fx replay` and diffs.
 
 * Do not commit generated state from `.fx/`, `.zig-cache/`, or `zig-out/`
 
-* Do not add a general alternate-screen (`\x1b[?1049h/l`) render path. fx is inline by design except for the three exclusive owner classes represented by `AlternateScreenOwner`: interactive tool-approval review, the full-transcript screen, and catalog menus. Every owner must leave or explicitly hand off the alternate buffer and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes before resolving, cancelling, or shutting down
+* Do not add a general alternate-screen (`\x1b[?1049h/l`) render path. fx is inline by design except for the three exclusive owner classes represented by `AlternateScreenOwner`: interactive tool-approval review, the full-screen chat surface, and catalog menus. Every owner must leave or explicitly hand off the alternate buffer and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes before resolving, cancelling, or shutting down
+* Do not reintroduce the Ctrl+O full-transcript reader. `/fullscreen` owns that surface now, reusing the same owner slot, and Ctrl+O must do nothing
 
 ## Releases
 

@@ -7,6 +7,7 @@ const SlashRegistry = command_specs.SlashRegistry;
 pub const ParsedCommand = union(enum) {
     quit,
     clear_screen,
+    fullscreen: []const u8,
     new_session,
     reset_session,
     resume_session,
@@ -38,6 +39,7 @@ pub const CommandHandlers = struct {
     ctx: *anyopaque,
     quit: *const fn (ctx: *anyopaque) anyerror!void,
     clear_screen: *const fn (ctx: *anyopaque) anyerror!void,
+    fullscreen: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     new_session: *const fn (ctx: *anyopaque) anyerror!void,
     reset_session: *const fn (ctx: *anyopaque) anyerror!void,
     resume_session: *const fn (ctx: *anyopaque) anyerror!void,
@@ -73,6 +75,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
     return switch (kind) {
         .quit => .quit,
         .clear_screen => .clear_screen,
+        .fullscreen => .{ .fullscreen = payload },
         .new_session => .new_session,
         .reset_session => .reset_session,
         .resume_session => .resume_session,
@@ -117,6 +120,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
     switch (parse(registry, cmd)) {
         .quit => try handlers.quit(handlers.ctx),
         .clear_screen => try handlers.clear_screen(handlers.ctx),
+        .fullscreen => |rest| try handlers.fullscreen(handlers.ctx, rest),
         .new_session => try handlers.new_session(handlers.ctx),
         .reset_session => try handlers.reset_session(handlers.ctx),
         .resume_session => try handlers.resume_session(handlers.ctx),
@@ -219,6 +223,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .ctx = ctx,
         .quit = unexpectedNoPayload,
         .clear_screen = unexpectedNoPayload,
+        .fullscreen = unexpectedPayload,
         .new_session = unexpectedNoPayload,
         .reset_session = unexpectedNoPayload,
         .resume_session = unexpectedNoPayload,
