@@ -24,6 +24,7 @@ pub const text_measurement = @import("tests/text_measurement.zig");
 pub const vt_engine = @import("tests/vt_engine.zig");
 pub const fullscreen_setting = @import("tests/fullscreen_setting.zig");
 pub const fullscreen_keybinding = @import("tests/fullscreen_keybinding.zig");
+pub const full_screen_routing = @import("tests/full_screen_routing.zig");
 
 test {
     std.testing.refAllDecls(@This());
