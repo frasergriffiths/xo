@@ -573,7 +573,7 @@ pub fn Runtime(comptime App: type) type {
             max_prompt_history: usize,
         ) !?u8 {
             if (!ingress.has_routing_work()) return null;
-            if (terminalIngressCancelsPendingFullTranscriptOpen(ingress)) {
+            if (terminalIngressCancelsPendingFullScreenOpen(ingress)) {
                 _ = full_transcript_rt.cancelPendingOpenForInput(app);
             }
 
@@ -743,13 +743,13 @@ pub fn Runtime(comptime App: type) type {
             return app.input_runtime.paste.active();
         }
 
-        fn terminalIngressCancelsPendingFullTranscriptOpen(
+        fn terminalIngressCancelsPendingFullScreenOpen(
             ingress: input_action.TerminalInputIngress,
         ) bool {
             const event = ingress.event orelse return false;
             return switch (event) {
                 .paste_byte, .raw => true,
-                .action => |decoded| decoded.action != .toggle_full_transcript,
+                .action => |decoded| decoded.action != .toggle_fullscreen,
             };
         }
 
@@ -1012,7 +1012,7 @@ pub fn Runtime(comptime App: type) type {
                 .delete_to_line_end,
                 .insert_newline,
                 .composer_shortcut,
-                .toggle_full_transcript,
+                .toggle_fullscreen,
                 => unreachable,
                 .page_up,
                 .page_down,

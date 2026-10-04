@@ -88,7 +88,7 @@ pub const Action = union(enum) {
     delete_to_line_start,
     delete_to_line_end,
     clear_line,
-    toggle_full_transcript,
+    toggle_fullscreen,
     toggle_permission_mode,
     open_all_sessions,
     open_model_catalog,

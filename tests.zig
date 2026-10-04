@@ -23,6 +23,7 @@ pub const table_rendering = @import("tests/table_rendering.zig");
 pub const text_measurement = @import("tests/text_measurement.zig");
 pub const vt_engine = @import("tests/vt_engine.zig");
 pub const fullscreen_setting = @import("tests/fullscreen_setting.zig");
+pub const fullscreen_keybinding = @import("tests/fullscreen_keybinding.zig");
 
 test {
     std.testing.refAllDecls(@This());
