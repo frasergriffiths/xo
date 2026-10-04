@@ -2641,6 +2641,10 @@ fn handleFullscreenCommand(app: anytype, rest: []const u8) !void {
         return;
     };
 
+    // A bare toggle and an explicit set are both idempotent. Reporting "on"
+    // again when it is already on is indistinguishable from a broken toggle,
+    // so the notice distinguishes unchanged from changed.
+    const already = currentFullscreenPreference(app) == target;
     const runtime_changed = if (comptime @hasField(std.meta.Child(@TypeOf(app)), "fullscreen"))
         target != app.fullscreen
     else
@@ -2671,12 +2675,29 @@ fn handleFullscreenCommand(app: anytype, rest: []const u8) !void {
         ),
     }
 
+    // Persisting the choice is not enough on its own: a preference that writes
+    // a file and leaves the screen untouched reads as a broken toggle. Apply it
+    // to the live surface too, so `/fullscreen on` takes the alternate buffer
+    // now and the same preference also carries into the next launch.
+    applyFullscreenToSurface(app, target) catch |err| switch (err) {
+        // Another owner holds the buffer, so the mode is recorded for the next
+        // launch rather than stealing the screen from it.
+        error.AlternateScreenAlreadyOwned => {},
+        else => return err,
+    };
+
     var message: std.Io.Writer.Allocating = .init(app.alloc);
     defer message.deinit();
     if (target) {
-        message.writer.writeAll("full screen display: on. It applies the next time you start fx.") catch return;
+        message.writer.writeAll(if (already)
+            "full screen display: already on"
+        else
+            "full screen display: on") catch return;
     } else {
-        message.writer.writeAll("full screen display: off. fx starts inline next time.") catch return;
+        message.writer.writeAll(if (already)
+            "full screen display: already off"
+        else
+            "full screen display: off") catch return;
     }
     const body = message.written();
     try app.writeDomainNotice(.{
@@ -2687,6 +2708,31 @@ fn handleFullscreenCommand(app: anytype, rest: []const u8) !void {
     if (comptime @hasField(std.meta.Child(@TypeOf(app)), "shell")) {
         app.shell.render_requests.request(.footer);
     }
+}
+
+/// Enters or leaves the alternate-surface full view for the live shell.
+///
+/// Uses the existing alternate-screen owner rather than adding one, so the
+/// exclusivity rule in the rendering docs still holds and Ctrl+O and Ctrl+T
+/// remain the only other ways in, which they are not: they are both unbound.
+fn applyFullscreenToSurface(app: anytype, target: bool) !void {
+    if (comptime !@hasField(std.meta.Child(@TypeOf(app)), "terminal")) return;
+    const terminal = &app.terminal;
+
+    if (target) {
+        // Refuse while another owner holds the buffer rather than stealing it.
+        // Approval and catalog menus are the other two owners.
+        if (terminal.alternate_screen_owner != .none) return error.AlternateScreenAlreadyOwned;
+        try app_lifecycle.openFullTranscript(app.alloc, terminal, &app.shell, &app.metrics);
+        return;
+    }
+
+    _ = try app_lifecycle.closeFullTranscriptIfActive(
+        app.alloc,
+        terminal,
+        &app.shell,
+        &app.metrics,
+    );
 }
 
 fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
