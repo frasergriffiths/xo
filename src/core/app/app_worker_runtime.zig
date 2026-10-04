@@ -87,7 +87,7 @@ pub const AssistantTextDrainResult = enum {
 
 /// Writes one full-detail record for an admitted route recovery transition.
 /// The footer status is transient; this preserves retry and failure history
-/// in the ctrl+o full transcript's detail section.
+/// in the full-screen surface's detail section.
 fn recordRouteRecoveryNotice(app: anytype, status: types.RouteRecoveryStatus) !void {
     var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
     defer body.deinit();
@@ -986,7 +986,7 @@ pub fn Runtime(comptime App: type) type {
                             app.shell.render_requests.request(.footer);
                         }
                     },
-                    // The serving provider already appears on the ctrl+o
+                    // The serving provider already appears on the full-screen
                     // network record; nothing interactive consumes the event
                     // today. The batch drain frees the payload.
                     .provider_resolved => {},

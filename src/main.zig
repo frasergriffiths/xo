@@ -484,6 +484,9 @@ const App = struct {
     context_enabled: bool = true,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
+    /// Resolved `fullscreen` preference: launch into the full-screen chat
+    /// surface rather than inline. Inline is the default.
+    fullscreen: bool = false,
     auto_upgrade_enabled: bool = true,
     effort: ReasoningEffort = .auto,
     /// Resolved review-model override for automatic permission review

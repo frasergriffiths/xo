@@ -505,7 +505,7 @@ pub const WorkerEvent = union(enum) {
     question_requested,
     open_model_picker,
     semantic_notice: types.SemanticNotice,
-    /// A full-only observability record (network call outcome) for the ctrl+o
+    /// A full-only observability record (network call outcome) for the full-screen
     /// full transcript's detail section. Never enters the transcript store.
     full_detail_record: types.SemanticNotice,
     route_recovery_status: types.RouteRecoveryStatus,

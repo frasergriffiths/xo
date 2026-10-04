@@ -108,9 +108,9 @@ fn modifiedArrowAction(byte: u8, modifiers: u16, meta_prefixed: bool) ?InputEsca
     return null;
 }
 
-/// Ctrl+O no longer opens the full-transcript reader. The kitty-protocol path
-/// for the same chord is retired alongside the bare control byte so the two
-/// decoders cannot disagree about what Ctrl+O means.
+/// Byte 15 is retired. The kitty-protocol path for the same chord is retired
+/// alongside the bare control byte so the two decoders cannot disagree about
+/// what a retired chord means.
 fn ctrlOKeyAction(meta_prefixed: bool, modifiers: u16) InputEscapeAction {
     _ = meta_prefixed;
     _ = modifiers;
@@ -271,11 +271,11 @@ fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) Inpu
 
 pub fn controlByteFeatureAction(byte: u8) ?InputEscapeAction {
     return switch (byte) {
-        // Ctrl+T toggles full screen. Byte 15 (Ctrl+O) used to toggle the
-        // full-transcript reader and now deliberately maps to nothing: the
-        // reader is gone and `/fullscreen` owns the alternate buffer.
+        // Bytes 15 and 20 both used to reach the full-transcript reader.
+        // `/fullscreen` is now the only way into the alternate buffer, so both
+        // deliberately map to nothing. A retired binding must resolve to
+        // nothing rather than to something adjacent.
         16 => .open_model_catalog,
-        20 => .toggle_fullscreen,
         else => null,
     };
 }

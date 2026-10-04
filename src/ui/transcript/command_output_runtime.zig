@@ -1882,8 +1882,8 @@ fn appendDimmedCommandRowsWithGutterStyle(
 fn foldedHint(alloc: Allocator, hidden_records: usize, cols: u16) ![]u8 {
     const noun = if (hidden_records == 1) "line" else "lines";
     const candidates = [_][]u8{
-        try std.fmt.allocPrint(alloc, "│ … {d} {s} more (ctrl+o to view)", .{ hidden_records, noun }),
-        try std.fmt.allocPrint(alloc, "│ … {d} more (ctrl+o)", .{hidden_records}),
+        try std.fmt.allocPrint(alloc, "│ … {d} {s} more (/fullscreen)", .{ hidden_records, noun }),
+        try std.fmt.allocPrint(alloc, "│ … {d} more (/fullscreen)", .{hidden_records}),
         try std.fmt.allocPrint(alloc, "│ … {d} more", .{hidden_records}),
     };
     defer for (candidates) |candidate| alloc.free(candidate);

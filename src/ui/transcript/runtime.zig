@@ -33,7 +33,7 @@ const ui_render = @import("../render.zig");
 const types = @import("../../core/shared/types.zig");
 
 /// One timestamped full-detail record (session assembly, network call,
-/// recovery transition) shown only in the ctrl+o full transcript. Kept out of
+/// recovery transition) shown only in the full-screen surface. Kept out of
 /// the transcript entry store so inline rendering, retention, replay, and
 /// resume never observe it.
 const FullDetailRecord = struct {
@@ -983,7 +983,7 @@ pub const TranscriptRuntime = struct {
     transcript_release: transcript_release.State = .{},
     /// Sorted by entry id so exact lookup stays bounded as history grows.
     tool_details: std.ArrayList(ToolDetailRecord) = .empty,
-    /// Full-detail records shown only in the ctrl+o full transcript. Sibling
+    /// Full-detail records shown only in the full-screen surface. Sibling
     /// of `tool_details`: parallel to the entry store, never inline, never
     /// persisted, cleared with the transcript.
     full_detail_records: std.ArrayList(FullDetailRecord) = .empty,
@@ -2912,7 +2912,7 @@ pub const TranscriptRuntime = struct {
 
     /// Appends one full-only detail record (session assembly, network,
     /// recovery) and marks the full transcript content dirty so an open
-    /// ctrl+o view reloads it. Never touches the entry store.
+    /// The full-screen view reloads it. Never touches the entry store.
     pub fn appendFullDetailRecord(
         self: *TranscriptRuntime,
         alloc: Allocator,

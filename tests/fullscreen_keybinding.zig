@@ -18,10 +18,13 @@ test "ctrl+o no longer maps to any feature action" {
     try testing.expectEqual(@as(?input_action.Action, null), escape_parser.controlByteFeatureAction(15));
 }
 
-test "ctrl+t maps to the full-screen toggle" {
+test "ctrl+t is retired alongside ctrl+o" {
+    // `/fullscreen` is the only way into the alternate buffer now, so neither
+    // control byte may reach it. A key that reappears here silently restores a
+    // second entry point the user explicitly asked to remove.
     try testing.expectEqual(
-        input_action.Action.toggle_fullscreen,
-        escape_parser.controlByteFeatureAction(20).?,
+        @as(?input_action.Action, null),
+        escape_parser.controlByteFeatureAction(20),
     );
 }
 
@@ -35,7 +38,7 @@ test "ctrl+p still opens the model catalog" {
 
 test "unmapped control bytes stay unmapped" {
     for ([_]u8{ 0, 1, 2, 14, 17, 19, 21, 23, 25, 26, 27 }) |byte| {
-        if (byte == 16 or byte == 20) continue;
+        if (byte == 16) continue;
         try testing.expectEqual(
             @as(?input_action.Action, null),
             escape_parser.controlByteFeatureAction(byte),
@@ -43,9 +46,10 @@ test "unmapped control bytes stay unmapped" {
     }
 }
 
-test "the toggle action exists as a distinct action value" {
-    // Constructing the value is the check: if the tag were removed, or if the
-    // retired name were still in use, this stops compiling.
+test "the toggle action exists but is not bound to any control byte" {
+    // The action survives because `/fullscreen` routing still names it. What is
+    // gone is the keyboard entry point, so constructing the value must not
+    // imply any byte reaches it.
     const toggled: input_action.Action = .toggle_fullscreen;
     try testing.expect(toggled == .toggle_fullscreen);
 
@@ -54,7 +58,7 @@ test "the toggle action exists as a distinct action value" {
     // enforced at compile time by the absence of any reference to it.
     for ([_]u8{ 0, 3, 12, 15, 16, 20, 27 }) |byte| {
         if (escape_parser.controlByteFeatureAction(byte)) |action| {
-            try testing.expect(action != .toggle_fullscreen or byte == 20);
+            try testing.expect(action != .toggle_fullscreen);
         }
     }
 }

@@ -218,9 +218,9 @@ pub fn Runtime(comptime App: type) type {
             app_session_runtime.Runtime(App).enableSessionStores(app);
         }
 
-        // Neutral one-line summary inline; the full detail stays behind Ctrl+O.
+        // Neutral one-line summary inline; the full detail stays on the full-screen surface.
         fn writeCollapsedStartupNotice(app: *App, topic: []const u8, summary_lead: []const u8, detail: []const u8) !void {
-            const summary = try std.fmt.allocPrint(app.alloc, "{s} (ctrl+o to view)", .{summary_lead});
+            const summary = try std.fmt.allocPrint(app.alloc, "{s} (/fullscreen)", .{summary_lead});
             defer app.alloc.free(summary);
             try app.writeDomainNotice(.{ .topic = topic, .tone = .neutral, .body = summary }, true);
             try app.writeDomainNotice(.{ .topic = topic, .tone = .neutral, .body = detail, .visibility = .full_only }, true);
@@ -410,6 +410,10 @@ pub fn Runtime(comptime App: type) type {
             try app.worker.setProviderRouting(std.heap.c_allocator, startup.provider_order, startup.provider_strict);
             app.context_enabled = startup.context_enabled;
             app.fast_mode = startup.fast_mode;
+            // The `fullscreen` preference, unlike most display settings, decides
+            // which surface owns the alternate buffer at launch. Without this
+            // line `/fullscreen` persists correctly but nothing reads it back.
+            if (comptime @hasField(App, "fullscreen")) app.fullscreen = startup.fullscreen;
             app.input_runtime.slash_menu_categories = startup.slash_menu_categories;
             app.shell.collapse_tool_calls = startup.collapse_tool_calls;
             app.auto_upgrade_enabled = startup.auto_upgrade;

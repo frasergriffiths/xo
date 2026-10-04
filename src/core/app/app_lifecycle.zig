@@ -149,6 +149,8 @@ pub const StartupState = struct {
     auto_upgrade: bool = true,
     update_channel: update_target.Channel = .stable,
     startup_scrollback: bool = true,
+    /// Launch the shell in the full-screen chat surface. Inline is the default.
+    fullscreen: bool = false,
     prompt_history_enabled: bool = true,
     prompt_history_store_allowed: bool = true,
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
@@ -668,6 +670,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.auto_upgrade = settings.auto_upgrade orelse true;
     state.update_channel = settings.update_channel orelse .stable;
     state.startup_scrollback = settings.startup_scrollback orelse true;
+    state.fullscreen = settings.fullscreen orelse false;
     state.theme = if (settings.theme) |value| try alloc.dupe(u8, value) else null;
     state.effort = settings.effort orelse .auto;
     state.review_model = try alloc.dupe(u8, settings.review_model orelse "");

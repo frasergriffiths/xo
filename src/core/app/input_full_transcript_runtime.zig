@@ -155,7 +155,6 @@ pub fn Runtime(comptime App: type) type {
 
         fn keyForAction(resolved: input_action.Action) ?FullTranscriptKey {
             return switch (resolved) {
-                .toggle_fullscreen => .toggle,
                 .cursor_left => .{ .navigate = .left },
                 .cursor_right => .{ .navigate = .right },
                 .cursor_up => .{ .wheel_scroll = .up },

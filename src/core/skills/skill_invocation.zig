@@ -215,7 +215,7 @@ pub fn buildExplicitPromptSection(
     const summary = if (failed == 0)
         try std.fmt.allocPrint(alloc, "{d} requested skill{s} loaded{s}", .{ loaded, if (loaded == 1) "" else "s", load_rows.written() })
     else
-        try std.fmt.allocPrint(alloc, "Requested skills · {d} loaded · {d} failed (ctrl+o for details){s}", .{ loaded, failed, load_rows.written() });
+        try std.fmt.allocPrint(alloc, "Requested skills · {d} loaded · {d} failed{s}", .{ loaded, failed, load_rows.written() });
     errdefer alloc.free(summary);
     const details = if (load_details.written().len > 0) try load_details.toOwnedSlice() else null;
     errdefer if (details) |value| alloc.free(value);

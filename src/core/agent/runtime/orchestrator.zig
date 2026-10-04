@@ -2868,7 +2868,7 @@ fn writeUsageTokens(writer: *std.Io.Writer, usage: types.Usage) !void {
 }
 
 /// Publishes one full-detail record per settled provider request so the
-/// ctrl+o full transcript carries network call outcomes that the footer only
+/// The full-screen surface carries network call outcomes that the footer only
 /// shows transiently. Publication failure never fails the turn.
 fn pushNetworkRecord(
     deps: *const AgentRuntimeDeps,

@@ -53,8 +53,8 @@ pub const ScreenAction = union(enum) {
 /// `transcript_presentation.Event` carries only `toggle`, `left`, and `right`,
 /// so it is not the vocabulary for vertical scrolling.
 ///
-/// Byte-level control handling. Ctrl+T is the full-screen toggle; Ctrl+O is
-/// retired and deliberately unmapped. Ctrl+C interrupts, Ctrl+L redraws.
+/// Byte-level control handling. Ctrl+C interrupts and Ctrl+L redraws; both
+/// are screen-tier so a running turn stays stoppable from inside the surface.
 pub fn tierForControlByte(byte: u8) Tier {
     return switch (byte) {
         // Ctrl+C interrupts the running turn. It must not be swallowed by the
@@ -64,9 +64,8 @@ pub fn tierForControlByte(byte: u8) Tier {
         12 => .screen,
         16 => .screen,
         20 => .screen,
-        // Byte 15 (Ctrl+O) is intentionally absent: the reader is gone, and a
-        // retired binding must resolve to nothing rather than silently do
-        // something adjacent.
+        // A retired binding must resolve to nothing rather than silently do
+        // something adjacent, which is why bytes 15 and 20 are absent.
         15 => .ignore,
         // Ctrl+W is a composer editing chord (delete previous word), so it must
         // stay with the composer rather than being treated as a screen control.
